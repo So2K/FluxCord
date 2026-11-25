@@ -1,0 +1,270 @@
+#pragma once
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <set>
+#include <vector>
+
+namespace fc {
+
+/// Production-grade RFC 6184 H.264 RTP Reorder Buffer & Access-Unit Depacketizer.
+/// Handles out-of-order UDP bursts, 0-byte Discord BWE padding probe packets,
+/// Single NALU / STAP-A / FU-A, packet-loss detection, and IDR/SPS keyframe gating.
+class VideoDepacketizer {
+public:
+    struct FrameOut {
+        uint32_t timestamp = 0;
+        std::vector<uint8_t> annexb;
+        bool is_keyframe = false;
+    };
+
+    void reset() {
+        frames_.clear();
+        empty_probe_seqs_.clear();
+        has_seq_ = false;
+        last_ext_seq_ = -1;
+        last_emitted_max_seq_ = -1;
+        need_keyframe_ = true;
+        frames_ok_ = 0;
+        frames_dropped_ = 0;
+    }
+
+    /// Record a 0-byte RTP padding/BWE probe packet sequence number so it never looks like a lost video packet!
+    void noteEmptyProbeSeq(uint16_t seq) {
+        int64_t ext = unwrapSeq(seq);
+        if (last_emitted_max_seq_ >= 0 && ext <= last_emitted_max_seq_) return;
+        empty_probe_seqs_.insert(ext);
+        while (empty_probe_seqs_.size() > 64) empty_probe_seqs_.erase(empty_probe_seqs_.begin());
+    }
+
+    bool pushPacket(uint16_t seq, uint32_t rtp_ts, bool marker, const uint8_t* payload, int len,
+                    int64_t now_ms, FrameOut& out, bool& want_pli) {
+        want_pli = false;
+        if (!payload || len < 1) {
+            noteEmptyProbeSeq(seq);
+            return tryEmit(now_ms, out, want_pli);
+        }
+
+        int64_t extSeq = unwrapSeq(seq);
+        if (last_emitted_max_seq_ >= 0 && extSeq <= last_emitted_max_seq_) {
+            return false;
+        }
+
+        auto& fb = frames_[rtp_ts];
+        if (fb.packets.empty()) fb.first_ms = now_ms;
+        fb.packets[extSeq] = std::vector<uint8_t>(payload, payload + len);
+        if (marker) {
+            fb.has_marker = true;
+            fb.marker_seq = extSeq;
+            fb.marker_ms = now_ms;
+        }
+
+        while (frames_.size() > 16) {
+            frames_.erase(frames_.begin());
+            frames_dropped_++;
+            need_keyframe_ = true;
+            want_pli = true;
+        }
+
+        return tryEmit(now_ms, out, want_pli);
+    }
+
+    bool tryEmit(int64_t now_ms, FrameOut& out, bool& want_pli) {
+        want_pli = false;
+        while (!frames_.empty()) {
+            // Advance last_emitted_max_seq_ over any contiguous BWE probe packets
+            while (last_emitted_max_seq_ >= 0 && empty_probe_seqs_.count(last_emitted_max_seq_ + 1)) {
+                empty_probe_seqs_.erase(last_emitted_max_seq_ + 1);
+                last_emitted_max_seq_++;
+            }
+
+            auto bestIt = frames_.begin();
+            int64_t bestMinSeq = bestIt->second.packets.begin()->first;
+            for (auto it = frames_.begin(); it != frames_.end(); ++it) {
+                if (!it->second.packets.empty() && it->second.packets.begin()->first < bestMinSeq) {
+                    bestMinSeq = it->second.packets.begin()->first;
+                    bestIt = it;
+                }
+            }
+
+            auto& fb = bestIt->second;
+            int64_t minSeq = fb.packets.begin()->first;
+            int64_t maxSeq = fb.packets.rbegin()->first;
+
+            // Check internal contiguity (allowing BWE probe packets if any fell inside the range)
+            bool contiguousInternal = true;
+            for (int64_t s = minSeq; s <= maxSeq; ++s) {
+                if (!fb.packets.count(s) && !empty_probe_seqs_.count(s)) {
+                    contiguousInternal = false;
+                    break;
+                }
+            }
+
+            // Check contiguity with previous emitted frame (allowing BWE probes in between)
+            bool contiguousWithPrev = (last_emitted_max_seq_ < 0) || (minSeq == last_emitted_max_seq_ + 1);
+            if (!contiguousWithPrev && minSeq > last_emitted_max_seq_ + 1 && (minSeq - last_emitted_max_seq_) <= 32) {
+                bool allProbes = true;
+                for (int64_t s = last_emitted_max_seq_ + 1; s < minSeq; ++s) {
+                    if (!empty_probe_seqs_.count(s)) { allProbes = false; break; }
+                }
+                contiguousWithPrev = allProbes;
+            }
+
+            // Fast-path: if a complete internally-contiguous frame arrived and we're waiting for a keyframe,
+            // emit it immediately if it's an IDR/SPS keyframe even if earlier P-frame packets were lost!
+            if (fb.has_marker && (maxSeq == fb.marker_seq) && contiguousInternal && (contiguousWithPrev || need_keyframe_)) {
+                bool assembled = assembleAnnexB(fb, out.annexb);
+                out.timestamp = bestIt->first;
+                out.is_keyframe = hasIdrOrSps(out.annexb.data(), out.annexb.size());
+                if (contiguousWithPrev || out.is_keyframe) {
+                    last_emitted_max_seq_ = maxSeq;
+                    frames_.erase(bestIt);
+                    if (assembled && !out.annexb.empty()) {
+                        frames_ok_++;
+                        return true;
+                    }
+                    continue;
+                }
+            }
+
+            // Generous timeouts so large WebRTC-paced 1080p/1440p IDR keyframes (40-80 packets paced over 80-160ms!)
+            // NEVER get dropped mid-flight before their marker packet arrives!
+            bool timedOut = (fb.has_marker && (now_ms - fb.marker_ms >= 80)) || (now_ms - fb.first_ms >= 250);
+            if (!timedOut) break;
+
+            if (fb.has_marker && contiguousInternal) {
+                bool assembled = assembleAnnexB(fb, out.annexb);
+                out.timestamp = bestIt->first;
+                out.is_keyframe = hasIdrOrSps(out.annexb.data(), out.annexb.size());
+                last_emitted_max_seq_ = maxSeq;
+                frames_.erase(bestIt);
+                if (assembled && out.is_keyframe) {
+                    frames_ok_++;
+                    return true;
+                }
+                frames_dropped_++;
+                need_keyframe_ = true;
+                want_pli = true;
+                continue;
+            }
+
+            last_emitted_max_seq_ = std::max(last_emitted_max_seq_, maxSeq);
+            frames_.erase(bestIt);
+            frames_dropped_++;
+            need_keyframe_ = true;
+            want_pli = true;
+        }
+        return false;
+    }
+
+    static bool hasIdrOrSps(const uint8_t* data, size_t len) {
+        for (size_t i = 0; i + 4 < len; ++i) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                size_t sc = 0;
+                if (data[i + 2] == 1) sc = 3;
+                else if (data[i + 2] == 0 && data[i + 3] == 1) sc = 4;
+                if (sc > 0 && i + sc < len) {
+                    uint8_t nt = data[i + sc] & 0x1F;
+                    if (nt == 5 || nt == 7) return true;
+                    i += sc;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool needKeyframe() const { return need_keyframe_; }
+    void setNeedKeyframe(bool v) { need_keyframe_ = v; }
+    int64_t framesOk() const { return frames_ok_; }
+    int64_t framesDropped() const { return frames_dropped_; }
+
+private:
+    struct FrameBuf {
+        std::map<int64_t, std::vector<uint8_t>> packets;
+        bool has_marker = false;
+        int64_t marker_seq = -1;
+        int64_t first_ms = 0;
+        int64_t marker_ms = 0;
+    };
+
+    int64_t unwrapSeq(uint16_t s) {
+        if (!has_seq_) {
+            has_seq_ = true;
+            last_ext_seq_ = s;
+            return s;
+        }
+        int64_t cand = (last_ext_seq_ & ~int64_t(0xFFFF)) | int64_t(s);
+        if (cand < last_ext_seq_ - 32768) cand += 65536;
+        else if (cand > last_ext_seq_ + 32768) cand -= 65536;
+        if (cand > last_ext_seq_) last_ext_seq_ = cand;
+        return cand;
+    }
+
+    static void appendStartCode(std::vector<uint8_t>& v) {
+        v.push_back(0); v.push_back(0); v.push_back(0); v.push_back(1);
+    }
+
+    static bool assembleAnnexB(const FrameBuf& fb, std::vector<uint8_t>& out) {
+        out.clear();
+        std::vector<uint8_t> fu;
+        bool inFu = false;
+
+        for (const auto& [seq, pkt] : fb.packets) {
+            if (pkt.empty()) continue;
+            const uint8_t* pay = pkt.data();
+            int payLen = int(pkt.size());
+            uint8_t naluType = pay[0] & 0x1F;
+
+            if (naluType >= 1 && naluType <= 23) {
+                if (inFu) { inFu = false; fu.clear(); }
+                appendStartCode(out);
+                out.insert(out.end(), pay, pay + payLen);
+            } else if (naluType == 24) {
+                if (inFu) { inFu = false; fu.clear(); }
+                int off = 1;
+                while (off + 2 <= payLen) {
+                    uint16_t sz = uint16_t((uint16_t(pay[off]) << 8) | pay[off + 1]);
+                    off += 2;
+                    if (off + sz > payLen) return false;
+                    appendStartCode(out);
+                    out.insert(out.end(), pay + off, pay + off + sz);
+                    off += sz;
+                }
+            } else if (naluType == 28) {
+                if (payLen < 2) return false;
+                uint8_t fuHdr = pay[1];
+                bool startBit = (fuHdr & 0x80) != 0;
+                bool endBit = (fuHdr & 0x40) != 0;
+                if (startBit) {
+                    fu.clear();
+                    fu.push_back((pay[0] & 0xE0) | (fuHdr & 0x1F));
+                    fu.insert(fu.end(), pay + 2, pay + payLen);
+                    inFu = true;
+                } else if (inFu) {
+                    fu.insert(fu.end(), pay + 2, pay + payLen);
+                } else {
+                    return false;
+                }
+                if (endBit && inFu) {
+                    appendStartCode(out);
+                    out.insert(out.end(), fu.begin(), fu.end());
+                    fu.clear();
+                    inFu = false;
+                }
+            }
+        }
+        return !inFu && !out.empty();
+    }
+
+    std::map<uint32_t, FrameBuf> frames_;
+    std::set<int64_t> empty_probe_seqs_;
+    bool has_seq_ = false;
+    int64_t last_ext_seq_ = -1;
+    int64_t last_emitted_max_seq_ = -1;
+    bool need_keyframe_ = true;
+    int64_t frames_ok_ = 0;
+    int64_t frames_dropped_ = 0;
+};
+
+} // namespace fc
