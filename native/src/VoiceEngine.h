@@ -25,8 +25,8 @@ public:
     void setMuted(bool m) { muted_.store(m); }
     void setDeafened(bool d) { deafened_.store(d); }
     void setLoopback(bool lb) { loopback_.store(lb); }
-    void setInputGain(float g) { input_gain_.store(g); }
-    void setOutputVolume(float v) { output_vol_.store(v); }
+    void setInputGain(float g);
+    void setOutputVolume(float v);
     void setUserVolume(uint32_t ssrc, float vol);
     void setNoiseConfig(int32_t mode, float strength, bool hpf, bool agc, float gate_db);
 

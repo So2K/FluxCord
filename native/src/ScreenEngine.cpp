@@ -60,11 +60,25 @@ void fitAspectEven(UINT srcW, UINT srcH, int32_t maxW, int32_t maxH, UINT& outW,
 }
 
 // Lightweight COM completion handler for Windows 10/11 Process Loopback (captures game/system audio WITHOUT FluxCord voice echo!)
+// Owns AUDIOCLIENT_ACTIVATION_PARAMS & PROPVARIANT on the heap so OS worker thread never reads dead stack memory on timeout!
 class ProcessLoopbackHandler final : public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
 public:
     HANDLE done_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HRESULT result_hr = E_FAIL;
     ComPtr<IAudioClient> client;
+    AUDIOCLIENT_ACTIVATION_PARAMS params{};
+    PROPVARIANT pv{};
+
+    ProcessLoopbackHandler(DWORD pid, bool includeTree) {
+        params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+        params.ProcessLoopbackParams.TargetProcessId = pid;
+        params.ProcessLoopbackParams.ProcessLoopbackMode = includeTree
+            ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+            : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+        pv.vt = VT_BLOB;
+        pv.blob.cbSize = sizeof(params);
+        pv.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
+    }
 
     ~ProcessLoopbackHandler() { if (done_ev) CloseHandle(done_ev); }
 
@@ -106,21 +120,9 @@ private:
 
 bool tryOpenProcessLoopback(DWORD pid, bool includeTree, ComPtr<IAudioClient>& outClient) {
     if (pid == 0) return false;
-    AUDIOCLIENT_ACTIVATION_PARAMS params{};
-    params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    params.ProcessLoopbackParams.TargetProcessId = pid;
-    params.ProcessLoopbackParams.ProcessLoopbackMode = includeTree
-        ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
-        : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
-
-    PROPVARIANT pv{};
-    pv.vt = VT_BLOB;
-    pv.blob.cbSize = sizeof(params);
-    pv.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
-
-    auto* handler = new ProcessLoopbackHandler();
+    auto* handler = new ProcessLoopbackHandler(pid, includeTree);
     ComPtr<IActivateAudioInterfaceAsyncOperation> op;
-    HRESULT hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient), &pv, handler, &op);
+    HRESULT hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, __uuidof(IAudioClient), &handler->pv, handler, &op);
     bool ok = false;
     if (SUCCEEDED(hr) && WaitForSingleObject(handler->done_ev, 1500) == WAIT_OBJECT_0 && SUCCEEDED(handler->result_hr) && handler->client) {
         outClient = handler->client;
@@ -247,6 +249,7 @@ bool createHardwareEncoderMft(int32_t /*codec*/, int32_t w, int32_t h, int32_t f
 } // namespace
 
 ScreenEngine::ScreenEngine(VoiceTransport* transport) : transport_(transport) {
+    worker_done_ev_ = CreateEventW(nullptr, TRUE, TRUE, nullptr);
     if (transport_) {
         transport_->setPliCallback([this] { requestKeyframe(); });
     }
@@ -255,6 +258,7 @@ ScreenEngine::ScreenEngine(VoiceTransport* transport) : transport_(transport) {
 ScreenEngine::~ScreenEngine() {
     if (transport_) transport_->setPliCallback(nullptr);
     stop();
+    if (worker_done_ev_) { CloseHandle(worker_done_ev_); worker_done_ev_ = nullptr; }
 }
 
 int32_t ScreenEngine::listMonitors(FcMonitorInfo* out_list, int32_t max_count) {
@@ -298,7 +302,7 @@ bool ScreenEngine::start(int32_t monitor_index, int32_t target_w, int32_t target
     target_h_ = std::clamp(target_h, 360, 2160) & ~7;
     target_fps_ = std::clamp(fps, 15, 120);
     bitrate_kbps_ = std::clamp(bitrate_kbps, 1000, 50000);
-    codec_ = codec;
+    codec_ = FC_CODEC_H264; // Discord WebRTC Go Live requires H.264 RTP packetizer & DAVE_CODEC_H264
     loopback_preview_ = loopback_preview;
     capture_audio_ = capture_system_audio;
     render_device_id_ = render_device_id ? render_device_id : "";
@@ -313,6 +317,7 @@ bool ScreenEngine::start(int32_t monitor_index, int32_t target_w, int32_t target
         stats_.running = 1;
     }
 
+    if (worker_done_ev_) ResetEvent(worker_done_ev_);
     running_.store(true);
     worker_ = std::thread([this] { captureEncodeLoop(); });
     if (capture_audio_ && transport_) {
@@ -328,7 +333,18 @@ void ScreenEngine::stop() {
 
 void ScreenEngine::stopLocked() {
     running_.store(false);
-    if (worker_.joinable()) worker_.join();
+    if (worker_.joinable()) {
+        // Prevent cross-thread DXGI SwapChain HWND SendMessage deadlock when stop() is called from UI thread!
+        if (preview_hwnd_ && worker_done_ev_ && GetWindowThreadProcessId(preview_hwnd_, nullptr) == GetCurrentThreadId()) {
+            while (WaitForSingleObject(worker_done_ev_, 0) != WAIT_OBJECT_0) {
+                DWORD wr = MsgWaitForMultipleObjectsEx(1, &worker_done_ev_, 50, QS_SENDMESSAGE, 0);
+                if (wr == WAIT_OBJECT_0) break;
+                MSG msg{};
+                PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            }
+        }
+        worker_.join();
+    }
     if (audio_worker_.joinable()) audio_worker_.join();
     std::lock_guard lk(stats_mtx_);
     stats_.running = 0;
@@ -348,6 +364,11 @@ void ScreenEngine::getStats(FcScreenStats* out) const {
 }
 
 void ScreenEngine::captureEncodeLoop() {
+    struct DoneGuard {
+        HANDLE ev;
+        ~DoneGuard() { if (ev) SetEvent(ev); }
+    } doneGuard{ worker_done_ev_ };
+
     HANDLE mm = boostRealtimeThread(L"Games");
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HDESK origDesk = GetThreadDesktop(GetCurrentThreadId());
@@ -516,35 +537,65 @@ void ScreenEngine::captureEncodeLoop() {
     ComPtr<ID3D11VideoProcessorEnumerator> vpenum;
     ComPtr<ID3D11VideoProcessor> vp;
     bool hasVp = false;
+    bool canDualSingleBlt = false;
 
-    // 4-surface NV12 VRAM ring prevents GPU write-after-read tearing while Async NVENC reads previous surfaces!
-    constexpr int kNv12Ring = 4;
-    std::array<ComPtr<ID3D11Texture2D>, kNv12Ring> nv12Ring;
-    std::array<ComPtr<ID3D11VideoProcessorOutputView>, kNv12Ring> vpOutRing;
+    // 4-surface NV12 encoder ring + 1 dedicated preview scratch slot (prevents GPU write-after-read race when !canSubmit!)
+    constexpr int kEncRing = 4;
+    constexpr int kPreviewScratchIdx = 4;
+    constexpr int kNv12Total = 5;
+    std::array<ComPtr<ID3D11Texture2D>, kNv12Total> nv12Ring;
+    std::array<ComPtr<ID3D11VideoProcessorOutputView>, kNv12Total> vpOutRing;
     int nv12CurIdx = 0;
     int nv12LastIdx = 0;
 
+    auto fitLetterboxRect = [](UINT inW, UINT inH, RECT box) -> RECT {
+        LONG bw = std::max<LONG>(1, box.right - box.left);
+        LONG bh = std::max<LONG>(1, box.bottom - box.top);
+        double sa = double(std::max<UINT>(1, inW)) / double(std::max<UINT>(1, inH));
+        double da = double(bw) / double(bh);
+        RECT r = box;
+        if (sa > da + 0.01) {
+            LONG nh = std::max<LONG>(2, LONG(double(bw) / sa) & ~1L);
+            r.top = box.top + (bh - nh) / 2;
+            r.bottom = r.top + nh;
+        } else if (sa < da - 0.01) {
+            LONG nw = std::max<LONG>(2, LONG(double(bh) * sa) & ~1L);
+            r.left = box.left + (bw - nw) / 2;
+            r.right = r.left + nw;
+        }
+        return r;
+    };
+
     auto rebuildVideoProcessor = [&]() {
         hasVp = false;
+        canDualSingleBlt = false;
         vp.Reset();
         vpenum.Reset();
-        for (int i = 0; i < kNv12Ring; ++i) vpOutRing[i].Reset();
+        for (int i = 0; i < kNv12Total; ++i) vpOutRing[i].Reset();
         if (!vdev || !vctx) return;
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC vdesc{};
         vdesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-        vdesc.InputWidth = srcW; vdesc.InputHeight = srcH;
+        vdesc.InputWidth = isDualActive ? std::max(srcW, srcW2) : srcW;
+        vdesc.InputHeight = isDualActive ? std::max(srcH, srcH2) : srcH;
         vdesc.OutputWidth = dstW; vdesc.OutputHeight = dstH;
         vdesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
         if (SUCCEEDED(vdev->CreateVideoProcessorEnumerator(&vdesc, &vpenum)) &&
             SUCCEEDED(vdev->CreateVideoProcessor(vpenum.Get(), 0, &vp))) {
+            D3D11_VIDEO_PROCESSOR_CAPS vpCaps{};
+            if (SUCCEEDED(vpenum->GetVideoProcessorCaps(&vpCaps))) {
+                canDualSingleBlt = (vpCaps.MaxInputStreams >= 2 && vpCaps.MaxStreamStates >= 2);
+            }
             if (vctx1) {
                 vctx1->VideoProcessorSetStreamColorSpace1(vp.Get(), 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                if (canDualSingleBlt) {
+                    vctx1->VideoProcessorSetStreamColorSpace1(vp.Get(), 1, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                }
                 vctx1->VideoProcessorSetOutputColorSpace1(vp.Get(), DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
             }
             D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
             ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
             bool allOk = true;
-            for (int i = 0; i < kNv12Ring; ++i) {
+            for (int i = 0; i < kNv12Total; ++i) {
                 if (!nv12Ring[i] || FAILED(vdev->CreateVideoProcessorOutputView(nv12Ring[i].Get(), vpenum.Get(), &ovd, &vpOutRing[i]))) {
                     allOk = false;
                 }
@@ -566,7 +617,7 @@ void ScreenEngine::captureEncodeLoop() {
     nv12Desc.SampleDesc.Count = 1;
     nv12Desc.Usage = D3D11_USAGE_DEFAULT;
     nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-    for (int i = 0; i < kNv12Ring; ++i) {
+    for (int i = 0; i < kNv12Total; ++i) {
         dev->CreateTexture2D(&nv12Desc, nullptr, &nv12Ring[i]);
     }
     rebuildVideoProcessor();
@@ -648,45 +699,60 @@ void ScreenEngine::captureEncodeLoop() {
     const int64_t sampleDurHns = 10000000 / target_fps_;
     int asyncNeedInput = 0;
     DWORD encOutBufCap = 4 * 1024 * 1024; // 4 MB handles 4K60 50Mbps IDR keyframes cleanly!
+    ComPtr<IMFSample> reusableOutSample;
+    ComPtr<IMFMediaBuffer> reusableOutBuf;
+    DWORD reusableAllocCap = 0;
 
     auto pullMftOutput = [&](int64_t fallbackHns) {
         if (!encMft) return;
-        MFT_OUTPUT_DATA_BUFFER outBuf{};
         MFT_OUTPUT_STREAM_INFO osi{};
         encMft->GetOutputStreamInfo(0, &osi);
-        ComPtr<IMFSample> outSample;
-        if (!(osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-            MFCreateSample(&outSample);
-            ComPtr<IMFMediaBuffer> mb;
-            MFCreateMemoryBuffer(std::max<DWORD>(osi.cbSize, encOutBufCap), &mb);
-            outSample->AddBuffer(mb.Get());
-            outBuf.pSample = outSample.Get();
-        }
-        DWORD status = 0;
-        HRESULT ohr = encMft->ProcessOutput(0, 1, &outBuf, &status);
-        if (outBuf.pEvents) { outBuf.pEvents->Release(); outBuf.pEvents = nullptr; }
-        if (ohr == MF_E_BUFFERTOOSMALL) {
-            encOutBufCap = std::min<DWORD>(encOutBufCap * 2, 16 * 1024 * 1024);
-            return;
-        }
-        if (SUCCEEDED(ohr) && outBuf.pSample) {
-            ComPtr<IMFMediaBuffer> cb;
-            if (SUCCEEDED(outBuf.pSample->ConvertToContiguousBuffer(&cb))) {
-                BYTE* data = nullptr;
-                DWORD maxLen = 0, curLen = 0;
-                if (SUCCEEDED(cb->Lock(&data, &maxLen, &curLen)) && curLen > 0) {
-                    bytesWindow += curLen;
-                    uint32_t vssrc = video_ssrc_.load();
-                    if (transport_ && transport_->isReady() && vssrc != 0) {
-                        LONGLONG outHns = fallbackHns;
-                        outBuf.pSample->GetSampleTime(&outHns);
-                        uint32_t rtpTs = uint32_t((outHns * 9) / 1000);
-                        transport_->sendH264AccessUnit(data, int(curLen), vssrc, rtpTs);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            MFT_OUTPUT_DATA_BUFFER outBuf{};
+            if (!(osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
+                DWORD wantCap = std::max<DWORD>(osi.cbSize, encOutBufCap);
+                if (!reusableOutSample || !reusableOutBuf || reusableAllocCap < wantCap) {
+                    reusableOutSample.Reset();
+                    reusableOutBuf.Reset();
+                    if (FAILED(MFCreateSample(&reusableOutSample)) ||
+                        FAILED(MFCreateMemoryBuffer(wantCap, &reusableOutBuf))) {
+                        return;
                     }
-                    cb->Unlock();
+                    reusableOutSample->AddBuffer(reusableOutBuf.Get());
+                    reusableAllocCap = wantCap;
                 }
+                reusableOutBuf->SetCurrentLength(0);
+                outBuf.pSample = reusableOutSample.Get();
             }
-            if (osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) outBuf.pSample->Release();
+            DWORD status = 0;
+            HRESULT ohr = encMft->ProcessOutput(0, 1, &outBuf, &status);
+            if (outBuf.pEvents) { outBuf.pEvents->Release(); outBuf.pEvents = nullptr; }
+            if (ohr == MF_E_BUFFERTOOSMALL) {
+                // MUST retry ProcessOutput immediately in Async MFT mode after dequeuing METransformHaveOutput!
+                encOutBufCap = std::min<DWORD>(std::max<DWORD>(osi.cbSize, encOutBufCap * 2), 32 * 1024 * 1024);
+                encMft->GetOutputStreamInfo(0, &osi);
+                continue;
+            }
+            if (SUCCEEDED(ohr) && outBuf.pSample) {
+                ComPtr<IMFMediaBuffer> cb;
+                if (SUCCEEDED(outBuf.pSample->ConvertToContiguousBuffer(&cb))) {
+                    BYTE* data = nullptr;
+                    DWORD maxLen = 0, curLen = 0;
+                    if (SUCCEEDED(cb->Lock(&data, &maxLen, &curLen)) && curLen > 0) {
+                        bytesWindow += curLen;
+                        uint32_t vssrc = video_ssrc_.load();
+                        if (transport_ && transport_->isReady() && vssrc != 0) {
+                            LONGLONG outHns = fallbackHns;
+                            outBuf.pSample->GetSampleTime(&outHns);
+                            uint32_t rtpTs = uint32_t((outHns * 9) / 1000);
+                            transport_->sendH264AccessUnit(data, int(curLen), vssrc, rtpTs);
+                        }
+                        cb->Unlock();
+                    }
+                }
+                if (osi.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) outBuf.pSample->Release();
+            }
+            break;
         }
     };
 
@@ -751,6 +817,10 @@ void ScreenEngine::captureEncodeLoop() {
                     if (deskTex2) {
                         D3D11_TEXTURE2D_DESC td2{};
                         deskTex2->GetDesc(&td2);
+                        if (td2.Width != srcW2 || td2.Height != srcH2) {
+                            srcW2 = td2.Width; srcH2 = td2.Height;
+                            rebuildVideoProcessor();
+                        }
                         if (!dualCache1) {
                             D3D11_TEXTURE2D_DESC cd = td2;
                             cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -785,11 +855,19 @@ void ScreenEngine::captureEncodeLoop() {
                     deskTex = dualCache0;
                 } else {
                     skippedStatic++;
+                    auto nowKf = std::chrono::steady_clock::now();
+                    float stSec = std::chrono::duration<float>(nowKf - windowStart).count();
                     {
                         std::lock_guard lk(stats_mtx_);
                         stats_.frames_skipped_static = skippedStatic;
+                        if (stSec >= 1.0f) {
+                            stats_.fps = float(framesWindow) / stSec;
+                            stats_.bitrate_kbps = (float(bytesWindow) * 8.0f / 1000.0f) / stSec;
+                            framesWindow = 0;
+                            bytesWindow = 0;
+                            windowStart = nowKf;
+                        }
                     }
-                    auto nowKf = std::chrono::steady_clock::now();
                     bool readyForPliKf = force_keyframe_.load() && (nowKf - lastKfTime >= std::chrono::milliseconds(500));
                     bool periodicKf = (nowKf - lastKfTime >= std::chrono::seconds(2));
                     if (hasLastNv12Frame && (readyForPliKf || periodicKf)) {
@@ -850,7 +928,7 @@ void ScreenEngine::captureEncodeLoop() {
                 allocWindowBuffers(curW, curH);
                 rebuildVideoProcessor();
             }
-            if (winMemDc && winBits && winUploadTex && PrintWindow(target_hwnd_, winMemDc, 2)) {
+            if (winMemDc && winBits && winUploadTex && !IsHungAppWindow(target_hwnd_) && PrintWindow(target_hwnd_, winMemDc, 2)) {
                 ctx->UpdateSubresource(winUploadTex.Get(), 0, nullptr, winBits, winTexW * 4, 0);
                 deskTex = winUploadTex;
             } else {
@@ -865,13 +943,16 @@ void ScreenEngine::captureEncodeLoop() {
         if ((deskTex || reencodeStaticKf) && hasVp) {
             auto tEnc0 = std::chrono::steady_clock::now();
 
+            drainAsyncEvents();
+            const bool canSubmit = hasHwEnc && encMft && ((!isAsyncMft) || (asyncNeedInput > 0));
             int surfIdx = nv12LastIdx;
             if (deskTex) {
-                surfIdx = nv12CurIdx;
+                // Only write/advance NV12 encoder ring when NVENC is ready for input; otherwise write dedicated scratch slot 4!
+                surfIdx = canSubmit ? nv12CurIdx : kPreviewScratchIdx;
                 D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
                 ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
                 if (isDualActive) {
-                    // ZERO-COPY Dual-Screen GPU Composite: Left half = Monitor 1, Right half = Monitor 2 (2px dark divider)!
+                    // ZERO-COPY Dual-Screen GPU Composite: Left half = Monitor 1, Right half = Monitor 2 (2px dark divider, aspect-preserving)!
                     ID3D11Texture2D* texL = dualCache0 ? dualCache0.Get() : deskTex.Get();
                     ID3D11Texture2D* texR = dualCache1 ? dualCache1.Get() : texL;
                     ComPtr<ID3D11VideoProcessorInputView> vpInL, vpInR;
@@ -882,25 +963,44 @@ void ScreenEngine::captureEncodeLoop() {
                         texR->GetDesc(&tdR);
                         RECT srcL{ 0, 0, LONG(tdL.Width), LONG(tdL.Height) };
                         RECT srcR{ 0, 0, LONG(tdR.Width), LONG(tdR.Height) };
-                        RECT rcL{ 0, 0, LONG(dstW / 2 - 2), LONG(dstH) };
-                        RECT rcR{ LONG(dstW / 2 + 2), 0, LONG(dstW), LONG(dstH) };
+                        RECT boxL{ 0, 0, LONG(dstW / 2 - 2), LONG(dstH) };
+                        RECT boxR{ LONG(dstW / 2 + 2), 0, LONG(dstW), LONG(dstH) };
+                        RECT rcL = fitLetterboxRect(tdL.Width, tdL.Height, boxL);
+                        RECT rcR = fitLetterboxRect(tdR.Width, tdR.Height, boxR);
                         D3D11_VIDEO_COLOR bg{};
                         bg.RGBA = { 0.04f, 0.04f, 0.06f, 1.0f };
                         vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bg);
-                        vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcL);
-                        vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &rcL);
-                        vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 1, TRUE, &srcR);
-                        vctx->VideoProcessorSetStreamDestRect(vp.Get(), 1, TRUE, &rcR);
-                        if (vctx1) {
-                            vctx1->VideoProcessorSetStreamColorSpace1(vp.Get(), 1, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                        if (canDualSingleBlt) {
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcL);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &rcL);
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 1, TRUE, &srcR);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 1, TRUE, &rcR);
+                            D3D11_VIDEO_PROCESSOR_STREAM sts[2]{};
+                            sts[0].Enable = TRUE; sts[0].pInputSurface = vpInL.Get();
+                            sts[1].Enable = TRUE; sts[1].pInputSurface = vpInR.Get();
+                            vctx->VideoProcessorBlt(vp.Get(), vpOutRing[surfIdx].Get(), 0, 2, sts);
+                        } else {
+                            // Safe 2-pass fallback for GPUs with MaxInputStreams == 1
+                            D3D11_VIDEO_PROCESSOR_STREAM st{};
+                            st.Enable = TRUE;
+                            vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &boxL);
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcL);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &rcL);
+                            st.pInputSurface = vpInL.Get();
+                            vctx->VideoProcessorBlt(vp.Get(), vpOutRing[surfIdx].Get(), 0, 1, &st);
+
+                            vctx->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, &boxR);
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &srcR);
+                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &rcR);
+                            st.pInputSurface = vpInR.Get();
+                            vctx->VideoProcessorBlt(vp.Get(), vpOutRing[surfIdx].Get(), 0, 1, &st);
+                            vctx->VideoProcessorSetOutputTargetRect(vp.Get(), FALSE, nullptr);
                         }
-                        D3D11_VIDEO_PROCESSOR_STREAM sts[2]{};
-                        sts[0].Enable = TRUE; sts[0].pInputSurface = vpInL.Get();
-                        sts[1].Enable = TRUE; sts[1].pInputSurface = vpInR.Get();
-                        vctx->VideoProcessorBlt(vp.Get(), vpOutRing[surfIdx].Get(), 0, 2, sts);
-                        nv12LastIdx = surfIdx;
-                        nv12CurIdx = (nv12CurIdx + 1) % kNv12Ring;
-                        hasLastNv12Frame = true;
+                        if (canSubmit) {
+                            nv12LastIdx = surfIdx;
+                            nv12CurIdx = (nv12CurIdx + 1) % kEncRing;
+                            hasLastNv12Frame = true;
+                        }
                     }
                 } else {
                     ComPtr<ID3D11VideoProcessorInputView> vpIn;
@@ -909,9 +1009,11 @@ void ScreenEngine::captureEncodeLoop() {
                         st.Enable = TRUE;
                         st.pInputSurface = vpIn.Get();
                         vctx->VideoProcessorBlt(vp.Get(), vpOutRing[surfIdx].Get(), 0, 1, &st);
-                        nv12LastIdx = surfIdx;
-                        nv12CurIdx = (nv12CurIdx + 1) % kNv12Ring;
-                        hasLastNv12Frame = true;
+                        if (canSubmit) {
+                            nv12LastIdx = surfIdx;
+                            nv12CurIdx = (nv12CurIdx + 1) % kEncRing;
+                            hasLastNv12Frame = true;
+                        }
                     }
                 }
             }
@@ -923,10 +1025,8 @@ void ScreenEngine::captureEncodeLoop() {
             }
 
             // Feed VRAM NV12 surface directly to Hardware NVENC MFT
-            if (hasHwEnc && encMft && nv12Ring[surfIdx]) {
-                drainAsyncEvents();
-                bool canSubmit = (!isAsyncMft) || (asyncNeedInput > 0);
-                if (canSubmit) {
+            if (canSubmit && nv12Ring[surfIdx]) {
+                {
                     auto nowKf2 = std::chrono::steady_clock::now();
                     bool wantKf = force_keyframe_.load() && (nowKf2 - lastKfTime >= std::chrono::milliseconds(500));
                     bool periodicKf2 = (nowKf2 - lastKfTime >= std::chrono::seconds(2));
@@ -1021,6 +1121,8 @@ void ScreenEngine::captureEncodeLoop() {
         ComPtr<IMFShutdown> shut;
         if (SUCCEEDED(encMft.As(&shut))) shut->Shutdown();
     }
+    reusableOutBuf.Reset();
+    reusableOutSample.Reset();
     encEvGen.Reset();
     encCodecApi.Reset();
     encMft.Reset();
@@ -1028,7 +1130,7 @@ void ScreenEngine::captureEncodeLoop() {
     previewSwap.Reset();
     prevVp.Reset();
     prevEnum.Reset();
-    for (int i = 0; i < kNv12Ring; ++i) { vpOutRing[i].Reset(); nv12Ring[i].Reset(); }
+    for (int i = 0; i < kNv12Total; ++i) { vpOutRing[i].Reset(); nv12Ring[i].Reset(); }
     vp.Reset();
     vpenum.Reset();
     dup.Reset();
@@ -1170,11 +1272,11 @@ void ScreenEngine::systemAudioLoop() {
                                     const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mixWf);
                                     isFloat = (ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
                                 }
-                                if (isFloat && mixWf->wBitsPerSample == 32) sampleFmt = 0;
-                                else if (mixWf->wBitsPerSample == 16) sampleFmt = 1;
-                                else if (mixWf->wBitsPerSample == 24) sampleFmt = 3; // 24-bit signed LE (USB DAC safe!)
-                                else sampleFmt = 2; // 32-bit int PCM
-                                started = true;
+                                if (isFloat && mixWf->wBitsPerSample == 32) { sampleFmt = 0; started = true; }
+                                else if (!isFloat && mixWf->wBitsPerSample == 16) { sampleFmt = 1; started = true; }
+                                else if (!isFloat && mixWf->wBitsPerSample == 24) { sampleFmt = 3; started = true; } // 24-bit signed LE (USB DAC safe!)
+                                else if (!isFloat && mixWf->wBitsPerSample == 32) { sampleFmt = 2; started = true; } // 32-bit int PCM
+                                else { ac->Stop(); cap.Reset(); ac.Reset(); }
                             }
                         }
                     }
@@ -1192,6 +1294,10 @@ void ScreenEngine::systemAudioLoop() {
             uint8_t opusBuf[1200];
             int activeHangFrames = 0;
             auto lastPktTime = std::chrono::steady_clock::now();
+            // Stateful fractional phase across WASAPI packets eliminates 100Hz boundary clicks at 44.1kHz / 96kHz!
+            double srcPhase = 0.0;
+            float prevL = 0.0f, prevR = 0.0f;
+            bool hasPrev = false;
 
             auto readSample = [&](const BYTE* base, uint32_t frameIdx, uint32_t chIdx) -> float {
                 uint32_t idx = frameIdx * srcCh + std::min(chIdx, srcCh - 1);
@@ -1237,26 +1343,45 @@ void ScreenEngine::systemAudioLoop() {
                 if (SUCCEEDED(hr)) {
                     lastPktTime = std::chrono::steady_clock::now();
                     if (frames > 0) {
-                        double ratio = 48000.0 / double(srcRate);
-                        uint32_t outF = (srcRate == 48000) ? frames : uint32_t(double(frames) * ratio + 0.5);
+                        const double step = double(srcRate) / 48000.0;
                         if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !data) {
-                            fifo.insert(fifo.end(), size_t(outF) * 2, 0.0f);
+                            while (srcPhase < double(frames) - 1.0 + (srcRate == 48000 ? 1.0 : 0.0)) {
+                                fifo.push_back(0.0f);
+                                fifo.push_back(0.0f);
+                                srcPhase += step;
+                            }
+                            srcPhase -= double(frames);
+                            prevL = 0.0f; prevR = 0.0f; hasPrev = true;
                         } else if (srcRate == 48000 && sampleFmt == 0 && srcCh == 2) {
                             const float* fp = reinterpret_cast<const float*>(data);
                             fifo.insert(fifo.end(), fp, fp + size_t(frames) * 2);
-                        } else {
-                            for (uint32_t i = 0; i < outF; ++i) {
-                                double srcPos = double(i) / ratio;
-                                uint32_t s0 = std::min<uint32_t>(frames - 1, uint32_t(srcPos));
-                                uint32_t s1 = std::min<uint32_t>(frames - 1, s0 + 1);
-                                float frac = float(srcPos - double(s0));
-                                float l = readSample(data, s0, 0) * (1.0f - frac) + readSample(data, s1, 0) * frac;
-                                float r = (srcCh >= 2)
-                                    ? (readSample(data, s0, 1) * (1.0f - frac) + readSample(data, s1, 1) * frac)
-                                    : l;
+                        } else if (srcRate == 48000) {
+                            for (uint32_t i = 0; i < frames; ++i) {
+                                float l = readSample(data, i, 0);
+                                float r = (srcCh >= 2) ? readSample(data, i, 1) : l;
                                 fifo.push_back(l);
                                 fifo.push_back(r);
                             }
+                        } else {
+                            auto getChan = [&](int32_t idx, uint32_t ch) -> float {
+                                if (idx < 0) return hasPrev ? (ch == 0 ? prevL : prevR) : readSample(data, 0, ch);
+                                return readSample(data, std::min<uint32_t>(uint32_t(idx), frames - 1), ch);
+                            };
+                            while (srcPhase < double(frames) - 1.0) {
+                                int32_t i0 = int32_t(std::floor(srcPhase));
+                                float frac = float(srcPhase - double(i0));
+                                float l = getChan(i0, 0) * (1.0f - frac) + getChan(i0 + 1, 0) * frac;
+                                float r = (srcCh >= 2)
+                                    ? (getChan(i0, 1) * (1.0f - frac) + getChan(i0 + 1, 1) * frac)
+                                    : l;
+                                fifo.push_back(l);
+                                fifo.push_back(r);
+                                srcPhase += step;
+                            }
+                            prevL = readSample(data, frames - 1, 0);
+                            prevR = (srcCh >= 2) ? readSample(data, frames - 1, 1) : prevL;
+                            hasPrev = true;
+                            srcPhase -= double(frames);
                         }
                     }
                     cap->ReleaseBuffer(frames);

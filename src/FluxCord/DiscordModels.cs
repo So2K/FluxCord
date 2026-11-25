@@ -6,6 +6,7 @@ public sealed class RtcRegionInfo
     public string Name = "";
     public int PingMs = -1; // -1 = measuring / unknown
     public bool Optimal;
+    public bool IsOfficialDiscordPing;
 }
 
 public sealed class DiscordUser
@@ -35,13 +36,20 @@ public sealed class DiscordFriend
         : $"https://cdn.discordapp.com/avatars/{UserId}/{Avatar}.png?size=64";
 }
 
+public readonly record struct ChannelOverwrite(string Id, int Type, ulong Allow, ulong Deny);
+
 public sealed class DiscordGuild
 {
     public string Id = "";
     public string Name = "";
     public string Icon = "";
+    public string OwnerId = "";
+    public ulong EveryonePerms = ulong.MaxValue;
+    public Dictionary<string, ulong> RolePerms = new();
+    public HashSet<string> MyRoleIds = [];
     public int UnreadCount;
     public List<DiscordChannel> Channels = [];
+    public List<DiscordChannel> AllChannels = [];
     public Dictionary<string, VoiceMember> VoiceStates = new();
 
     public string? IconUrl => string.IsNullOrEmpty(Icon)
@@ -61,6 +69,8 @@ public sealed class DiscordChannel
     public int Position;
     public string ParentId = "";
     public string LastMessageId = "";
+    public List<ChannelOverwrite> Overwrites = [];
+    public bool Inaccessible;
     public bool IsVoice => Type == 2 || Type == 13;
     public bool IsCategory => Type == 4;
     public string? DmAvatarUrl => string.IsNullOrEmpty(RecipientAvatar) || string.IsNullOrEmpty(RecipientId)
@@ -104,6 +114,14 @@ public sealed class DiscordEmbed
     public uint Color = 0xFF5865F2;
 }
 
+public sealed class ReactionEntry
+{
+    public string Display = ""; // e.g. "🔥" or ":custom:"
+    public string ApiKey = "";  // e.g. "🔥" or "custom:123456789"
+    public int Count;
+    public bool Me;
+}
+
 public sealed class DiscordMessage
 {
     public string Id = "";
@@ -117,9 +135,9 @@ public sealed class DiscordMessage
     public string ReplyPreview = "";
     public List<string> AttachmentUrls = [];
     public List<DiscordAttachment> Attachments = [];
-    public List<DiscordEmbed> Embeds = [];
-    public List<string> Reactions = [];
-    public HashSet<string> MyReactions = [];
+    // Immutable / copy-on-write arrays so Gateway thread mutations NEVER throw InvalidOperationException on Direct2D UI render thread!
+    public DiscordEmbed[] Embeds = [];
+    public ReactionEntry[] Reactions = [];
     public bool IsEdited;
     public bool Pending;
 

@@ -52,6 +52,7 @@ void VoiceTransport::daveDestroyLocked() {
     if (dave_enc_) { daveEncryptorDestroy(dave_enc_); dave_enc_ = nullptr; }
     if (dave_session_) { daveSessionDestroy(dave_session_); dave_session_ = nullptr; }
     dave_proto_ver_ = 0;
+    video_ssrc_ = 0;
     dave_enc_active_.store(false);
 }
 
@@ -67,10 +68,15 @@ bool VoiceTransport::daveInit(uint16_t protocol_version, uint64_t channel_id, co
     }
     if (!dave_session_ || !dave_enc_) return false;
 
-    daveEncryptorAssignSsrcToCodec(dave_enc_, self_ssrc, DAVE_CODEC_OPUS);
+    if (self_ssrc != 0) daveEncryptorAssignSsrcToCodec(dave_enc_, self_ssrc, DAVE_CODEC_OPUS);
+    if (video_ssrc_ != 0) daveEncryptorAssignSsrcToCodec(dave_enc_, video_ssrc_, DAVE_CODEC_H264);
     if (protocol_version > 0) {
         daveSessionInit(dave_session_, protocol_version, channel_id, self_user_id_.c_str());
-        daveEncryptorSetPassthroughMode(dave_enc_, false);
+        // If upgrading live from protocol 0 -> 1 while media is already flowing, stay in passthrough until OP 22 transition!
+        bool liveUnencryptedSession = (audio_tx_pkts_.load() > 0 || video_tx_pkts_.load() > 0) && !daveEncryptorHasKeyRatchet(dave_enc_);
+        if (!liveUnencryptedSession) {
+            daveEncryptorSetPassthroughMode(dave_enc_, false);
+        }
     } else {
         daveSessionReset(dave_session_);
         daveEncryptorSetPassthroughMode(dave_enc_, true);
@@ -86,6 +92,7 @@ void VoiceTransport::daveSetVideoSsrc(uint32_t video_ssrc) {
         if (sock_ != INVALID_SOCKET) optimizeUdpSocket(sock_, true, &remote_, &qos_flow_id_);
     }
     std::lock_guard lk(dave_mtx_);
+    video_ssrc_ = video_ssrc;
     if (!dave_enc_) dave_enc_ = daveEncryptorCreate();
     if (dave_enc_) daveEncryptorAssignSsrcToCodec(dave_enc_, video_ssrc, DAVE_CODEC_H264);
 }
@@ -95,12 +102,21 @@ void VoiceTransport::daveAddUser(const char* user_id) {
     std::lock_guard lk(dave_mtx_);
     if (!dave_session_) dave_session_ = daveSessionCreate(nullptr, nullptr, nullptr, nullptr);
     if (dave_session_) daveSessionAddRecognizedUser(dave_session_, user_id);
-    if (user_decryptors_.find(user_id) == user_decryptors_.end()) {
-        DAVEDecryptorHandle dec = daveDecryptorCreate();
+    auto& dec = user_decryptors_[user_id];
+    if (!dec) {
+        dec = daveDecryptorCreate();
         if (dec) {
             daveDecryptorTransitionToPassthroughMode(dec, dave_proto_ver_ == 0);
-            user_decryptors_[user_id] = dec;
             user_has_ratchet_[user_id] = false;
+        }
+    }
+    if (dec && dave_session_ && dave_proto_ver_ > 0 && !user_has_ratchet_[user_id]) {
+        DAVEKeyRatchetHandle kr = daveSessionGetKeyRatchet(dave_session_, user_id);
+        if (kr) {
+            daveDecryptorTransitionToPassthroughMode(dec, false);
+            daveDecryptorTransitionToKeyRatchet(dec, kr);
+            daveKeyRatchetDestroy(kr);
+            user_has_ratchet_[user_id] = true;
         }
     }
 }
@@ -183,14 +199,16 @@ int32_t VoiceTransport::daveProcessProposals(const uint8_t* data, int32_t len, u
     return n;
 }
 
-bool VoiceTransport::daveProcessCommit(const uint8_t* data, int32_t len) {
+int32_t VoiceTransport::daveProcessCommit(const uint8_t* data, int32_t len) {
     std::lock_guard lk(dave_mtx_);
-    if (!dave_session_ || !data || len <= 0) return false;
+    if (!dave_session_ || !data || len <= 0) return 0;
     DAVECommitResultHandle res = daveSessionProcessCommit(dave_session_, data, size_t(len));
-    if (!res) return false;
-    bool ok = !daveCommitResultIsFailed(res);
+    if (!res) return 0;
+    bool ignored = daveCommitResultIsIgnored(res);
+    bool failed = daveCommitResultIsFailed(res);
     daveCommitResultDestroy(res);
-    return ok;
+    if (ignored) return 2;
+    return failed ? 0 : 1;
 }
 
 bool VoiceTransport::daveProcessWelcome(const uint8_t* data, int32_t len) {
@@ -244,13 +262,14 @@ void VoiceTransport::daveExecuteTransition(uint16_t protocol_version) {
 bool VoiceTransport::connectAndDiscover(const char* ip, uint16_t port, uint32_t ssrc, std::string& out_ext_ip, uint16_t& out_ext_port) {
     if (!ip || !*ip) return false;
     std::lock_guard life(lifecycle_mtx_);
-    disconnectLocked();
+    // Close ONLY UDP socket & RX thread — preserve pre-populated DAVE recognizedUsers & video_ssrc_!
+    closeTransportLocked();
     ssrc_.store(ssrc);
 
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return false;
 
-    DWORD timeoutMs = 1500;
+    DWORD timeoutMs = 500;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
     sockaddr_in rem{};
@@ -277,12 +296,28 @@ bool VoiceTransport::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
     }
 
     uint8_t resp[128]{};
-    sockaddr_in from{};
-    int fromLen = sizeof(from);
-    int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
-                     reinterpret_cast<sockaddr*>(&from), &fromLen);
-    QueryPerformanceCounter(&t1);
-    if (n < 74 || getBE16(resp) != 0x0002) {
+    bool discOk = false;
+    int64_t deadlineMs = steadyMs() + 1500;
+    while (steadyMs() < deadlineMs) {
+        sockaddr_in from{};
+        int fromLen = sizeof(from);
+        int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
+                         reinterpret_cast<sockaddr*>(&from), &fromLen);
+        if (n < 0) {
+            // Retry one sendto on packet loss
+            sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
+                   reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
+            continue;
+        }
+        if (from.sin_addr.s_addr == rem.sin_addr.s_addr &&
+            from.sin_port == rem.sin_port &&
+            n >= 74 && getBE16(resp) == 0x0002 && getBE32(resp + 4) == ssrc) {
+            QueryPerformanceCounter(&t1);
+            discOk = true;
+            break;
+        }
+    }
+    if (!discOk) {
         closesocket(s);
         return false;
     }
@@ -307,6 +342,7 @@ bool VoiceTransport::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
         video_seq_ = 0;
         nonce_counter_ = 1;
         last_audio_ts_ = 0;
+        has_audio_ts_ = false;
     }
 
     connected_.store(true);
@@ -328,7 +364,7 @@ void VoiceTransport::disconnect() {
     disconnectLocked();
 }
 
-void VoiceTransport::disconnectLocked() {
+void VoiceTransport::closeTransportLocked() {
     running_.store(false);
     connected_.store(false);
     has_key_.store(false);
@@ -347,10 +383,7 @@ void VoiceTransport::disconnectLocked() {
             closesocket(sock_);
             sock_ = INVALID_SOCKET;
         }
-    }
-    {
-        std::lock_guard lk(dave_mtx_);
-        daveDestroyLocked();
+        has_audio_ts_ = false;
     }
     {
         std::lock_guard lk(video_mtx_);
@@ -362,6 +395,12 @@ void VoiceTransport::disconnectLocked() {
     video_tx_pkts_.store(0);
     rx_pkts_.store(0);
     pli_rx_.store(0);
+}
+
+void VoiceTransport::disconnectLocked() {
+    closeTransportLocked();
+    std::lock_guard lk(dave_mtx_);
+    daveDestroyLocked();
 }
 
 bool VoiceTransport::sendEncryptedRtpLocked(uint8_t payload_type, uint16_t seq, uint32_t ts, uint32_t ssrc, bool marker, const uint8_t* payload, int len) {
@@ -443,11 +482,12 @@ bool VoiceTransport::sendOpus(const uint8_t* opus, int len, uint32_t timestamp) 
     }
 
     std::lock_guard lk(tx_mtx_);
-    // Keep RTP audio timestamps strictly monotonic even across sendSilenceFrames()
-    if (last_audio_ts_ != 0 && int32_t(timestamp - last_audio_ts_) <= 0) {
+    // Keep RTP audio timestamps strictly monotonic even across sendSilenceFrames() & 32-bit wraparound!
+    if (has_audio_ts_ && int32_t(timestamp - last_audio_ts_) <= 0) {
         timestamp = last_audio_ts_ + 960;
     }
     last_audio_ts_ = timestamp;
+    has_audio_ts_ = true;
     return sendEncryptedRtpLocked(120, audio_seq_++, timestamp, mySsrc, false, payload, payloadLen);
 }
 
@@ -457,7 +497,8 @@ void VoiceTransport::sendSilenceFrames() {
     uint32_t mySsrc = ssrc_.load();
     std::lock_guard lk(tx_mtx_);
     for (int i = 0; i < 5; ++i) {
-        last_audio_ts_ += 960;
+        last_audio_ts_ = has_audio_ts_ ? (last_audio_ts_ + 960) : 960;
+        has_audio_ts_ = true;
         sendEncryptedRtpLocked(120, audio_seq_++, last_audio_ts_, mySsrc, false, kSilence, 3);
     }
 }
@@ -607,6 +648,53 @@ bool VoiceTransport::sendH264AccessUnit(const uint8_t* annexb, int len, uint32_t
     return true;
 }
 
+bool VoiceTransport::decryptAndCheckRtcpPli(const uint8_t* pkt, int n, const uint8_t key[32], bool use_xchacha) {
+    if (!pkt || !key || n < 28) return false;
+    if ((pkt[0] & 0xC0) != 0x80) return false;
+    uint8_t ptFull = pkt[1];
+    if (ptFull < 200 || ptFull > 207) return false;
+
+    uint8_t nonce[24]{};
+    std::memcpy(nonce, pkt + n - 4, 4);
+
+    uint8_t rtcpBuf[2048]{};
+    if (n > int(sizeof(rtcpBuf))) return false;
+    std::memcpy(rtcpBuf, pkt, 8);
+
+    unsigned long long plen = 0;
+    int cipherLen = n - 8 - 4;
+    bool ok = false;
+    if (use_xchacha) {
+        if (cipherLen < 16) return false;
+        ok = crypto_aead_xchacha20poly1305_ietf_decrypt(
+                 rtcpBuf + 8, &plen, nullptr,
+                 pkt + 8, size_t(cipherLen),
+                 pkt, 8,
+                 nonce, key) == 0;
+    } else {
+        if (cipherLen < int(crypto_secretbox_MACBYTES)) return false;
+        ok = crypto_secretbox_open_easy(rtcpBuf + 8, pkt + 8, size_t(cipherLen), nonce, key) == 0;
+        plen = size_t(cipherLen - int(crypto_secretbox_MACBYTES));
+    }
+    if (!ok || plen < 4) return false;
+
+    int totalLen = 8 + int(plen);
+    // Walk compound RTCP sub-packets (e.g. SR=200 / RR=201 followed by PSFB=206 PLI FMT=1 or FIR FMT=4!)
+    int off = 0;
+    while (off + 4 <= totalLen) {
+        if ((rtcpBuf[off] & 0xC0) != 0x80) break;
+        uint8_t fmt = rtcpBuf[off] & 0x1F;
+        uint8_t subPt = rtcpBuf[off + 1];
+        int subBytes = (int(getBE16(rtcpBuf + off + 2)) + 1) * 4;
+        if (subBytes <= 0 || off + subBytes > totalLen) break;
+        if (subPt == 206 && (fmt == 1 || fmt == 4)) {
+            return true;
+        }
+        off += subBytes;
+    }
+    return false;
+}
+
 void VoiceTransport::rxLoop() {
     HANDLE mm = boostRealtimeThread(L"Pro Audio");
     uint8_t buf[2048];
@@ -638,22 +726,8 @@ void VoiceTransport::rxLoop() {
         int n = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n < 12 || !has_key_.load()) continue;
-        if (from.sin_addr.s_addr != rem.sin_addr.s_addr) continue; // drop spoofed foreign packets
-
-        uint8_t ptFull = buf[1];
-        uint8_t pt = ptFull & 0x7F;
-        // Detect incoming RTCP PSFB (PT=206: PLI FMT=1 / FIR FMT=4) -> immediately force an NVENC IDR keyframe for viewers!
-        if (ptFull == 206 || ptFull == 205) {
-            uint8_t fmt = buf[0] & 0x1F;
-            if (ptFull == 206 && (fmt == 1 || fmt == 4)) {
-                pli_rx_.fetch_add(1);
-                std::function<void()> cb;
-                { std::lock_guard clk(cb_mtx_); cb = pli_cb_; }
-                if (cb) cb();
-            }
-            continue;
-        }
-        if (n < 28 || (pt >= 72 && pt <= 76)) continue; // Other RTCP (SR/RR)
+        // Drop spoofed foreign IP or port packets!
+        if (from.sin_addr.s_addr != rem.sin_addr.s_addr || from.sin_port != rem.sin_port) continue;
 
         uint8_t localKey[32];
         bool useXchacha = true;
@@ -662,6 +736,20 @@ void VoiceTransport::rxLoop() {
             std::memcpy(localKey, key_, 32);
             useXchacha = use_xchacha_;
         }
+
+        uint8_t ptFull = buf[1];
+        uint8_t pt = ptFull & 0x7F;
+        // Authenticate & walk incoming encrypted compound RTCP (SR/RR + PSFB PT=206 PLI/FIR)
+        if (ptFull >= 200 && ptFull <= 207) {
+            if (decryptAndCheckRtcpPli(buf, n, localKey, useXchacha)) {
+                pli_rx_.fetch_add(1);
+                std::function<void()> cb;
+                { std::lock_guard clk(cb_mtx_); cb = pli_cb_; }
+                if (cb) cb();
+            }
+            continue;
+        }
+        if (n < 28 || (pt >= 72 && pt <= 79)) continue;
 
         uint8_t cc = buf[0] & 0x0F;
         bool ext = (buf[0] & 0x10) != 0;
@@ -737,14 +825,16 @@ void VoiceTransport::rxLoop() {
                             }
                         }
                     }
-                    // Fallback: if SSRC arrived before OP 5 SPEAKING, probe only ratcheted non-passthrough decryptors!
+                    // Fallback: if SSRC arrived before OP 5 SPEAKING, probe only ratcheted decryptors
+                    // AND only cache ssrc_to_user_ if frame has DAVE magic trailer 0xFA,0xFA (prevents transition passthrough misbinding!)
                     if (!decrypted && itU == ssrc_to_user_.end()) {
+                        const bool hasDaveTrailer = (opusLen >= 12 && opusPtr[opusLen - 2] == 0xFA && opusPtr[opusLen - 1] == 0xFA);
                         for (auto& [uid, dec] : user_decryptors_) {
                             if (!dec || !user_has_ratchet_[uid]) continue;
                             size_t written = 0;
                             if (daveDecryptorDecrypt(dec, DAVE_MEDIA_TYPE_AUDIO, opusPtr, size_t(opusLen),
                                                      daveOut, sizeof(daveOut), &written) == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS && written > 0) {
-                                ssrc_to_user_[ssrc] = uid;
+                                if (hasDaveTrailer) ssrc_to_user_[ssrc] = uid;
                                 opusPtr = daveOut;
                                 opusLen = int(written);
                                 decrypted = true;

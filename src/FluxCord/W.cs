@@ -69,6 +69,7 @@ internal static unsafe partial class W
     [LibraryImport("user32.dll")] public static partial nint LoadCursorW(nint inst, nint id);
     [LibraryImport("user32.dll")] public static partial nint LoadImageW(nint inst, nint name, uint type, int cx, int cy, uint fuLoad);
     [LibraryImport("user32.dll")] public static partial int GetSystemMetrics(int nIndex);
+    [LibraryImport("user32.dll")] public static partial int GetSystemMetricsForDpi(int nIndex, uint dpi);
     [LibraryImport("user32.dll")] public static partial nint SetCursor(nint cur);
     [LibraryImport("user32.dll")] public static partial nint SetCapture(nint h);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool ReleaseCapture();
@@ -137,24 +138,38 @@ internal static unsafe partial class W
     public static bool AsyncKeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
     public static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
 
-    public static int ResolveKeyVk(string keyName) => (keyName ?? "").Trim().ToUpperInvariant() switch
+    public static int ResolveKeyVk(string keyName)
     {
-        "LCONTROL" or "CTRL" or "CONTROL" => 0xA2,
-        "RCONTROL" or "RCTRL" => 0xA3,
-        "LSHIFT" or "SHIFT" => 0xA0,
-        "RSHIFT" => 0xA1,
-        "LMENU" or "LALT" or "ALT" => 0xA4,
-        "RMENU" or "RALT" => 0xA5,
-        "CAPSLOCK" or "CAPS" => 0x14,
-        "XBUTTON1" or "MOUSE4" => 0x05,
-        "XBUTTON2" or "MOUSE5" => 0x06,
-        "SPACE" => 0x20,
-        "V" => 0x56,
-        "T" => 0x54,
-        "G" => 0x47,
-        "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
-        _ => VK_RCONTROL
-    };
+        string k = (keyName ?? "").Trim().ToUpperInvariant();
+        if (k.Length == 4 && k.StartsWith("KEY", StringComparison.Ordinal) && k[3] is >= 'A' and <= 'Z')
+            return k[3];
+        if (k.Length == 1 && k[0] is >= 'A' and <= 'Z')
+            return k[0];
+        if (k.Length == 6 && k.StartsWith("DIGIT", StringComparison.Ordinal) && k[5] is >= '0' and <= '9')
+            return k[5];
+        if (k.Length == 1 && k[0] is >= '0' and <= '9')
+            return k[0];
+        return k switch
+        {
+            "LCONTROL" or "CONTROLLEFT" or "CTRL" or "CONTROL" => 0xA2,
+            "RCONTROL" or "CONTROLRIGHT" or "RCTRL" => 0xA3,
+            "LSHIFT" or "SHIFTLEFT" or "SHIFT" => 0xA0,
+            "RSHIFT" or "SHIFTRIGHT" => 0xA1,
+            "LMENU" or "ALTLEFT" or "LALT" or "ALT" => 0xA4,
+            "RMENU" or "ALTRIGHT" or "RALT" => 0xA5,
+            "CAPSLOCK" or "CAPS" => 0x14,
+            "TAB" => 0x09,
+            "BACKQUOTE" or "TILDE" or "`" => 0xC0,
+            "MBUTTON" or "MOUSE3" or "MOUSEBUTTON2" => 0x04,
+            "XBUTTON1" or "MOUSE4" or "MOUSEBUTTON3" => 0x05,
+            "XBUTTON2" or "MOUSE5" or "MOUSEBUTTON4" => 0x06,
+            "SPACE" => 0x20,
+            "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
+            "F5" => 0x74, "F6" => 0x75, "F7" => 0x76, "F8" => 0x77,
+            "F9" => 0x78, "F10" => 0x79, "F11" => 0x7A, "F12" => 0x7B,
+            _ => VK_RCONTROL
+        };
+    }
 
     public static void CopyText(nint hwnd, string text)
     {
@@ -202,12 +217,15 @@ internal static unsafe partial class W
             try
             {
                 uint biSize = *(uint*)ptr;
+                if (biSize < 40 || biSize > (uint)dibSize - 4) return null;
                 ushort bitCount = *(ushort*)((byte*)ptr + 14);
                 uint compression = *(uint*)((byte*)ptr + 16);
                 uint clrUsed = *(uint*)((byte*)ptr + 32);
-                uint paletteBytes = clrUsed > 0 ? clrUsed * 4 : (bitCount <= 8 ? (1u << bitCount) * 4 : (compression == 3 && biSize == 40 ? 12u : 0u));
+                if (clrUsed > 65536) return null;
+                uint paletteBytes = clrUsed > 0 ? clrUsed * 4 : (bitCount is > 0 and <= 8 ? (1u << bitCount) * 4 : (compression == 3 && biSize == 40 ? 12u : 0u));
                 uint pixelOff = 14 + biSize + paletteBytes;
                 uint fileSize = 14 + (uint)dibSize;
+                if (pixelOff > fileSize) return null;
 
                 bmp = new byte[fileSize];
                 bmp[0] = (byte)'B'; bmp[1] = (byte)'M';

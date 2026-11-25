@@ -27,13 +27,14 @@ public:
     void resize(int32_t w, int32_t h);
     void stop();
 
-    // DAVE E2EE for stream session
+    // DAVE E2EE for stream session (daveProcessCommit returns: 1=applied, 2=ignored, 0=failed)
     bool daveInit(uint16_t proto_ver, uint64_t channel_id, const char* self_user_id, uint32_t self_ssrc);
     void daveAddUser(const char* user_id);
+    void daveRemoveUser(const char* user_id);
     int32_t daveGetKeyPackage(uint8_t* out_buf, int32_t cap);
     void daveSetExternalSender(const uint8_t* data, int32_t len);
     int32_t daveProcessProposals(const uint8_t* data, int32_t len, uint8_t* out_cw, int32_t cap);
-    bool daveProcessCommit(const uint8_t* data, int32_t len);
+    int32_t daveProcessCommit(const uint8_t* data, int32_t len);
     bool daveProcessWelcome(const uint8_t* data, int32_t len);
     void daveExecuteTransition(uint16_t proto_ver);
 
@@ -41,6 +42,7 @@ public:
 
 private:
     void rxDecodeLoop();
+    void closeTransportLocked();
     void stopLocked();
     void daveDestroyLocked();
     uint32_t makeVoiceAudioKey(uint32_t audio_ssrc) const {
@@ -76,10 +78,12 @@ private:
     DAVEDecryptorHandle dave_dec_ = nullptr;
     std::string streamer_uid_;
     uint16_t dave_proto_ver_ = 0;
+    bool dave_has_ratchet_ = false;
 
     mutable std::mutex stats_mtx_;
     FcScreenStats stats_{};
 
+    HANDLE worker_done_ev_ = nullptr;
     std::thread worker_;
 };
 

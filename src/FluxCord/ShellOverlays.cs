@@ -275,15 +275,9 @@ public static unsafe partial class Shell
             { s.StreamFps = fpsList[i]; changed = true; }
         }
 
-        string[] codList = ["H.264", "HEVC", "AV1"];
-        float cx = box.X + pad + 320;
-        float cw = (box.Right - pad - cx - 8) / 3f;
-        for (int i = 0; i < codList.Length; i++)
-        {
-            bool sel = s.StreamCodec == i;
-            if (UI.Button(UI.Id("sh_cod", i), new R(cx + i * (cw + 4), sy, cw, 30), codList[i], sel ? Th.Brand : Th.Card, Th.Text, 6, 11.5f))
-            { s.StreamCodec = i; changed = true; }
-        }
+        float cx = box.X + pad + 320f;
+        Gfx.FillRect(new R(cx, sy, box.Right - pad - cx, 30), Th.Brand, 6);
+        Gfx.DrawText("H.264 NVENC (Go Live)", new R(cx + 4, sy + 7, box.Right - pad - cx - 8, 16), 11.5f, 0xFFFFFFFF, 700, 1);
         sy += 42;
 
         // Capture System Audio checkbox + big "Go Live" button
@@ -864,14 +858,9 @@ public static unsafe partial class Shell
             }
             y += 44;
 
-            (int C, string L)[] codP = [(0, "H.264 NVENC"), (1, "HEVC NVENC"), (2, "AV1 NVENC")];
-            float cw = (pw - 12) / 3f;
-            for (int i = 0; i < 3; i++)
-            {
-                bool sel = s.StreamCodec == codP[i].C;
-                if (UI.Button(UI.Id("sc", i), new R(px + i * (cw + 6), y, cw, 34), codP[i].L, sel ? Th.Brand : Th.Card, Th.Text, 6, 12.5f))
-                { s.StreamCodec = codP[i].C; changed = true; }
-            }
+            Gfx.FillRect(new R(px, y, pw, 34), 0x225865F2, 6);
+            Gfx.StrokeRect(new R(px, y, pw, 34), Th.Brand, 1, 6);
+            Gfx.DrawText("Кодек трансляции: H.264 NVENC (аппаратный профиль Discord Go Live + DAVE E2EE)", new R(px + 12, y + 9, pw - 24, 16), 12f, Th.Text, 600);
             y += 48;
 
             float kbps = s.StreamBitrateKbps / 1000f;
@@ -1402,7 +1391,8 @@ public static unsafe partial class Shell
         bool inVoice = false;
         if (!string.IsNullOrEmpty(_profileGuildId))
         {
-            var g = dc.Guilds.FirstOrDefault(x => x.Id == _profileGuildId);
+            DiscordGuild? g;
+            lock (dc.Guilds) g = dc.Guilds.FirstOrDefault(x => x.Id == _profileGuildId);
             if (g != null) lock (g.VoiceStates) inVoice = g.VoiceStates.ContainsKey(uid);
         }
 

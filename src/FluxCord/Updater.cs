@@ -42,10 +42,11 @@ public sealed class ResumeSession
 /// </summary>
 public static class Updater
 {
-    public const string CurrentVersion = "1.0.3";
+    public const string CurrentVersion = "1.0.4";
     public const string Repo = "So2K/FluxCord";
     public static readonly string UpdatesDir = Path.Combine(SettingsStore.DataDir, "updates");
     public static readonly string ResumePath = Path.Combine(SettingsStore.DataDir, "resume_session.json");
+    public static readonly string ErrorMarkerPath = Path.Combine(UpdatesDir, "update_error.txt");
 
     private static readonly HttpClient Http = MakeClient();
     private static volatile bool _checking, _downloading, _applying, _autoApplyQueued;
@@ -76,15 +77,103 @@ public static class Updater
         return c;
     }
 
-    private static string? FindStagedExeDir(string stageRoot)
+    private static bool IsSafeVersionTag(string ver)
+    {
+        if (string.IsNullOrWhiteSpace(ver) || ver.Length > 40) return false;
+        if (ver[0] < '0' || ver[0] > '9') return false;
+        if (ver.Contains("..", StringComparison.Ordinal)) return false;
+        foreach (char c in ver)
+        {
+            bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == '-';
+            if (!ok) return false;
+        }
+        string rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(UpdatesDir)) + Path.DirectorySeparatorChar;
+        string candFull = Path.GetFullPath(Path.Combine(UpdatesDir, "v" + ver));
+        return candFull.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsValidHexSha256(string? s)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length != 64) return false;
+        foreach (char c in s)
+        {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
+    private static string? ExtractSha256FromReleaseBody(string body, string? assetName)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return null;
+        // Scan release body for a 64-hex SHA-256 (preferring after assetName or "SHA-256")
+        int searchStart = 0;
+        if (!string.IsNullOrEmpty(assetName))
+        {
+            int idx = body.IndexOf(assetName, StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0) searchStart = idx;
+        }
+        if (searchStart == 0)
+        {
+            int idx2 = body.IndexOf("SHA-256", StringComparison.OrdinalIgnoreCase);
+            if (idx2 >= 0) searchStart = idx2;
+        }
+        for (int pass = 0; pass < 2; pass++)
+        {
+            int start = pass == 0 ? searchStart : 0;
+            int run = 0;
+            for (int i = start; i < body.Length; i++)
+            {
+                char c = body[i];
+                bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (hex)
+                {
+                    run++;
+                    if (run == 64)
+                    {
+                        bool nextHex = (i + 1 < body.Length) &&
+                            ((body[i + 1] >= '0' && body[i + 1] <= '9') ||
+                             (body[i + 1] >= 'a' && body[i + 1] <= 'f') ||
+                             (body[i + 1] >= 'A' && body[i + 1] <= 'F'));
+                        if (!nextHex) return body.Substring(i - 63, 64).ToLowerInvariant();
+                    }
+                }
+                else run = 0;
+            }
+        }
+        return null;
+    }
+
+    private static string? FindStagedExeDir(string stageRoot, string? expectedSha256 = null)
     {
         if (!Directory.Exists(stageRoot)) return null;
+        if (!string.IsNullOrEmpty(expectedSha256))
+        {
+            string marker = Path.Combine(stageRoot, ".verified_sha256");
+            if (!File.Exists(marker)) return null;
+            string saved = "";
+            try { saved = File.ReadAllText(marker).Trim(); } catch { }
+            if (!string.Equals(saved, expectedSha256, StringComparison.OrdinalIgnoreCase)) return null;
+        }
         if (File.Exists(Path.Combine(stageRoot, "FluxCord.exe"))) return stageRoot;
         return Directory.GetDirectories(stageRoot).FirstOrDefault(d => File.Exists(Path.Combine(d, "FluxCord.exe")));
     }
 
     public static void InitOnStartup(bool resumedArg)
     {
+        // Surface any swap failure marker written by apply_update.ps1
+        try
+        {
+            if (File.Exists(ErrorMarkerPath))
+            {
+                string err = File.ReadAllText(ErrorMarkerPath).Trim();
+                try { File.Delete(ErrorMarkerPath); } catch { }
+                SettingsStore.Log("Updater previous swap failed (rolled back): " + err);
+                StatusText = "Предыдущее обновление откачено (файлы были заняты)";
+            }
+        }
+        catch { }
+
         // Clean leftover hot-swap files & old cached update folders
         try
         {
@@ -204,24 +293,27 @@ public static class Updater
                                 string d = de.GetString() ?? "";
                                 if (d.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)) sha256 = d[7..].Trim().ToLowerInvariant();
                             }
+                            if (!IsValidHexSha256(sha256))
+                                sha256 = ExtractSha256FromReleaseBody(body, zipName);
                             if (preferred) break;
                         }
                     }
                 }
 
-                bool newer = IsNewer(tag, CurrentVersion) && !string.IsNullOrEmpty(zipUrl);
+                // Strict security checks: valid non-traversal SemVer tag + valid 64-hex SHA-256 required!
+                bool newer = IsSafeVersionTag(tag) && IsNewer(tag, CurrentVersion) && !string.IsNullOrEmpty(zipUrl) && IsValidHexSha256(sha256);
                 _checking = false;
 
                 if (newer)
                 {
                     AvailableVersion = tag;
                     DownloadUrl = zipUrl;
-                    AssetName = zipName ?? $"FluxCord-{tag}-win-x64.zip";
+                    AssetName = Path.GetFileName(zipName ?? $"FluxCord-{tag}-win-x64.zip");
                     AssetSize = zipSize;
                     ExpectedSha256 = sha256;
                     ReleaseNotes = TruncateSafe(body, 420);
 
-                    string? preStage = FindStagedExeDir(Path.Combine(UpdatesDir, "v" + tag, "stage"));
+                    string? preStage = FindStagedExeDir(Path.Combine(UpdatesDir, "v" + tag, "stage"), ExpectedSha256);
                     if (preStage != null)
                     {
                         StagedDir = preStage;
@@ -293,9 +385,19 @@ public static class Updater
         if (autoApply) _autoApplyQueued = true;
         Progress = 0;
         string ver = AvailableVersion;
+        if (!IsSafeVersionTag(ver))
+        {
+            _downloading = false;
+            _autoApplyQueued = false;
+            return;
+        }
         string url = DownloadUrl;
+        string? wantSha = ExpectedSha256;
         string verDir = Path.Combine(UpdatesDir, "v" + ver);
-        string zipPath = Path.Combine(verDir, AssetName ?? $"FluxCord-{ver}-win-x64.zip");
+        string safeAsset = Path.GetFileName(AssetName ?? $"FluxCord-{ver}-win-x64.zip");
+        if (string.IsNullOrEmpty(safeAsset) || !safeAsset.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+            safeAsset = $"FluxCord-{ver}-win-x64.zip";
+        string zipPath = Path.Combine(verDir, safeAsset);
         string partPath = zipPath + ".part";
         string stageRoot = Path.Combine(verDir, "stage");
 
@@ -335,13 +437,15 @@ public static class Updater
                 }
             }
 
-            if (!string.IsNullOrEmpty(ExpectedSha256))
+            if (!IsValidHexSha256(wantSha))
+                throw new InvalidOperationException("Отсутствует SHA-256 подпись релиза!");
+
+            StatusText = $"Проверка SHA-256 v{ver}...";
+            App.WakeUi();
+            await using (var fs = File.OpenRead(partPath))
             {
-                StatusText = $"Проверка SHA-256 v{ver}...";
-                App.WakeUi();
-                await using var fs = File.OpenRead(partPath);
                 var hash = Convert.ToHexString(await SHA256.HashDataAsync(fs)).ToLowerInvariant();
-                if (!string.Equals(hash, ExpectedSha256, StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(hash, wantSha, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("Контрольная сумма SHA-256 не совпала!");
             }
 
@@ -354,8 +458,9 @@ public static class Updater
             if (Directory.Exists(stageRoot)) Directory.Delete(stageRoot, true);
             Directory.CreateDirectory(stageRoot);
             ZipFile.ExtractToDirectory(zipPath, stageRoot, overwriteFiles: true);
+            File.WriteAllText(Path.Combine(stageRoot, ".verified_sha256"), wantSha!);
 
-            string? stageDir = FindStagedExeDir(stageRoot);
+            string? stageDir = FindStagedExeDir(stageRoot, wantSha);
             if (stageDir == null)
                 throw new InvalidOperationException("В архиве обновления не найден FluxCord.exe");
 
@@ -409,10 +514,11 @@ public static class Updater
             SettingsStore.Log($"Updater: saved resume_session.json (voice={snap.VoiceChannelId}, watches={snap.WatchedStreams.Count}, streaming={snap.WasStreaming})");
 
             int pid = Environment.ProcessId;
-            string appDir = AppContext.BaseDirectory.TrimEnd('\\', '/');
-            string stageDir = StagedDir.TrimEnd('\\', '/');
+            string appDir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
+            string stageDir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(StagedDir));
             string backupDir = Path.Combine(UpdatesDir, "backup_prev");
             string swapPs1 = Path.Combine(UpdatesDir, "apply_update.ps1");
+            string errFile = ErrorMarkerPath;
             string newExe = Path.Combine(appDir, "FluxCord.exe");
 
             static string PsQuote(string s) => "'" + s.Replace("'", "''") + "'";
@@ -422,6 +528,7 @@ $pidTarget = {pid}
 $src = {PsQuote(stageDir)}
 $dst = {PsQuote(appDir)}
 $bak = {PsQuote(backupDir)}
+$errOut = {PsQuote(errFile)}
 $exe = {PsQuote(newExe)}
 
 # Wait cleanly up to 8 seconds for FluxCord to flush SQLite/GPU/Discord Disconnect
@@ -437,7 +544,7 @@ Start-Sleep -Milliseconds 120
 # Full backup of existing app files for atomic rollback safety
 if (Test-Path $bak) {{ Remove-Item $bak -Recurse -Force }}
 New-Item -ItemType Directory -Force -Path $bak | Out-Null
-Get-ChildItem -Path $src -Recurse -File | ForEach-Object {{
+Get-ChildItem -Path $src -Recurse -File | Where-Object {{ $_.Name -ne '.verified_sha256' }} | ForEach-Object {{
     $rel = $_.FullName.Substring($src.Length).TrimStart('\','/')
     $dstFile = Join-Path $dst $rel
     if (Test-Path $dstFile) {{
@@ -449,23 +556,32 @@ Get-ChildItem -Path $src -Recurse -File | ForEach-Object {{
 
 # Copy staged release files with retry + automatic rollback on any failure
 $ok = $true
-for ($try = 0; $try -lt 5; $try++) {{
+$lastErr = ''
+for ($try = 0; $try -lt 6; $try++) {{
     $ok = $true
-    Get-ChildItem -Path $src -Recurse -File | ForEach-Object {{
-        $rel = $_.FullName.Substring($src.Length).TrimStart('\','/')
+    Get-ChildItem -Path $src -Recurse -File | Where-Object {{ $_.Name -ne '.verified_sha256' }} | ForEach-Object {{
+        $srcFile = $_.FullName
+        $rel = $srcFile.Substring($src.Length).TrimStart('\','/')
         $dstFile = Join-Path $dst $rel
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dstFile) | Out-Null
-        try {{ Copy-Item $_.FullName $dstFile -Force -ErrorAction Stop }} catch {{ $ok = $false }}
+        try {{ Copy-Item $srcFile $dstFile -Force -ErrorAction Stop }} catch {{ $ok = $false; $lastErr = $_.Exception.Message }}
     }}
     if ($ok) {{ break }}
     Start-Sleep -Milliseconds 250
 }}
 
 if (-not $ok) {{
-    Get-ChildItem -Path $bak -Recurse -File | ForEach-Object {{
-        $rel = $_.FullName.Substring($bak.Length).TrimStart('\','/')
-        $dstFile = Join-Path $dst $rel
-        Copy-Item $_.FullName $dstFile -Force
+    Set-Content -Path $errOut -Value $lastErr -Encoding UTF8
+    for ($rtry = 0; $rtry -lt 4; $rtry++) {{
+        $rbOk = $true
+        Get-ChildItem -Path $bak -Recurse -File | ForEach-Object {{
+            $bakFile = $_.FullName
+            $rel = $bakFile.Substring($bak.Length).TrimStart('\','/')
+            $dstFile = Join-Path $dst $rel
+            try {{ Copy-Item $bakFile $dstFile -Force -ErrorAction Stop }} catch {{ $rbOk = $false }}
+        }}
+        if ($rbOk) {{ break }}
+        Start-Sleep -Milliseconds 200
     }}
 }}
 
@@ -498,15 +614,38 @@ Remove-Item $MyInvocation.MyCommand.Path -Force
     public static bool IsNewer(string remote, string local)
     {
         if (string.IsNullOrWhiteSpace(remote)) return false;
-        return Version.TryParse(Normalize(remote), out var rv)
-            && Version.TryParse(Normalize(local), out var lv)
-            && rv > lv;
+        remote = remote.Trim().TrimStart('v', 'V');
+        local = (local ?? "").Trim().TrimStart('v', 'V');
+        string remPre = ExtractPreRelease(remote, out string remCore);
+        string locPre = ExtractPreRelease(local, out string locCore);
+        if (!Version.TryParse(Normalize(remCore), out var rv) || !Version.TryParse(Normalize(locCore), out var lv))
+            return false;
+        int cmp = CompareVersion4(rv, lv);
+        if (cmp != 0) return cmp > 0;
+        // SemVer 2.0: 1.0.4 > 1.0.4-rc1 (stable beats pre-release of identical numeric version!)
+        if (string.IsNullOrEmpty(remPre) && !string.IsNullOrEmpty(locPre)) return true;
+        if (!string.IsNullOrEmpty(remPre) && string.IsNullOrEmpty(locPre)) return false;
+        return !string.IsNullOrEmpty(remPre) && string.Compare(remPre, locPre, StringComparison.OrdinalIgnoreCase) > 0;
+    }
+
+    private static int CompareVersion4(Version a, Version b)
+    {
+        int c = a.Major.CompareTo(b.Major); if (c != 0) return c;
+        c = a.Minor.CompareTo(b.Minor); if (c != 0) return c;
+        c = Math.Max(0, a.Build).CompareTo(Math.Max(0, b.Build)); if (c != 0) return c;
+        return Math.Max(0, a.Revision).CompareTo(Math.Max(0, b.Revision));
+    }
+
+    private static string ExtractPreRelease(string v, out string core)
+    {
+        int dash = v.IndexOf('-');
+        if (dash >= 0) { core = v[..dash]; return v[(dash + 1)..]; }
+        core = v;
+        return "";
     }
 
     private static string Normalize(string v)
     {
-        int dash = v.IndexOf('-');
-        if (dash >= 0) v = v[..dash];
         var parts = v.Split('.');
         return parts.Length == 1 ? v + ".0" : v;
     }

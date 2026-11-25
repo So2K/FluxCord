@@ -51,7 +51,7 @@ std::string wideToUtf8(const wchar_t* w) {
 }
 
 bool captureRectToBgra(HDC srcDc, int sx, int sy, int sw, int sh, uint8_t* outBgra, int tw, int th) {
-    if (!srcDc || sw <= 0 || sh <= 0 || !outBgra || tw <= 0 || th <= 0) return false;
+    if (!srcDc || sw <= 0 || sh <= 0 || !outBgra || tw <= 0 || th <= 0 || tw > 4096 || th > 4096) return false;
     HDC memDc = CreateCompatibleDC(srcDc);
     if (!memDc) return false;
     BITMAPINFO bi{};
@@ -69,13 +69,14 @@ bool captureRectToBgra(HDC srcDc, int sx, int sy, int sw, int sh, uint8_t* outBg
         SetStretchBltMode(memDc, HALFTONE);
         SetBrushOrgEx(memDc, 0, 0, nullptr);
         if (StretchBlt(memDc, 0, 0, tw, th, srcDc, sx, sy, sw, sh, SRCCOPY | CAPTUREBLT)) {
-            std::memcpy(outBgra, bits, size_t(tw) * size_t(th) * 4);
-            for (int i = 0; i < tw * th; ++i) outBgra[i * 4 + 3] = 255;
+            const size_t pxCount = size_t(tw) * size_t(th);
+            std::memcpy(outBgra, bits, pxCount * 4);
+            for (size_t i = 0; i < pxCount; ++i) outBgra[i * 4 + 3] = 255;
             ok = true;
         }
         SelectObject(memDc, old);
-        DeleteObject(dib);
     }
+    if (dib) DeleteObject(dib);
     DeleteDC(memDc);
     return ok;
 }
@@ -220,7 +221,7 @@ FC_API int32_t fc_dave_process_proposals(const uint8_t* data, int32_t len, uint8
     std::shared_lock lk(g_smtx);
     return g_transport ? g_transport->daveProcessProposals(data, len, out_commit_welcome, cap) : 0;
 }
-FC_API int32_t fc_dave_process_commit(const uint8_t* data, int32_t len) { std::shared_lock lk(g_smtx); return (g_transport && g_transport->daveProcessCommit(data, len)) ? 1 : 0; }
+FC_API int32_t fc_dave_process_commit(const uint8_t* data, int32_t len) { std::shared_lock lk(g_smtx); return g_transport ? g_transport->daveProcessCommit(data, len) : 0; }
 FC_API int32_t fc_dave_process_welcome(const uint8_t* data, int32_t len) { std::shared_lock lk(g_smtx); return (g_transport && g_transport->daveProcessWelcome(data, len)) ? 1 : 0; }
 FC_API void fc_dave_execute_transition(uint16_t protocol_version) { std::shared_lock lk(g_smtx); if (g_transport) g_transport->daveExecuteTransition(protocol_version); }
 
@@ -307,14 +308,14 @@ FC_API int32_t fc_capture_window_thumb(uint64_t hwnd_u64, uint8_t* out_bgra, int
     const DWORD selfPid = GetCurrentProcessId();
     return runOnInputDesktop([&]() -> int32_t {
         HWND hwnd = reinterpret_cast<HWND>(hwnd_u64);
-        if (!IsWindow(hwnd) || !out_bgra || thumb_w <= 0 || thumb_h <= 0) return 0;
+        if (!IsWindow(hwnd) || IsHungAppWindow(hwnd) || !out_bgra || thumb_w <= 0 || thumb_h <= 0 || thumb_w > 4096 || thumb_h > 4096) return 0;
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
         if (pid == selfPid) return 0; // never self-deadlock PrintWindow on our own window!
 
         RECT rc{};
         GetWindowRect(hwnd, &rc);
-        int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        int w = std::min<int>(8192, rc.right - rc.left), h = std::min<int>(8192, rc.bottom - rc.top);
         if (w <= 0 || h <= 0) return 0;
 
         HDC winDc = GetDC(nullptr);
@@ -388,7 +389,11 @@ FC_API void fc_pub_set_video_ssrc(uint32_t video_ssrc) {
 FC_API void fc_pub_request_keyframe() {
     std::shared_lock lk(g_smtx);
     if (g_screen) g_screen->requestKeyframe();
-    if (g_pub_transport && g_pub_transport->isReady()) g_pub_transport->sendSilenceFrames();
+    // Only emit initial silence frames if system audio isn't actively streaming (prevents 100ms mute & RTP TS jump in live audio!)
+    if (g_pub_transport && g_pub_transport->isReady() &&
+        g_pub_transport->audioTxPackets() == 0 && (!g_screen || !g_screen->isCapturingAudio())) {
+        g_pub_transport->sendSilenceFrames();
+    }
 }
 FC_API void fc_pub_get_stats(int32_t* out_tx_pkts, int32_t* out_pli_rx, int32_t* out_dave_active) {
     std::shared_lock lk(g_smtx);
@@ -423,7 +428,7 @@ FC_API int32_t fc_pub_dave_process_proposals(const uint8_t* data, int32_t len, u
     std::shared_lock lk(g_smtx);
     return g_pub_transport ? g_pub_transport->daveProcessProposals(data, len, out_cw, cap) : 0;
 }
-FC_API int32_t fc_pub_dave_process_commit(const uint8_t* data, int32_t len) { std::shared_lock lk(g_smtx); return (g_pub_transport && g_pub_transport->daveProcessCommit(data, len)) ? 1 : 0; }
+FC_API int32_t fc_pub_dave_process_commit(const uint8_t* data, int32_t len) { std::shared_lock lk(g_smtx); return g_pub_transport ? g_pub_transport->daveProcessCommit(data, len) : 0; }
 FC_API int32_t fc_pub_dave_process_welcome(const uint8_t* data, int32_t len) { std::shared_lock lk(g_smtx); return (g_pub_transport && g_pub_transport->daveProcessWelcome(data, len)) ? 1 : 0; }
 FC_API void fc_pub_dave_execute_transition(uint16_t protocol_version) { std::shared_lock lk(g_smtx); if (g_pub_transport) g_pub_transport->daveExecuteTransition(protocol_version); }
 
@@ -465,11 +470,28 @@ FC_API void fc_watch_get_stats_slot(int32_t slot, FcScreenStats* out_stats) {
     if (auto* w = getWatchUnlocked(slot)) w->getStats(out_stats);
 }
 FC_API int32_t fc_watch_dave_init_slot(int32_t slot, uint16_t proto_ver, uint64_t channel_id, const char* self_user_id, uint32_t self_ssrc) {
+    if (slot < 0 || slot >= kMaxWatchSlots) return 0;
+    {
+        std::unique_lock ulk(g_smtx);
+        if (!getWatchUnlocked(slot)) ensureInitLocked();
+    }
     std::shared_lock lk(g_smtx);
     auto* w = getWatchUnlocked(slot);
     return (w && w->daveInit(proto_ver, channel_id, self_user_id, self_ssrc)) ? 1 : 0;
 }
-FC_API void fc_watch_dave_add_user_slot(int32_t slot, const char* user_id) { std::shared_lock lk(g_smtx); if (auto* w = getWatchUnlocked(slot)) w->daveAddUser(user_id); }
+FC_API void fc_watch_dave_add_user_slot(int32_t slot, const char* user_id) {
+    if (slot < 0 || slot >= kMaxWatchSlots) return;
+    {
+        std::unique_lock ulk(g_smtx);
+        if (!getWatchUnlocked(slot)) ensureInitLocked();
+    }
+    std::shared_lock lk(g_smtx);
+    if (auto* w = getWatchUnlocked(slot)) w->daveAddUser(user_id);
+}
+FC_API void fc_watch_dave_remove_user_slot(int32_t slot, const char* user_id) {
+    std::shared_lock lk(g_smtx);
+    if (auto* w = getWatchUnlocked(slot)) w->daveRemoveUser(user_id);
+}
 FC_API int32_t fc_watch_dave_get_key_package_slot(int32_t slot, uint8_t* out_buf, int32_t cap) {
     std::shared_lock lk(g_smtx);
     auto* w = getWatchUnlocked(slot); return w ? w->daveGetKeyPackage(out_buf, cap) : 0;
@@ -484,7 +506,7 @@ FC_API int32_t fc_watch_dave_process_proposals_slot(int32_t slot, const uint8_t*
 }
 FC_API int32_t fc_watch_dave_process_commit_slot(int32_t slot, const uint8_t* data, int32_t len) {
     std::shared_lock lk(g_smtx);
-    auto* w = getWatchUnlocked(slot); return (w && w->daveProcessCommit(data, len)) ? 1 : 0;
+    auto* w = getWatchUnlocked(slot); return w ? w->daveProcessCommit(data, len) : 0;
 }
 FC_API int32_t fc_watch_dave_process_welcome_slot(int32_t slot, const uint8_t* data, int32_t len) {
     std::shared_lock lk(g_smtx);
@@ -507,6 +529,7 @@ FC_API void fc_watch_stop() { fc_watch_stop_slot(0); }
 FC_API void fc_watch_get_stats(FcScreenStats* o) { fc_watch_get_stats_slot(0, o); }
 FC_API int32_t fc_watch_dave_init(uint16_t p, uint64_t c, const char* u, uint32_t s) { return fc_watch_dave_init_slot(0, p, c, u, s); }
 FC_API void fc_watch_dave_add_user(const char* u) { fc_watch_dave_add_user_slot(0, u); }
+FC_API void fc_watch_dave_remove_user(const char* u) { fc_watch_dave_remove_user_slot(0, u); }
 FC_API int32_t fc_watch_dave_get_key_package(uint8_t* b, int32_t c) { return fc_watch_dave_get_key_package_slot(0, b, c); }
 FC_API void fc_watch_dave_set_external_sender(const uint8_t* d, int32_t l) { fc_watch_dave_set_external_sender_slot(0, d, l); }
 FC_API int32_t fc_watch_dave_process_proposals(const uint8_t* d, int32_t l, uint8_t* o, int32_t c) { return fc_watch_dave_process_proposals_slot(0, d, l, o, c); }

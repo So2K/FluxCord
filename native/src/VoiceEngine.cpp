@@ -27,6 +27,13 @@ int64_t steadyMs() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Safe bit-level finite check under /fp:fast!
+inline bool isFiniteFast(float x) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    return (bits & 0x7F800000u) != 0x7F800000u;
+}
+
 bool isDeviceLostHr(HRESULT hr) {
     return hr == AUDCLNT_E_DEVICE_INVALIDATED ||
            hr == AUDCLNT_E_SERVICE_NOT_RUNNING ||
@@ -129,12 +136,14 @@ struct VoiceEngine::RemoteStream {
     void pushPacket(uint16_t seq, const uint8_t* opus, int len) {
         last_rx_ms = steadyMs();
         int64_t ext = unwrapSeq(seq);
-        if (playing && ext < next_play_seq) {
+        bool recentStream = playing || (next_play_seq > 0 && (last_rx_ms - last_loss_ms) < 500);
+        if (recentStream && ext < next_play_seq) {
             // Recover cleanly if remote sender restarted its sequence counter while playing!
             if (++stale_count > 50) {
                 jb.clear();
                 playing = false;
                 last_ext_seq = seq;
+                next_play_seq = 0;
                 ext = seq;
                 stale_count = 0;
             } else {
@@ -183,10 +192,12 @@ struct VoiceEngine::RemoteStream {
                     consecutive_plc = 0;
                 }
             } else if (!jb.empty() && jb.begin()->first > next_play_seq && consecutive_plc < 4) {
-                // True packet loss: invoke Opus In-Band FEC if next packet exists, else Opus PLC!
+                // True packet loss: invoke Opus In-Band FEC matching next packet's exact frame duration, else Opus PLC!
                 auto itNext = jb.find(next_play_seq + 1);
                 if (itNext != jb.end() && itNext->second.size() > 3) {
-                    samples = opus_decode_float(dec, itNext->second.data(), int(itNext->second.size()), decBuf.data(), kFrame, 1);
+                    int fecFrames = opus_packet_get_nb_samples(itNext->second.data(), int(itNext->second.size()), kRate);
+                    if (fecFrames <= 0 || fecFrames > kMaxOpus) fecFrames = kFrame;
+                    samples = opus_decode_float(dec, itNext->second.data(), int(itNext->second.size()), decBuf.data(), fecFrames, 1);
                 } else {
                     samples = opus_decode_float(dec, nullptr, 0, decBuf.data(), kFrame, 0);
                 }
@@ -210,6 +221,7 @@ struct VoiceEngine::RemoteStream {
                         float fade = 1.0f - float(i) / float(std::max(1, samples * 2));
                         decBuf[size_t(i)] *= fade;
                     }
+                    next_play_seq++;
                     consecutive_plc = 2;
                     playing = false;
                 } else {
@@ -326,7 +338,18 @@ void VoiceEngine::stopLocked() {
     suppressor_.clearTelemetry();
 }
 
+void VoiceEngine::setInputGain(float g) {
+    if (!isFiniteFast(g)) g = 1.0f;
+    input_gain_.store(std::clamp(g, 0.0f, 4.0f));
+}
+
+void VoiceEngine::setOutputVolume(float v) {
+    if (!isFiniteFast(v)) v = 1.0f;
+    output_vol_.store(std::clamp(v, 0.0f, 2.0f));
+}
+
 void VoiceEngine::setUserVolume(uint32_t ssrc, float vol) {
+    if (!isFiniteFast(vol)) vol = 1.0f;
     std::lock_guard lk(mtx_);
     user_volumes_[ssrc] = std::clamp(vol, 0.0f, 2.0f);
 }
@@ -414,10 +437,11 @@ size_t VoiceEngine::pullMixedStereo(float* dst, size_t stereo_frames) {
         }
     }
 
-    // Soft limiter on mixed master bus so loud speakers never hard-clip!
+    // Soft limiter + /fp:fast NaN guard on mixed master bus so loud speakers never hard-clip!
     for (size_t i = 0; i < samples; ++i) {
         float s = dst[i];
-        if (s > 0.95f) s = 0.95f + 0.049f * std::tanh((s - 0.95f) * 10.0f);
+        if (!isFiniteFast(s)) s = 0.0f;
+        else if (s > 0.95f) s = 0.95f + 0.049f * std::tanh((s - 0.95f) * 10.0f);
         else if (s < -0.95f) s = -0.95f + 0.049f * std::tanh((s + 0.95f) * 10.0f);
         dst[i] = s;
     }
@@ -450,6 +474,7 @@ void VoiceEngine::captureLoop() {
     float stereoFrame[kFrame * 2];
     uint32_t rtpTs = 0;
     bool prevSpeaking = false;
+    bool wasMuted = false;
 
     // Outer device-recovery loop: automatically survives USB mic hot-unplug / Bluetooth switches!
     while (running_.load()) {
@@ -503,14 +528,17 @@ void VoiceEngine::captureLoop() {
                 std::memcpy(frame, acc.data() + off, sizeof(frame));
                 off += kFrame;
 
-                if (muted_.load()) {
+                bool nowMuted = muted_.load();
+                if (nowMuted) {
                     std::memset(frame, 0, sizeof(frame));
                     speaking_.store(false);
                     suppressor_.clearTelemetry();
                 } else {
+                    if (wasMuted) suppressor_.reset();
                     suppressor_.process(frame, kFrame);
                     speaking_.store(suppressor_.isVoiceActive());
                 }
+                wasMuted = nowMuted;
 
                 if (loopback_.load() && !deafened_.load()) {
                     std::lock_guard lk(mtx_);

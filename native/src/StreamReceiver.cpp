@@ -44,10 +44,12 @@ StreamReceiver::StreamReceiver(VoiceEngine* voice, int32_t slot_index) : voice_(
     WSADATA wsa{};
     wsa_ok_ = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
     sodium_init();
+    worker_done_ev_ = CreateEventW(nullptr, TRUE, TRUE, nullptr);
 }
 
 StreamReceiver::~StreamReceiver() {
     stop();
+    if (worker_done_ev_) { CloseHandle(worker_done_ev_); worker_done_ev_ = nullptr; }
     if (wsa_ok_) WSACleanup();
 }
 
@@ -56,10 +58,16 @@ void StreamReceiver::daveDestroyLocked() {
     if (dave_session_) { daveSessionDestroy(dave_session_); dave_session_ = nullptr; }
     streamer_uid_.clear();
     dave_proto_ver_ = 0;
+    dave_has_ratchet_ = false;
 }
 
 bool StreamReceiver::daveInit(uint16_t proto_ver, uint64_t channel_id, const char* self_user_id, uint32_t self_ssrc) {
     if (self_ssrc != 0) local_ssrc_.store(self_ssrc);
+    bool alreadyDecoding = false;
+    {
+        std::lock_guard slk(stats_mtx_);
+        alreadyDecoding = (stats_.frames_encoded > 0);
+    }
     std::lock_guard lk(dave_mtx_);
     dave_proto_ver_ = proto_ver;
     if (!dave_session_) dave_session_ = daveSessionCreate(nullptr, nullptr, nullptr, nullptr);
@@ -67,10 +75,13 @@ bool StreamReceiver::daveInit(uint16_t proto_ver, uint64_t channel_id, const cha
     if (!dave_session_ || !dave_dec_) return false;
     if (proto_ver > 0) {
         daveSessionInit(dave_session_, proto_ver, channel_id, self_user_id ? self_user_id : "");
-        daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
+        if (!alreadyDecoding || dave_has_ratchet_) {
+            daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
+        }
     } else {
         daveSessionReset(dave_session_);
         daveDecryptorTransitionToPassthroughMode(dave_dec_, true);
+        dave_has_ratchet_ = false;
     }
     return true;
 }
@@ -80,6 +91,21 @@ void StreamReceiver::daveAddUser(const char* user_id) {
     std::lock_guard lk(dave_mtx_);
     if (!dave_session_) dave_session_ = daveSessionCreate(nullptr, nullptr, nullptr, nullptr);
     if (dave_session_) daveSessionAddRecognizedUser(dave_session_, user_id);
+    if (dave_session_ && dave_dec_ && dave_proto_ver_ > 0 && !streamer_uid_.empty() && streamer_uid_ == user_id) {
+        DAVEKeyRatchetHandle kr = daveSessionGetKeyRatchet(dave_session_, user_id);
+        if (kr) {
+            daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
+            daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
+            daveKeyRatchetDestroy(kr);
+            dave_has_ratchet_ = true;
+        }
+    }
+}
+
+void StreamReceiver::daveRemoveUser(const char* user_id) {
+    if (!user_id || !*user_id) return;
+    std::lock_guard lk(dave_mtx_);
+    if (dave_session_) daveSessionRemoveRecognizedUser(dave_session_, user_id);
 }
 
 int32_t StreamReceiver::daveGetKeyPackage(uint8_t* out_buf, int32_t cap) {
@@ -119,14 +145,16 @@ int32_t StreamReceiver::daveProcessProposals(const uint8_t* data, int32_t len, u
     return n;
 }
 
-bool StreamReceiver::daveProcessCommit(const uint8_t* data, int32_t len) {
+int32_t StreamReceiver::daveProcessCommit(const uint8_t* data, int32_t len) {
     std::lock_guard lk(dave_mtx_);
-    if (!dave_session_ || !data || len <= 0) return false;
+    if (!dave_session_ || !data || len <= 0) return 0;
     DAVECommitResultHandle res = daveSessionProcessCommit(dave_session_, data, size_t(len));
-    if (!res) return false;
-    bool ok = !daveCommitResultIsFailed(res);
+    if (!res) return 0;
+    bool ignored = daveCommitResultIsIgnored(res);
+    bool failed = daveCommitResultIsFailed(res);
     daveCommitResultDestroy(res);
-    return ok;
+    if (ignored) return 2;
+    return failed ? 0 : 1;
 }
 
 bool StreamReceiver::daveProcessWelcome(const uint8_t* data, int32_t len) {
@@ -145,6 +173,7 @@ void StreamReceiver::daveExecuteTransition(uint16_t proto_ver) {
     if (!dave_dec_) return;
     if (proto_ver == 0) {
         daveDecryptorTransitionToPassthroughMode(dave_dec_, true);
+        dave_has_ratchet_ = false;
         return;
     }
     if (dave_session_ && !streamer_uid_.empty()) {
@@ -153,6 +182,7 @@ void StreamReceiver::daveExecuteTransition(uint16_t proto_ver) {
             daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
             daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
             daveKeyRatchetDestroy(kr);
+            dave_has_ratchet_ = true;
         }
     }
 }
@@ -178,6 +208,7 @@ void StreamReceiver::setRemoteStreams(uint32_t video_ssrc, uint32_t audio_ssrc, 
                 daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
                 daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
                 daveKeyRatchetDestroy(kr);
+                dave_has_ratchet_ = true;
             }
         }
     }
@@ -193,7 +224,8 @@ void StreamReceiver::setVolume(float vol) {
 bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t ssrc, HWND hwnd, std::string& out_ext_ip, uint16_t& out_ext_port) {
     if (!ip || !*ip) return false;
     std::lock_guard life(lifecycle_mtx_);
-    stopLocked();
+    // Close ONLY transport & worker thread — preserve pre-populated DAVE session / streamer_uid_!
+    closeTransportLocked();
     hwnd_ = hwnd;
     local_ssrc_.store(ssrc);
     rtcp_nonce_ = 1;
@@ -203,7 +235,7 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
 
     int rcvBuf = 8 * 1024 * 1024;
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
-    DWORD timeoutMs = 1500;
+    DWORD timeoutMs = 500;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
     sockaddr_in rem{};
@@ -225,11 +257,26 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
     }
 
     uint8_t resp[128]{};
-    sockaddr_in from{};
-    int fromLen = sizeof(from);
-    int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
-                     reinterpret_cast<sockaddr*>(&from), &fromLen);
-    if (n < 74 || getBE16(resp) != 0x0002) {
+    bool discOk = false;
+    int64_t deadlineMs = steadyMs() + 1500;
+    while (steadyMs() < deadlineMs) {
+        sockaddr_in from{};
+        int fromLen = sizeof(from);
+        int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
+                         reinterpret_cast<sockaddr*>(&from), &fromLen);
+        if (n < 0) {
+            sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
+                   reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
+            continue;
+        }
+        if (from.sin_addr.s_addr == rem.sin_addr.s_addr &&
+            from.sin_port == rem.sin_port &&
+            n >= 74 && getBE16(resp) == 0x0002 && getBE32(resp + 4) == ssrc) {
+            discOk = true;
+            break;
+        }
+    }
+    if (!discOk) {
         closesocket(s);
         return false;
     }
@@ -255,6 +302,7 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
         std::strncpy(stats_.encoder_name, "DXVA / NVDEC Hardware H.264", sizeof(stats_.encoder_name) - 1);
     }
 
+    if (worker_done_ev_) ResetEvent(worker_done_ev_);
     running_.store(true);
     worker_ = std::thread([this] { rxDecodeLoop(); });
     return true;
@@ -280,26 +328,39 @@ void StreamReceiver::stop() {
     stopLocked();
 }
 
-void StreamReceiver::stopLocked() {
+void StreamReceiver::closeTransportLocked() {
     running_.store(false);
     has_key_.store(false);
-    video_ssrc_.store(0);
-    audio_ssrc_.store(0);
     reset_depack_.store(false);
 
     if (sock_ != INVALID_SOCKET) shutdown(sock_, SD_BOTH);
-    if (worker_.joinable()) worker_.join();
+    if (worker_.joinable()) {
+        // Prevent cross-thread DXGI SwapChain HWND SendMessage deadlock when stop() is called from UI thread!
+        if (hwnd_ && worker_done_ev_ && GetWindowThreadProcessId(hwnd_, nullptr) == GetCurrentThreadId()) {
+            while (WaitForSingleObject(worker_done_ev_, 0) != WAIT_OBJECT_0) {
+                DWORD wr = MsgWaitForMultipleObjectsEx(1, &worker_done_ev_, 50, QS_SENDMESSAGE, 0);
+                if (wr == WAIT_OBJECT_0) break;
+                MSG msg{};
+                PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            }
+        }
+        worker_.join();
+    }
     if (sock_ != INVALID_SOCKET) {
         removeUdpQosFlow(sock_, qos_flow_id_);
         closesocket(sock_);
         sock_ = INVALID_SOCKET;
     }
-    {
-        std::lock_guard lk(dave_mtx_);
-        daveDestroyLocked();
-    }
     std::lock_guard lk(stats_mtx_);
     stats_.running = 0;
+}
+
+void StreamReceiver::stopLocked() {
+    video_ssrc_.store(0);
+    audio_ssrc_.store(0);
+    closeTransportLocked();
+    std::lock_guard lk(dave_mtx_);
+    daveDestroyLocked();
 }
 
 void StreamReceiver::getStats(FcScreenStats* out) const {
@@ -309,9 +370,15 @@ void StreamReceiver::getStats(FcScreenStats* out) const {
 }
 
 void StreamReceiver::rxDecodeLoop() {
+    struct DoneGuard {
+        HANDLE ev;
+        ~DoneGuard() { if (ev) SetEvent(ev); }
+    } doneGuard{ worker_done_ev_ };
+
     HANDLE mm = boostRealtimeThread(L"Games");
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
+    const sockaddr_in rem = remote_;
 
     { // Inner COM scope so ALL D3D11 / MF objects release cleanly BEFORE MFShutdown!
     ComPtr<ID3D11Device> dev;
@@ -518,7 +585,7 @@ void StreamReceiver::rxDecodeLoop() {
 
     auto drainDecoderOutputs = [&]() {
         if (!decMft) return;
-        for (int drain = 0; drain < 6; ++drain) {
+        for (int drain = 0; drain < 32; ++drain) {
             MFT_OUTPUT_DATA_BUFFER outBuf{};
             DWORD status = 0;
             HRESULT ohr = decMft->ProcessOutput(0, 1, &outBuf, &status);
@@ -620,8 +687,10 @@ void StreamReceiver::rxDecodeLoop() {
         }
     };
 
+    bool decNeedsKf = true;
     auto decodeAndPresent = [&](const VideoDepacketizer::FrameOut& fr, uint32_t mediaSsrc) {
         if (fr.annexb.empty() || !decMft) return;
+        if (depack.needKeyframe()) decNeedsKf = true;
         const uint8_t* frameData = fr.annexb.data();
         size_t frameLen = fr.annexb.size();
 
@@ -647,8 +716,10 @@ void StreamReceiver::rxDecodeLoop() {
                             daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
                             daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
                             daveKeyRatchetDestroy(kr);
+                            dave_has_ratchet_ = true;
                         }
                     }
+                    decNeedsKf = true;
                     depack.setNeedKeyframe(true);
                     return;
                 }
@@ -662,13 +733,14 @@ void StreamReceiver::rxDecodeLoop() {
         }
 
         // Gate strictly on an actual IDR (NAL type 5) + valid SPS/PPS (in-frame or cached) so NVDEC never smears or hangs!
-        if (depack.needKeyframe()) {
+        if (decNeedsKf) {
             bool hasIdr = VideoDepacketizer::hasIdr(frameData, frameLen);
             bool hasSps = frameHasNalu(frameData, frameLen, 7);
             bool hasPps = frameHasNalu(frameData, frameLen, 8);
             bool configReady = (hasSps || !cachedSps.empty()) && (hasPps || !cachedPps.empty());
             if (!hasIdr || !configReady) {
                 kfSkipped++;
+                depack.setNeedKeyframe(true);
                 int64_t nowMs = steadyMs();
                 if (nowMs - lastPliMs > 450) {
                     sendEncryptedRtcpPli(mediaSsrc);
@@ -684,6 +756,7 @@ void StreamReceiver::rxDecodeLoop() {
                 frameData = prependBuf.data();
                 frameLen = prependBuf.size();
             }
+            decNeedsKf = false;
             depack.setNeedKeyframe(false);
         }
 
@@ -701,7 +774,11 @@ void StreamReceiver::rxDecodeLoop() {
                 HRESULT phr = decMft->ProcessInput(0, inSamp.Get(), 0);
                 if (phr == MF_E_NOTACCEPTING) {
                     drainDecoderOutputs();
-                    decMft->ProcessInput(0, inSamp.Get(), 0);
+                    phr = decMft->ProcessInput(0, inSamp.Get(), 0);
+                }
+                if (FAILED(phr)) {
+                    decNeedsKf = true;
+                    depack.setNeedKeyframe(true);
                 }
             }
         }
@@ -735,8 +812,10 @@ void StreamReceiver::rxDecodeLoop() {
     while (running_.load()) {
         if (reset_depack_.exchange(false)) {
             depack.reset();
+            decNeedsKf = true;
             cachedSps.clear();
             cachedPps.clear();
+            if (decMft) decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         }
 
         int32_t rw = pending_w_.exchange(0);
@@ -751,6 +830,16 @@ void StreamReceiver::rxDecodeLoop() {
         int64_t nowMs = steadyMs();
         if (nowMs - lastDiagMs >= 500) {
             lastDiagMs = nowMs;
+            auto nowWin = std::chrono::steady_clock::now();
+            float idleSec = std::chrono::duration<float>(nowWin - windowStart).count();
+            if (idleSec >= 1.0f) {
+                std::lock_guard lk(stats_mtx_);
+                stats_.fps = float(framesWindow) / idleSec;
+                stats_.bitrate_kbps = (float(bytesWindow) * 8.0f / 1000.0f) / idleSec;
+                framesWindow = 0;
+                bytesWindow = 0;
+                windowStart = nowWin;
+            }
             updateDiagText();
         }
         if (has_key_.load()) {
@@ -762,7 +851,7 @@ void StreamReceiver::rxDecodeLoop() {
                 lastKeepaliveMs = nowMs;
             }
             uint32_t vs = video_ssrc_.load();
-            if (vs != 0 && depack.needKeyframe() && (nowMs - lastPliMs > 600)) {
+            if (vs != 0 && (depack.needKeyframe() || decNeedsKf) && (nowMs - lastPliMs > 600)) {
                 sendEncryptedRtcpPli(vs);
                 lastPliMs = nowMs;
             }
@@ -772,7 +861,8 @@ void StreamReceiver::rxDecodeLoop() {
         int fromLen = sizeof(from);
         int n = recvfrom(sock_, reinterpret_cast<char*>(pkt), sizeof(pkt), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
-        if (n < 28 || !has_key_.load()) {
+        if (n < 28 || !has_key_.load() ||
+            from.sin_addr.s_addr != rem.sin_addr.s_addr || from.sin_port != rem.sin_port) {
             bool anyPli = false;
             bool stepPli = false;
             while (depack.tryEmit(steadyMs(), readyFrame, stepPli)) {

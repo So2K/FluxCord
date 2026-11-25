@@ -208,6 +208,8 @@ public static unsafe class App
         return new string(buf, 0, len);
     }
 
+    public static string PeekChatInputText() => ReadEdit(_chatEdit);
+
     public static string TakeChatInputText()
     {
         string s = ReadEdit(_chatEdit);
@@ -367,13 +369,25 @@ public static unsafe class App
     {
         if (_inRender || _shuttingDown || Gfx.DC == null) return;
         _inRender = true;
+        bool beganDraw = false;
         try
         {
             UI.BeginFrame();
             Gfx.BeginDraw(Th.Bg);
-            Shell.Draw();
-            Gfx.EndDraw();
-            UI.EndFrame();
+            beganDraw = true;
+            try
+            {
+                Shell.Draw();
+            }
+            finally
+            {
+                if (beganDraw)
+                {
+                    Gfx.UnwindClips();
+                    Gfx.EndDraw();
+                }
+                UI.EndFrame();
+            }
 
             if (UI.TakeAnimate()) W.SetTimer(Hwnd, 1, 16, 0);
             else W.KillTimer(Hwnd, 1);
@@ -448,10 +462,11 @@ public static unsafe class App
             }
             if (msg == W.WM_KEYDOWN && (int)w == W.VK_V && W.KeyDown(W.VK_CONTROL))
             {
-                // Allow pasting screenshots & browser "Copy Image" (CF_DIB) seamlessly!
+                // Allow pasting screenshots & browser "Copy Image" (CF_DIB) seamlessly (ignore key auto-repeat bit 30!)
                 if (W.IsClipboardFormatAvailable(8) && !W.IsClipboardFormatAvailable(13))
                 {
-                    Shell.OnClipboardImagePaste();
+                    if ((l.ToInt64() & (1L << 30)) == 0)
+                        Shell.OnClipboardImagePaste();
                     return 0;
                 }
             }
@@ -472,7 +487,7 @@ public static unsafe class App
             }
             if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN && !W.KeyDown(W.VK_SHIFT))
             {
-                Shell.OnChatEnter(TakeChatInputText());
+                Shell.OnChatEnter();
                 return 0;
             }
             // Suppress Windows error beep on Enter/Esc/Ctrl+A in single-line EDIT control
@@ -560,13 +575,15 @@ public static unsafe class App
             {
                 case W.WM_NCCALCSIZE when w != 0:
                 {
-                    // When maximized, inset client rect by exact OS border frame so top bar & close button NEVER clip off screen!
+                    // When maximized, inset client rect by exact per-monitor DPI OS border frame so top bar & close button NEVER clip!
                     if (W.IsZoomed(hwnd))
                     {
                         var ncp = (W.NCCALCSIZE_PARAMS*)l;
-                        int pad = W.GetSystemMetrics(W.SM_CXPADDEDBORDER);
-                        int fx = W.GetSystemMetrics(W.SM_CXSIZEFRAME) + pad;
-                        int fy = W.GetSystemMetrics(W.SM_CYSIZEFRAME) + pad;
+                        uint dpi = W.GetDpiForWindow(hwnd);
+                        if (dpi == 0) dpi = 96;
+                        int pad = W.GetSystemMetricsForDpi(W.SM_CXPADDEDBORDER, dpi);
+                        int fx = W.GetSystemMetricsForDpi(W.SM_CXSIZEFRAME, dpi) + pad;
+                        int fy = W.GetSystemMetricsForDpi(W.SM_CYSIZEFRAME, dpi) + pad;
                         ncp->r0.L += fx;
                         ncp->r0.T += fy;
                         ncp->r0.R -= fx;
@@ -579,9 +596,19 @@ public static unsafe class App
                     W.RECT wr;
                     W.GetWindowRect(hwnd, &wr);
                     int sx = W.LoWord(l), sy = W.HiWord(l);
-                    if (!W.IsZoomed(hwnd))
+                    uint dpi = W.GetDpiForWindow(hwnd);
+                    if (dpi == 0) dpi = 96;
+                    bool zoomed = W.IsZoomed(hwnd);
+                    int padX = zoomed ? W.GetSystemMetricsForDpi(W.SM_CXSIZEFRAME, dpi) + W.GetSystemMetricsForDpi(W.SM_CXPADDEDBORDER, dpi) : 0;
+                    int padY = zoomed ? W.GetSystemMetricsForDpi(W.SM_CYSIZEFRAME, dpi) + W.GetSystemMetricsForDpi(W.SM_CXPADDEDBORDER, dpi) : 0;
+                    float cy = (sy - (wr.T + padY)) / MathF.Max(0.1f, Gfx.Scale);
+                    float cx = (sx - (wr.L + padX)) / MathF.Max(0.1f, Gfx.Scale);
+                    float rightZone = Shell.TopBarRightZoneWidth;
+                    // Give top-right caption buttons (-, □, ✕, Update pill) client hit-test priority even at the very corner pixel!
+                    if (cy >= 0 && cy < Shell.TopH && cx >= Gfx.W - rightZone) return 1;
+                    if (!zoomed)
                     {
-                        const int b = 6;
+                        int b = Math.Max(6, (int)MathF.Round(6f * dpi / 96f));
                         bool left = sx < wr.L + b, right = sx >= wr.R - b, top = sy < wr.T + b, bot = sy >= wr.B - b;
                         if (top && left) return 13;
                         if (top && right) return 14;
@@ -592,14 +619,10 @@ public static unsafe class App
                         if (top) return 12;
                         if (bot) return 15;
                     }
-                    int pad = W.IsZoomed(hwnd) ? W.GetSystemMetrics(W.SM_CYSIZEFRAME) + W.GetSystemMetrics(W.SM_CXPADDEDBORDER) : 0;
-                    float cy = (sy - (wr.T + pad)) / MathF.Max(0.1f, Gfx.Scale);
-                    float cx = (sx - (wr.L + pad)) / MathF.Max(0.1f, Gfx.Scale);
-                    float rightZone = Shell.TopBarRightZoneWidth;
                     if (cy < Shell.TopH && cx < Gfx.W - rightZone) return 2;
                     return 1;
                 }
-                case W.WM_DPICHANGED:
+                case W.WM_DPICHANGED when !_shuttingDown:
                 {
                     Gfx.RefreshDpi();
                     RebuildEditFont();
@@ -624,7 +647,7 @@ public static unsafe class App
                 case W.WM_DROPFILES:
                     Shell.OnFilesDropped(W.ReadDroppedFiles((nint)w));
                     return 0;
-                case W.WM_SIZE when Gfx.DC != null:
+                case W.WM_SIZE when !_shuttingDown && Gfx.DC != null:
                     Gfx.Resize(W.LoWord(l), W.HiWord(l));
                     Render();
                     return 0;
@@ -715,8 +738,11 @@ public static unsafe class App
                 case W.WM_GETMINMAXINFO:
                 {
                     var mmi = (W.MINMAXINFO*)l;
-                    mmi->minTrackSize.X = 860;
-                    mmi->minTrackSize.Y = 560;
+                    uint dpi = hwnd != 0 ? W.GetDpiForWindow(hwnd) : W.GetDpiForSystem();
+                    if (dpi == 0) dpi = 96;
+                    float sc = (dpi / 96f) * Math.Clamp(SettingsStore.Current.UiScale, 0.8f, 1.5f);
+                    mmi->minTrackSize.X = (int)MathF.Round(860f * sc);
+                    mmi->minTrackSize.Y = (int)MathF.Round(560f * sc);
                     return 0;
                 }
                 case W.WM_KEYDOWN when (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL):

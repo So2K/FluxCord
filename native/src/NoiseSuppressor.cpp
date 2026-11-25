@@ -103,6 +103,10 @@ void NoiseSuppressor::fft512(float* re, float* im, bool inverse) const {
 
 void NoiseSuppressor::reset() {
     hpf_x1_ = hpf_x2_ = hpf_y1_ = hpf_y2_ = 0.0f;
+    if (rnnoise_state_ && rnnoise_destroy_ && rnnoise_create_) {
+        rnnoise_destroy_(rnnoise_state_);
+        rnnoise_state_ = rnnoise_create_(nullptr);
+    }
     std::memset(in_ring_, 0, sizeof(in_ring_));
     std::memset(out_ola_, 0, sizeof(out_ola_));
     ring_fill_ = kHop; // 256-sample prefill so first 256 inputs trigger frame 0 immediately
@@ -375,6 +379,10 @@ void NoiseSuppressor::processSpectralMmse(float* pcm, int32_t count, float stren
                     re[kFft - k] *= g;
                     im[kFft - k] *= g;
                 }
+            }
+            if (hpf_.load()) {
+                re[0] = 0.0f;
+                im[0] = 0.0f;
             }
 
             fft512(re, im, true);

@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -61,10 +62,16 @@ internal partial class FluxJsonContext : JsonSerializerContext { }
 
 public static class SettingsStore
 {
-    public static readonly string DataDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FluxCord");
+    public static readonly string DataDir = ResolveDataDir();
     public static readonly string SettingsPath = Path.Combine(DataDir, "settings.json");
     public static readonly string LogPath = Path.Combine(DataDir, "fluxcord.log");
+
+    private static string ResolveDataDir()
+    {
+        string? env = Environment.GetEnvironmentVariable("FLUXCORD_DATA_DIR")?.Trim();
+        if (!string.IsNullOrEmpty(env)) return Path.GetFullPath(env);
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FluxCord");
+    }
 
     private static readonly object _saveLock = new();
     private static readonly object _logLock = new();
@@ -102,6 +109,7 @@ public static class SettingsStore
                 {
                     var json = File.ReadAllText(SettingsPath);
                     Current = JsonSerializer.Deserialize(json, FluxJsonContext.Default.FluxSettings) ?? new();
+                    Sanitize(Current);
                 }
                 catch { Current = new(); }
             }
@@ -112,6 +120,27 @@ public static class SettingsStore
                 SaveLocked();
             }
         }
+    }
+
+    private static void Sanitize(FluxSettings s)
+    {
+        if (!float.IsFinite(s.UiScale)) s.UiScale = 1.0f;
+        s.UiScale = Math.Clamp(s.UiScale, 0.8f, 1.5f);
+        if (!float.IsFinite(s.InputGain)) s.InputGain = 1.0f;
+        s.InputGain = Math.Clamp(s.InputGain, 0f, 2f);
+        if (!float.IsFinite(s.OutputVolume)) s.OutputVolume = 1.0f;
+        s.OutputVolume = Math.Clamp(s.OutputVolume, 0f, 2f);
+        if (!float.IsFinite(s.NoiseStrength)) s.NoiseStrength = 0.88f;
+        s.NoiseStrength = Math.Clamp(s.NoiseStrength, 0f, 1f);
+        if (!float.IsFinite(s.GateDb)) s.GateDb = -46f;
+        s.GateDb = Math.Clamp(s.GateDb, -75f, -15f);
+        if (!float.IsFinite(s.UiSoundsVolume)) s.UiSoundsVolume = 0.75f;
+        s.UiSoundsVolume = Math.Clamp(s.UiSoundsVolume, 0f, 1f);
+        s.WindowWidth = Math.Clamp(s.WindowWidth, 860, 3840);
+        s.WindowHeight = Math.Clamp(s.WindowHeight, 560, 2160);
+        s.StreamFps = Math.Clamp(s.StreamFps, 15, 120);
+        s.StreamBitrateKbps = Math.Clamp(s.StreamBitrateKbps, 1000, 35000);
+        s.StreamCodec = (int)VideoCodec.H264;
     }
 
     public static void Save()
@@ -135,34 +164,53 @@ public static class SettingsStore
 
     public static string GetToken()
     {
-        if (string.IsNullOrEmpty(Current.EncryptedTokenB64)) return "";
-        try
+        lock (_saveLock)
         {
-            var enc = Convert.FromBase64String(Current.EncryptedTokenB64);
-            var plain = W.UnprotectDpapi(enc);
-            return plain.Length > 0 ? Encoding.UTF8.GetString(plain) : "";
+            if (string.IsNullOrEmpty(Current.EncryptedTokenB64)) return "";
+            byte[]? plain = null;
+            try
+            {
+                var enc = Convert.FromBase64String(Current.EncryptedTokenB64);
+                plain = W.UnprotectDpapi(enc);
+                return plain.Length > 0 ? Encoding.UTF8.GetString(plain) : "";
+            }
+            catch { return ""; }
+            finally
+            {
+                if (plain is { Length: > 0 }) CryptographicOperations.ZeroMemory(plain);
+            }
         }
-        catch { return ""; }
     }
 
     public static void SetToken(string token)
     {
-        token = token.Trim().Trim('"');
-        if (string.IsNullOrEmpty(token))
+        lock (_saveLock)
         {
-            Current.EncryptedTokenB64 = "";
-        }
-        else
-        {
-            var enc = W.ProtectDpapi(Encoding.UTF8.GetBytes(token));
-            if (enc.Length == 0)
+            token = token.Trim().Trim('"');
+            if (string.IsNullOrEmpty(token))
             {
-                Log("SetToken: DPAPI ProtectData failed, preserving previous token");
-                return;
+                Current.EncryptedTokenB64 = "";
             }
-            Current.EncryptedTokenB64 = Convert.ToBase64String(enc);
+            else
+            {
+                byte[] raw = Encoding.UTF8.GetBytes(token);
+                try
+                {
+                    var enc = W.ProtectDpapi(raw);
+                    if (enc.Length == 0)
+                    {
+                        Log("SetToken: DPAPI ProtectData failed, preserving previous token");
+                        return;
+                    }
+                    Current.EncryptedTokenB64 = Convert.ToBase64String(enc);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(raw);
+                }
+            }
+            SaveLocked();
         }
-        Save();
     }
 
     public static void MigrateFromExistingClients()

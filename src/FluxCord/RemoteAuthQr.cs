@@ -171,7 +171,7 @@ public sealed class RemoteAuthQr
                         {
                             byte[] dec = rsa.Decrypt(Convert.FromBase64String(eup.GetString()!), RSAEncryptionPadding.OaepSHA256);
                             var parts = Encoding.UTF8.GetString(dec).Split(':');
-                            ScannedUser = parts.Length >= 4 ? parts[3] : "аккаунт";
+                            ScannedUser = parts.Length >= 4 ? string.Join(':', parts[3..]) : "аккаунт";
                         }
                         Status = $"Отсканировано: {ScannedUser} — подтверди на телефоне!";
                         Notify();

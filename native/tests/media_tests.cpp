@@ -183,23 +183,60 @@ void testVideoDepacketizerReorderAndLoss() {
     auto p3 = makeFu(1001, 500, false, true);
     dp.pushPacket(106, 93000, false, p1.data(), int(p1.size()), 50, out, pli);
     dp.pushPacket(108, 93000, true, p3.data(), int(p3.size()), 52, out, pli);
-    bool emittedBroken = dp.tryEmit(150, out, pli); // +98ms > 80ms marker timeout
+    bool emittedBroken = dp.tryEmit(150, out, pli); // +98ms > 40ms marker timeout
     check(!emittedBroken && pli && dp.needKeyframe(), "VideoDepacketizer drops corrupt P-frame and triggers RTCP PLI");
+
+    // [C-01 Regression] Contiguous post-loss P-frame (seq 109 right after dropped 106..108) MUST be rejected while needKeyframe()==true!
+    bool emittedCorruptRef = dp.pushPacket(109, 94500, true, pSlice.data(), int(pSlice.size()), 160, out, pli);
+    check(!emittedCorruptRef && dp.needKeyframe(),
+          "VideoDepacketizer rejects contiguous post-loss P-frame while awaiting IDR keyframe");
 
     // Verify large WebRTC-paced IDR keyframe spread over 120ms is NOT dropped prematurely and emits immediately even after prior loss!
     dp.pushPacket(120, 96000, false, stap.data(), int(stap.size()), 200, out, pli);
     dp.pushPacket(121, 96000, false, fu1.data(), int(fu1.size()), 240, out, pli);
     dp.pushPacket(122, 96000, false, fu2.data(), int(fu2.size()), 290, out, pli);
     bool emittedPacedIdr = dp.pushPacket(123, 96000, true, fu3.data(), int(fu3.size()), 320, out, pli);
-    check(emittedPacedIdr && out.is_keyframe && out.annexb == expected,
+    check(emittedPacedIdr && out.is_keyframe && !dp.needKeyframe() && out.annexb == expected,
           "VideoDepacketizer preserves 120ms WebRTC-paced IDR keyframe after prior packet loss");
 
     // Regression: SFU temporal-layer frame skip (small seq gap 124..125 skipped, clean intact P-frame at 126) MUST NOT lock needKeyframe()!
-    dp.setNeedKeyframe(false);
     bool emittedCleanGap = dp.pushPacket(126, 99000, true, pSlice.data(), int(pSlice.size()), 360, out, pli);
     if (!emittedCleanGap) emittedCleanGap = dp.tryEmit(410, out, pli); // +50ms > 40ms marker wait
     check(emittedCleanGap && !dp.needKeyframe(),
           "VideoDepacketizer survives SFU temporal-layer seq gap without stalling stream to 1fps");
+}
+
+// 9. Verify VideoDepacketizer overflow want_pli preservation + lost-marker fast recovery + strict RFC 6184 checks!
+void testVideoDepacketizerOverflowAndRfc6184Guards() {
+    fc::VideoDepacketizer dp;
+    fc::VideoDepacketizer::FrameOut out;
+    bool pli = false;
+
+    // 9a. Push >16 incomplete frames: eviction want_pli MUST survive tryEmit()!
+    uint8_t slice[4] = { 0x41, 0x9A, 0x11, 0x22 };
+    bool sawOverflowPli = false;
+    for (int i = 0; i < 18; ++i) {
+        dp.pushPacket(uint16_t(500 + i * 2), uint32_t(10000 + i * 3000), false, slice, sizeof(slice), 1000, out, pli);
+        if (pli) sawOverflowPli = true;
+    }
+    check(sawOverflowPli && dp.needKeyframe(), "VideoDepacketizer preserves want_pli on >16 frame buffer overflow");
+
+    // 9b. Reject malformed RFC 6184 FU-A (both Start+End bits set 0xC0) & truncated STAP-A trailing byte
+    dp.reset();
+    uint8_t badFua[4] = { 28 | 0x60, uint8_t(0x80 | 0x40 | 5), 0xAA, 0xBB };
+    bool okBadFua = dp.pushPacket(10, 3000, true, badFua, sizeof(badFua), 10, out, pli);
+    uint8_t badStap[6] = { 24, 0, 2, 0x67, 0x42, 0xFF }; // trailing 0xFF
+    bool okBadStap = dp.pushPacket(11, 6000, true, badStap, sizeof(badStap), 20, out, pli);
+    check(!okBadFua && !okBadStap, "VideoDepacketizer rejects malformed RFC 6184 FU-A (S+E) and truncated STAP-A");
+
+    // 9c. Lost marker packet does NOT stall subsequent keyframe for 250ms (recovers at >=40ms)
+    dp.reset();
+    dp.pushPacket(20, 9000, false, slice, sizeof(slice), 100, out, pli); // Frame A missing marker
+    uint8_t idrSingle[6] = { 0x65, 0x88, 0x84, 0x21, 0xA0, 0x01 };
+    dp.pushPacket(22, 12000, true, idrSingle, sizeof(idrSingle), 110, out, pli); // Frame B (IDR) waiting behind A
+    bool fastRecovered = dp.tryEmit(155, out, pli); // +45ms after Frame B arrived (< 250ms!)
+    check(fastRecovered && out.is_keyframe && !dp.needKeyframe(),
+          "VideoDepacketizer recovers in 45ms when previous frame lost its RTP marker packet");
 }
 
 // 8. Verify NoiseSuppressor NaN/Inf immunity (zero state poisoning even on corrupted audio driver input!)
@@ -255,22 +292,44 @@ void testAeadRtpPaddingAndEncryptedRtcpPli() {
     crypto_aead_xchacha20poly1305_ietf_encrypt(rtcp + 8, &clen, mediaSsrc, 4, rtcp, 8, nullptr, nonce, key);
     std::memcpy(rtcp + 8 + clen, &ctr, 4);
     uint8_t rtcpPlain[16]{};
-    bool okRtcp = crypto_aead_xchacha20poly1305_ietf_decrypt(rtcpPlain, &plen, nullptr, rtcp + 8, clen, rtcp, 8, nonce, key) == 0;
-    check(okRtcp && plen == 4 && std::memcmp(rtcpPlain, mediaSsrc, 4) == 0,
-          "Encrypted RTCP PLI (8B AAD + Media SSRC + 16B tag + 4B LE nonce) verified");
+    // 5c. [C-05 Regression] Compound Encrypted RTCP (SR PT=200 + PSFB PT=206 PLI) & unauthenticated PT=206 rejection!
+    // Build compound RTCP: 28-byte SR (V=2,RC=0,PT=200,len=6 -> 28 bytes) + 12-byte PSFB PLI (V=2,FMT=1,PT=206,len=2 -> 12 bytes) = 40 bytes total
+    uint8_t compoundPlain[40]{};
+    compoundPlain[0] = 0x80; compoundPlain[1] = 200; compoundPlain[2] = 0; compoundPlain[3] = 6; // 28B SR
+    compoundPlain[28] = 0x81; compoundPlain[29] = 206; compoundPlain[30] = 0; compoundPlain[31] = 2; // 12B PLI
+    uint8_t compoundEnc[128]{};
+    std::memcpy(compoundEnc, compoundPlain, 8);
+    uint32_t ctr2 = 88;
+    uint8_t nonce2[24]{};
+    std::memcpy(nonce2, &ctr2, 4);
+    unsigned long long cLen2 = 0;
+    crypto_aead_xchacha20poly1305_ietf_encrypt(compoundEnc + 8, &cLen2, compoundPlain + 8, 32, compoundEnc, 8, nullptr, nonce2, key);
+    std::memcpy(compoundEnc + 8 + cLen2, &ctr2, 4);
+    int compTotal = int(8 + cLen2 + 4);
+
+    bool compoundDetected = fc::VoiceTransport::decryptAndCheckRtcpPli(compoundEnc, compTotal, key, true);
+    uint8_t forgedPli[32] = { 0x81, 206, 0, 2, 0x11, 0x22, 0x33, 0x44 };
+    bool forgedRejected = !fc::VoiceTransport::decryptAndCheckRtcpPli(forgedPli, sizeof(forgedPli), key, true);
+    check(compoundDetected && forgedRejected,
+          "Encrypted Compound RTCP (SR+PLI) detected & unauthenticated PT=206 spoof rejected");
 }
 
-// 6. Verify VoiceTransport Outbound Go Live DAVE H.264 video SSRC assignment & MLS KeyPackage + PLI callback wiring
+// 6. Verify VoiceTransport Outbound Go Live DAVE H.264 video SSRC assignment & MLS KeyPackage + connectAndDiscover DAVE preservation
 void testOutboundGoLiveDaveInit() {
     fc::VoiceTransport pub;
-    bool ok = pub.daveInit(1, 987654321012345678ULL, "111222333444555666", 33333u);
+    pub.daveAddUser("999888777666555444"); // Pre-added from VOICE_STATE_UPDATE BEFORE UDP connect!
     pub.daveSetVideoSsrc(33334u);
+    std::string extIp;
+    uint16_t extPort = 0;
+    // Failed connect to closed loopback port MUST NOT wipe pre-added DAVE session or video_ssrc_!
+    pub.connectAndDiscover("127.0.0.1", 9, 33333u, extIp, extPort);
+    bool ok = pub.daveInit(1, 987654321012345678ULL, "111222333444555666", 33333u);
     bool pliWired = false;
     pub.setPliCallback([&] { pliWired = true; });
     uint8_t kp[4096]{};
     int32_t kpLen = pub.daveGetKeyPackage(kp, sizeof(kp));
-    char msg[128];
-    std::snprintf(msg, sizeof(msg), "Outbound Go Live DAVE init + H264 SSRC + MLS KeyPackage (%d bytes)", kpLen);
+    char msg[140];
+    std::snprintf(msg, sizeof(msg), "Outbound Go Live DAVE init + preserved session across connectAndDiscover (%d bytes)", kpLen);
     check(ok && kpLen > 100 && !pub.isDaveEncrypting() && !pliWired && pub.audioTxPackets() == 0 && pub.videoTxPackets() == 0, msg);
 }
 
@@ -314,6 +373,7 @@ int main() {
     testNoiseSuppressorNoiseRejection();
     testVoiceJitterBufferWrapAndPlc();
     testVideoDepacketizerReorderAndLoss();
+    testVideoDepacketizerOverflowAndRfc6184Guards();
     testAeadRtpPaddingAndEncryptedRtcpPli();
     testOutboundGoLiveDaveInit();
     testGoLiveSystemAudioOpus128k();

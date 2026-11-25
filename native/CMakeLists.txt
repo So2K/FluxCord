@@ -99,7 +99,7 @@ target_compile_definitions(FluxCord.Tests PRIVATE
     UNICODE
     _UNICODE
 )
-target_compile_options(FluxCord.Tests PRIVATE /utf-8 /W3 /permissive- $<$<CONFIG:Release>:/O2 /Oi /arch:AVX2>)
+target_compile_options(FluxCord.Tests PRIVATE /utf-8 /W3 /permissive- $<$<CONFIG:Release>:/O2 /Oi /Ot /arch:AVX2 /fp:fast>)
 target_link_libraries(FluxCord.Tests PRIVATE
     ${OPUS_LIB}
     ${SODIUM_LIB}

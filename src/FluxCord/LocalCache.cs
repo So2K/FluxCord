@@ -142,6 +142,107 @@ public static class LocalCache
         }
     }
 
+    public static void DeleteMessagesBulk(IReadOnlyList<string> messageIds)
+    {
+        if (messageIds.Count == 0) return;
+        lock (_lock)
+        {
+            if (_conn == null) return;
+            try
+            {
+                using var tx = _conn.BeginTransaction();
+                using var cmd = _conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = "DELETE FROM messages WHERE id=$id;";
+                var pId = cmd.Parameters.Add("$id", SqliteType.Text);
+                foreach (var id in messageIds)
+                {
+                    if (string.IsNullOrEmpty(id)) continue;
+                    pId.Value = id;
+                    cmd.ExecuteNonQuery();
+                }
+                tx.Commit();
+            }
+            catch { }
+        }
+    }
+
+    public static void DeleteChannelMessages(string channelId)
+    {
+        if (string.IsNullOrEmpty(channelId)) return;
+        lock (_lock)
+        {
+            if (_conn == null) return;
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "DELETE FROM messages WHERE channel_id=$ch;";
+                cmd.Parameters.AddWithValue("$ch", channelId);
+                cmd.ExecuteNonQuery();
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
+    /// Reconciles offline-deleted messages in the fetched Snowflake window and persists fresh messages atomically.
+    /// </summary>
+    public static void ReconcileRecentChannelMessages(string channelId, IReadOnlyList<DiscordMessage> latestMsgs)
+    {
+        if (string.IsNullOrEmpty(channelId)) return;
+        if (latestMsgs.Count == 0)
+        {
+            DeleteChannelMessages(channelId);
+            return;
+        }
+        ulong minId = ulong.MaxValue;
+        var liveIds = new HashSet<string>(latestMsgs.Count);
+        foreach (var m in latestMsgs)
+        {
+            if (string.IsNullOrEmpty(m.Id)) continue;
+            liveIds.Add(m.Id);
+            if (ulong.TryParse(m.Id, out var u) && u < minId) minId = u;
+        }
+        if (minId != ulong.MaxValue)
+        {
+            lock (_lock)
+            {
+                if (_conn == null) Init();
+                if (_conn != null)
+                {
+                    try
+                    {
+                        var stale = new List<string>();
+                        using (var q = _conn.CreateCommand())
+                        {
+                            q.CommandText = "SELECT id FROM messages WHERE channel_id=$ch AND CAST(id AS INTEGER) >= $minId;";
+                            q.Parameters.AddWithValue("$ch", channelId);
+                            q.Parameters.AddWithValue("$minId", (long)minId);
+                            using var r = q.ExecuteReader();
+                            while (r.Read())
+                            {
+                                string id = r.GetString(0);
+                                if (!liveIds.Contains(id)) stale.Add(id);
+                            }
+                        }
+                        if (stale.Count > 0)
+                        {
+                            using var tx = _conn.BeginTransaction();
+                            using var del = _conn.CreateCommand();
+                            del.Transaction = tx;
+                            del.CommandText = "DELETE FROM messages WHERE id=$id;";
+                            var pId = del.Parameters.Add("$id", SqliteType.Text);
+                            foreach (var sid in stale) { pId.Value = sid; del.ExecuteNonQuery(); }
+                            tx.Commit();
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        SaveMessages(channelId, latestMsgs);
+    }
+
     public static List<DiscordMessage> LoadMessages(string channelId, int limit = 50)
     {
         var res = new List<DiscordMessage>();

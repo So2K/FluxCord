@@ -188,6 +188,8 @@ internal static unsafe partial class MediaNative
     public static partial int fc_watch_dave_init_slot(int slot, ushort protoVer, ulong channelId, string selfUserId, uint selfSsrc);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf8)]
     public static partial void fc_watch_dave_add_user_slot(int slot, string userId);
+    [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial void fc_watch_dave_remove_user_slot(int slot, string userId);
     [LibraryImport(Dll)] public static partial int fc_watch_dave_get_key_package_slot(int slot, byte* outBuf, int cap);
     [LibraryImport(Dll)] public static partial void fc_watch_dave_set_external_sender_slot(int slot, byte* data, int len);
     [LibraryImport(Dll)] public static partial int fc_watch_dave_process_proposals_slot(int slot, byte* data, int len, byte* outCw, int cap);

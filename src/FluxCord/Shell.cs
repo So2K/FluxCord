@@ -63,9 +63,11 @@ public static unsafe partial class Shell
     public static bool IsInVoiceStage => _inVoiceStage;
     public static bool IsMuted => _muted;
     public static bool IsDeafened => _deafened;
+    public static bool IsLocalStreaming => _streaming;
     public static float TopBarRightZoneWidth { get; private set; } = 140f;
     private static bool _muted, _deafened, _loopback;
     private static bool _streaming;
+    private static bool _qrStartQueued;
     private static long _voiceJoinedTick;
     private static long _cachedRamMb;
     private static long _lastRamSampleTick;
@@ -348,7 +350,7 @@ public static unsafe partial class Shell
             catch { }
         }
 
-        if (SettingsStore.Current.PushToTalk && dc.VoiceConnected)
+        if (SettingsStore.Current.PushToTalk && (dc.VoiceConnected || _loopback))
         {
             int pttVk = W.ResolveKeyVk(SettingsStore.Current.PushToTalkKey);
             bool pttDown = W.AsyncKeyDown(pttVk);
@@ -528,7 +530,7 @@ public static unsafe partial class Shell
             : autoBitrate;
 
         int ok = MediaNative.fc_screen_start_ex(
-            monitorIndex, targetHwnd, w, h, s.StreamFps, bitrate, s.StreamCodec,
+            monitorIndex, targetHwnd, w, h, s.StreamFps, bitrate, (int)VideoCodec.H264,
             1, App.SelfStreamHwnd, s.StreamCaptureAudio ? 1 : 0, s.RenderDeviceId);
 
         _streaming = ok != 0;
@@ -629,26 +631,52 @@ public static unsafe partial class Shell
         App.Invalidate();
     }
 
-    public static void OnChatEnter(string text)
+    public static void OnChatEnter(string? preTakenText = null)
     {
         var dc = DiscordClient.Instance;
-        if (!string.IsNullOrEmpty(dc.ActiveChannelId) && !string.IsNullOrWhiteSpace(text))
+        string raw = preTakenText ?? App.PeekChatInputText();
+        string trimmed = raw.Trim();
+        if (string.IsNullOrEmpty(dc.ActiveChannelId) || string.IsNullOrEmpty(trimmed)) return;
+        if (trimmed.Length > 2000)
         {
-            if (!string.IsNullOrEmpty(_editingMsgId))
-            {
-                _ = dc.EditMessageAsync(dc.ActiveChannelId, _editingMsgId, text);
-                _editingMsgId = "";
-                _editingOrigText = "";
-                Toast("Сообщение изменено");
-            }
-            else
-            {
-                _ = dc.SendMessageAsync(dc.ActiveChannelId, text, string.IsNullOrEmpty(_replyToId) ? null : _replyToId);
-                _replyToId = "";
-                _replyToLabel = "";
-                _chatScroll = 0;
-            }
+            if (preTakenText != null) App.SetChatInputText(raw);
+            Toast($"Сообщение слишком длинное ({trimmed.Length} / 2000 симв.)", 3500);
+            return;
         }
+        if (preTakenText == null) App.TakeChatInputText();
+
+        if (!string.IsNullOrEmpty(_editingMsgId))
+        {
+            _ = dc.EditMessageAsync(dc.ActiveChannelId, _editingMsgId, trimmed);
+            _editingMsgId = "";
+            _editingOrigText = "";
+            Toast("Сообщение изменено");
+        }
+        else
+        {
+            string cid = dc.ActiveChannelId;
+            string? rep = string.IsNullOrEmpty(_replyToId) ? null : _replyToId;
+            _replyToId = "";
+            _replyToLabel = "";
+            _chatScroll = 0;
+            SendAndRestoreOnFailureAsync(cid, trimmed, rep);
+        }
+    }
+
+    private static void SendAndRestoreOnFailureAsync(string channelId, string text, string? replyId)
+    {
+        _ = DiscordClient.Instance.SendMessageAsync(channelId, text, replyId).ContinueWith(t =>
+        {
+            if (t.IsFaulted || t.IsCanceled || !t.Result)
+            {
+                App.InvokeOnUiThread(() =>
+                {
+                    if (string.IsNullOrEmpty(App.PeekChatInputText()))
+                        App.SetChatInputText(text);
+                    Toast("Не удалось отправить сообщение (проверьте права / соединение)", 4000);
+                });
+            }
+        }, TaskScheduler.Default);
     }
 
     public static void OnTokenSubmit(string token)
@@ -697,16 +725,18 @@ public static unsafe partial class Shell
         _overlayCutouts.Clear();
 
         bool fullModalOpen = _showSettings || _showShareModal || _showQuickSwitch || _lightboxUrl != null;
-        bool mouseOverPopup = false;
+        bool anyPopupOpen = _showVoiceInfo || _showStatusMenu || _showEmojiPicker || _showPinsPopup ||
+                            _profileUserId != null || _ctxUser != null || _ctxStreamUserId != null || _audioPopupMode != 0;
+        bool hoverPreviewOver = false;
         for (int i = 0; i < _prevPopupRects.Count; i++)
-            if (_prevPopupRects[i].Contains(UI.MX, UI.MY)) { mouseOverPopup = true; break; }
+            if (_prevPopupRects[i].Contains(UI.MX, UI.MY)) { hoverPreviewOver = true; break; }
 
         float w = Gfx.W, h = Gfx.H;
         UI.InputBlocked = false;
         DrawTopBar(new R(0, 0, w, TopH));
 
-        // Block background click-through whenever a full modal or an overlay popup sits under the pointer!
-        UI.InputBlocked = fullModalOpen || mouseOverPopup;
+        // Block background click-through whenever ANY modal or popup is open (outside clicks dismiss ONLY the popup!)
+        UI.InputBlocked = fullModalOpen || anyPopupOpen || hoverPreviewOver;
 
         if (!dc.IsConnected && !dc.IsDemoMode)
         {
@@ -834,9 +864,43 @@ public static unsafe partial class Shell
             W.PostMessageW(App.Hwnd, W.WM_CLOSE, 0, 0);
     }
 
+    private static void QueueQrStartIfNeeded()
+    {
+        if (_qrStartQueued) return;
+        _qrStartQueued = true;
+        App.InvokeOnUiThread(() =>
+        {
+            _qrStartQueued = false;
+            var dc = DiscordClient.Instance;
+            var qr = RemoteAuthQr.Instance;
+            if (!dc.IsConnected && !dc.IsConnecting && !dc.IsDemoMode && !qr.IsRunning)
+                qr.Start();
+        });
+    }
+
     private static void DrawLoginScreen(R r)
     {
         Gfx.FillRect(r, Th.Bg);
+        var dc = DiscordClient.Instance;
+        if (dc.IsConnecting)
+        {
+            // Clean auto-login splash — NEVER spin up RemoteAuthQr WebSocket + RSA-2048 while saved DPAPI token is connecting!
+            var splash = new R(r.X + (r.W - 440) * 0.5f, r.Y + (r.H - 220) * 0.5f, 440, 220);
+            Gfx.FillRect(splash, Th.Panel, 14);
+            Gfx.StrokeRect(splash, Th.Border, 1, 14);
+            var spIcon = GetBrandIcon(96);
+            if (spIcon != null) Gfx.DrawBitmap(spIcon, new R(splash.X + (splash.W - 52) * 0.5f, splash.Y + 26, 52, 52));
+            Gfx.DrawText("Подключение к Discord...", new R(splash.X + 20, splash.Y + 92, splash.W - 40, 26), 17, Th.Text, 700, 1);
+            Gfx.DrawText(dc.StatusText, new R(splash.X + 20, splash.Y + 122, splash.W - 40, 20), 12.5f, Th.Sub, 500, 1);
+            if (UI.Button(UI.Id("btn_cancel_conn"), new R(splash.X + 110, splash.Y + 158, 220, 34), "Отмена / Сменить аккаунт", Th.Card, Th.Sub, 8, 12.5f))
+            {
+                dc.Disconnect();
+                QueueQrStartIfNeeded();
+            }
+            UI.Animate();
+            return;
+        }
+
         var card = new R(r.X + (r.W - 780) * 0.5f, r.Y + (r.H - 410) * 0.5f, 780, 410);
         Gfx.FillRect(card, Th.Panel, 14);
         Gfx.StrokeRect(card, Th.Border, 1, 14);
@@ -876,7 +940,7 @@ public static unsafe partial class Shell
 
         float rx = divX + 28, rw = card.Right - rx - 28;
         var qr = RemoteAuthQr.Instance;
-        if (!qr.IsRunning && !qr.IsExpired && qr.Matrix == null) qr.Start();
+        if (!qr.IsRunning && !qr.IsExpired && qr.Matrix == null) QueueQrStartIfNeeded();
 
         Gfx.DrawText("Вход по QR-коду", new R(rx, card.Y + 28, rw, 26), 17, Th.Text, 700, 1);
         float qrSize = 196;
@@ -912,7 +976,7 @@ public static unsafe partial class Shell
         if (qr.Matrix != null && !qr.IsExpired && qr.ExpiresAtTick > 0)
         {
             long remSec = Math.Max(0, (qr.ExpiresAtTick - Environment.TickCount64) / 1000);
-            if (remSec == 0) qr.Start();
+            if (remSec == 0) QueueQrStartIfNeeded();
             else if (string.IsNullOrEmpty(qr.ScannedUser)) statusLine = $"Отсканируй в Discord ({remSec / 60}:{remSec % 60:00})";
         }
         Gfx.DrawText(statusLine, new R(rx - 8, card.Y + 272, rw + 16, 40), 12.5f, string.IsNullOrEmpty(qr.ScannedUser) ? Th.Sub : Th.Green, 600, 1, true);
@@ -1923,7 +1987,11 @@ public static unsafe partial class Shell
                 float textW = msgArea.W - 88;
                 bool hasCode = m.Content.Contains("```", StringComparison.Ordinal);
                 bool isQuote = !hasCode && m.Content.TrimStart().StartsWith("> ", StringComparison.Ordinal);
-                float textH = string.IsNullOrEmpty(m.Content) ? 0f : Gfx.MeasureText(m.Content, 14f, 400, textW).H + (hasCode ? 16f : 0f);
+                float textH = string.IsNullOrEmpty(m.Content)
+                    ? 0f
+                    : (hasCode
+                        ? Gfx.MeasureText(m.Content.Replace("```", "").Trim(), 13f, 400, MathF.Max(60f, MathF.Min(textW, 640f) - 20f)).H + 20f
+                        : Gfx.MeasureText(m.Content, 14f, 400, textW).H);
                 float replyH = string.IsNullOrEmpty(m.ReplyPreview) ? 0f : 18f;
 
                 // Measure ALL attachments (images + file cards!)
@@ -1971,7 +2039,7 @@ public static unsafe partial class Shell
                     float eMeta = (!string.IsNullOrEmpty(eb.Author) ? 16f : 0f) + (!string.IsNullOrEmpty(eb.Footer) ? 16f : 0f);
                     embH += 22f + eMeta + eImgH + (string.IsNullOrEmpty(eb.Description) ? 0f : Gfx.MeasureText(eb.Description, 12.5f, 400, MathF.Min(420, textW - 24)).H) + 14f;
                 }
-                float reactH = m.Reactions.Count > 0 ? 28f : 0f;
+                float reactH = m.Reactions.Length > 0 ? 28f : 0f;
                 float headerH = grouped ? 4f : 24f;
                 float rowH = MathF.Max(grouped ? 24f : 44f, replyH + headerH + textH + attTotalH + embH + reactH + 8f);
                 totalMsgH += rowH;
@@ -2048,7 +2116,7 @@ public static unsafe partial class Shell
                     if (UI.Click(UI.Id("mfil_" + m.Id, fi), fr)) W.OpenUrl(fa.Url);
                     cy += 44f;
                 }
-                for (int ei = 0; ei < m.Embeds.Count; ei++)
+                for (int ei = 0; ei < m.Embeds.Length; ei++)
                 {
                     var eb = m.Embeds[ei];
                     float ew = MathF.Min(440, textW);
@@ -2084,21 +2152,21 @@ public static unsafe partial class Shell
                     if (!string.IsNullOrEmpty(eb.Footer)) Gfx.DrawText(eb.Footer, new R(msgArea.X + 76, ey, ew - 20, 15), 10.5f, Th.Dim);
                     cy += bh + 6f;
                 }
-                if (m.Reactions.Count > 0)
+                if (m.Reactions.Length > 0)
                 {
                     float rx = msgArea.X + 64;
                     int rIdx = 0;
                     foreach (var re in m.Reactions.Take(8))
                     {
-                        string emo = re.Split(' ')[0];
-                        bool isMine = m.MyReactions.Contains(emo);
-                        float rw = Gfx.MeasureText(re, 12, 600, 100).W + 16;
+                        string label = $"{re.Display} {re.Count}";
+                        bool isMine = re.Me;
+                        float rw = Gfx.MeasureText(label, 12, 600, 120).W + 16;
                         var rr = new R(rx, cy + 2, rw, 22);
                         Gfx.FillRect(rr, isMine ? 0x335865F2 : (UI.Hover(rr) ? Th.Hover : Th.Card), 6);
                         Gfx.StrokeRect(rr, isMine ? Th.Brand : Th.Border, 1, 6);
-                        Gfx.DrawText(re, new R(rx, cy + 5, rw, 16), 12, Th.Text, 600, 1);
+                        Gfx.DrawText(label, new R(rx, cy + 5, rw, 16), 12, Th.Text, 600, 1);
                         if (UI.Click(UI.Id("mreact_" + m.Id, rIdx++), rr))
-                            _ = dc.ToggleReactionAsync(m.ChannelId, m.Id, emo);
+                            _ = dc.ToggleReactionAsync(m.ChannelId, m.Id, re.ApiKey);
                         rx += rw + 6;
                     }
                 }
@@ -2106,8 +2174,8 @@ public static unsafe partial class Shell
                 {
                     // Solid top-right floating Discord action toolbar (never collides transparently over text!)
                     bool ownMsg = m.AuthorId == dc.Me.Id;
-                    int urlIdx = m.Content.IndexOf("http", StringComparison.OrdinalIgnoreCase);
-                    float pillW = 4 * 26f + 60f + 52f + (urlIdx >= 0 ? 58f : 0f) + (ownMsg ? 98f : 0f) + 12f;
+                    string? foundUrl = FindFirstHttpUrl(m.Content);
+                    float pillW = 4 * 26f + 60f + 52f + (foundUrl != null ? 58f : 0f) + (ownMsg ? 98f : 0f) + 12f;
                     var pillR = new R(rowRect.Right - pillW - 6, y + 2, pillW, 26);
                     Gfx.FillRect(pillR, 0xF416181F, 7);
                     Gfx.StrokeRect(pillR, Th.Border, 1, 7);
@@ -2126,14 +2194,11 @@ public static unsafe partial class Shell
                             App.SetChatInputText(_editingOrigText);
                         }
                     }
-                    if (urlIdx >= 0)
+                    if (foundUrl != null)
                     {
                         ax -= 56;
                         if (UI.Button(UI.Id("murl", mk), new R(ax, pillR.Y + 2, 54, 22), "Ссылка", 0x00000000, Th.Cyan, 5, 11))
-                        {
-                            int end = m.Content.IndexOfAny([' ', '\n', '\r', ')', ']'], urlIdx);
-                            W.OpenUrl(end > urlIdx ? m.Content[urlIdx..end] : m.Content[urlIdx..]);
-                        }
+                            W.OpenUrl(foundUrl);
                     }
                     ax -= 50;
                     if (UI.Button(UI.Id("mcpy", mk), new R(ax, pillR.Y + 2, 48, 22), "Копир.", 0x00000000, Th.Sub, 5, 11))
@@ -2230,7 +2295,18 @@ public static unsafe partial class Shell
         if (UI.Button(UI.Id("btn_emo"), new R(r.X + chatW - 126, _chatInputRect.Y + 4, 32, 32), "😀", _showEmojiPicker ? Th.Brand : Th.Card, Th.Text, 7, 14))
             _showEmojiPicker = !_showEmojiPicker;
         if (UI.Button(UI.Id("btn_send"), new R(r.X + chatW - 88, _chatInputRect.Y + 3, 66, 34), string.IsNullOrEmpty(_editingMsgId) ? "Отпр." : "Сохр.", Th.Brand, Th.Text, 7, 13))
-            OnChatEnter(App.TakeChatInputText());
+            OnChatEnter();
+    }
+
+    private static string? FindFirstHttpUrl(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return null;
+        int idx = s.IndexOf("https://", StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) idx = s.IndexOf("http://", StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        int end = s.IndexOfAny([' ', '\t', '\n', '\r', '>', '"', '\'', ')', ']'], idx);
+        string raw = (end > idx ? s[idx..end] : s[idx..]).TrimEnd('.', ',', ';', '!', '?');
+        return raw.Length > 8 ? raw : null;
     }
 
     private static void DrawMemberListSidebar(R r, DiscordGuild guild)

@@ -62,6 +62,7 @@ public:
         }
 
         // Evict oldest frame by minimum extended sequence (safe across 32-bit RTP timestamp wraparound!)
+        bool overflowPli = false;
         while (frames_.size() > 16) {
             auto oldIt = findOldestFrame();
             if (!oldIt->second.packets.empty()) {
@@ -70,10 +71,13 @@ public:
             frames_.erase(oldIt);
             frames_dropped_++;
             need_keyframe_ = true;
-            want_pli = true;
+            overflowPli = true;
         }
 
-        return tryEmit(now_ms, out, want_pli);
+        bool emitPli = false;
+        bool ok = tryEmit(now_ms, out, emitPli);
+        want_pli = overflowPli || emitPli;
+        return ok;
     }
 
     bool tryEmit(int64_t now_ms, FrameOut& out, bool& want_pli) {
@@ -124,18 +128,22 @@ public:
 
             bool frameComplete = fb.has_marker && (maxSeq == fb.marker_seq) && contiguousInternal && startsClean;
 
-            // Fast-path: complete frame that is either contiguous with previous OR we're waiting for a keyframe
+            // Fast-path: complete frame that is either contiguous with previous (when NOT awaiting keyframe) OR is a keyframe
             if (frameComplete && (contiguousWithPrev || need_keyframe_)) {
                 bool assembled = assembleAnnexB(fb, out.annexb);
                 out.timestamp = bestIt->first;
-                out.is_keyframe = hasIdrOrSps(out.annexb.data(), out.annexb.size());
-                if (contiguousWithPrev || out.is_keyframe) {
+                out.is_keyframe = assembled && hasIdrOrSps(out.annexb.data(), out.annexb.size());
+                if ((!need_keyframe_ && contiguousWithPrev) || out.is_keyframe) {
                     advanceLastEmitted(maxSeq);
                     frames_.erase(bestIt);
                     if (assembled && !out.annexb.empty()) {
+                        if (hasIdr(out.annexb.data(), out.annexb.size())) need_keyframe_ = false;
                         frames_ok_++;
                         return true;
                     }
+                    frames_dropped_++;
+                    need_keyframe_ = true;
+                    want_pli = true;
                     continue;
                 }
                 // Waiting for keyframe, and this complete frame is NOT a keyframe: discard immediately so it NEVER head-of-line blocks an IDR behind it!
@@ -146,20 +154,34 @@ public:
                 }
             }
 
-            // Timeouts: wait 40ms after marker for out-of-order frames, or 250ms total for WebRTC-paced 1080p/1440p IDR keyframes!
-            bool timedOut = (fb.has_marker && (now_ms - fb.marker_ms >= 40)) || (now_ms - fb.first_ms >= 250);
+            // If marker packet was lost, don't stall for full 250ms once a newer frame has already been waiting >=40ms!
+            bool newerFrameWaiting = false;
+            if (!fb.has_marker && frames_.size() > 1) {
+                for (auto it = frames_.begin(); it != frames_.end(); ++it) {
+                    if (it != bestIt && !it->second.packets.empty() &&
+                        it->second.packets.begin()->first > maxSeq &&
+                        (now_ms - it->second.first_ms >= 40)) {
+                        newerFrameWaiting = true;
+                        break;
+                    }
+                }
+            }
+
+            // Timeouts: wait 40ms after marker (or newer frame arrival on lost marker), or 250ms total for WebRTC-paced 1080p/1440p IDR keyframes!
+            bool timedOut = (fb.has_marker && (now_ms - fb.marker_ms >= 40)) || newerFrameWaiting || (now_ms - fb.first_ms >= 250);
             if (!timedOut) break;
 
             if (frameComplete) {
                 bool assembled = assembleAnnexB(fb, out.annexb);
                 out.timestamp = bestIt->first;
-                out.is_keyframe = hasIdrOrSps(out.annexb.data(), out.annexb.size());
+                out.is_keyframe = assembled && hasIdrOrSps(out.annexb.data(), out.annexb.size());
                 int64_t gap = (last_emitted_max_seq_ >= 0) ? (minSeq - last_emitted_max_seq_ - 1) : 0;
                 advanceLastEmitted(maxSeq);
                 frames_.erase(bestIt);
 
                 if (assembled && !out.annexb.empty()) {
                     if (out.is_keyframe) {
+                        if (hasIdr(out.annexb.data(), out.annexb.size())) need_keyframe_ = false;
                         frames_ok_++;
                         return true;
                     }
@@ -286,25 +308,31 @@ private:
                 appendStartCode(out);
                 out.insert(out.end(), pay, pay + payLen);
             } else if (naluType == 24) {
-                if (inFu) return false;
+                if (inFu || payLen <= 3) return false;
                 int off = 1;
                 while (off + 2 <= payLen) {
                     uint16_t sz = uint16_t((uint16_t(pay[off]) << 8) | pay[off + 1]);
                     off += 2;
                     if (sz == 0 || off + sz > payLen) return false;
+                    uint8_t subType = pay[off] & 0x1F;
+                    if (subType == 0 || subType >= 24) return false;
                     appendStartCode(out);
                     out.insert(out.end(), pay + off, pay + off + sz);
                     off += sz;
                 }
+                if (off != payLen) return false; // trailing truncated bytes in STAP-A
             } else if (naluType == 28) {
-                if (payLen < 2) return false;
+                if (payLen <= 2) return false; // RFC 6184 §5.8: FU-A requires >=1 payload byte
                 uint8_t fuHdr = pay[1];
+                uint8_t origType = fuHdr & 0x1F;
+                if (origType == 0 || origType >= 24) return false;
                 bool startBit = (fuHdr & 0x80) != 0;
                 bool endBit = (fuHdr & 0x40) != 0;
+                if (startBit && endBit) return false; // RFC 6184 §5.8: S and E MUST NOT both be set
                 if (startBit) {
                     if (inFu) return false; // nested FU-A start without endBit -> lost tail
                     fu.clear();
-                    fu.push_back((pay[0] & 0xE0) | (fuHdr & 0x1F));
+                    fu.push_back((pay[0] & 0xE0) | origType);
                     fu.insert(fu.end(), pay + 2, pay + payLen);
                     inFu = true;
                 } else if (inFu) {
@@ -318,6 +346,9 @@ private:
                     fu.clear();
                     inFu = false;
                 }
+            } else {
+                // Unsupported / reserved NALU packetization type (0, 25..27 STAP-B/MTAP, 29 FU-B, 30..31)
+                return false;
             }
         }
         return !inFu && !out.empty();

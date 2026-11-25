@@ -44,6 +44,7 @@ public static unsafe class Gfx
     public static double LastFlushMs { get; private set; }
 
     private static readonly Stack<R> _clipStack = new();
+    private static int _nativeClipDepth;
     private static readonly Dictionary<(float Size, int Weight, int Align, bool Wrap), IDWriteTextFormat> _formats = new();
     private static readonly Dictionary<(string Text, float Size, int Weight, float MaxW), (IDWriteTextLayout Layout, float W, float H)> _layouts = new();
     private static IDWriteFontCollection? _lucideFonts;
@@ -134,26 +135,59 @@ public static unsafe class Gfx
 
     public static void Resize(int w, int h)
     {
-        if (w <= 0 || h <= 0 || _swap == null) return;
+        if (w <= 0 || h <= 0 || _swap == null || DC == null) return;
         PxW = w;
         PxH = h;
         DC.Target = null;
         _target?.Dispose();
         _target = null;
-        _swap.ResizeBuffers(2, (uint)w, (uint)h, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
+        var rhr = _swap.ResizeBuffers(2, (uint)w, (uint)h, Format.B8G8R8A8_UNorm, SwapChainFlags.None);
+        if (rhr.Failure)
+        {
+            RecoverDevice();
+            return;
+        }
         CreateTarget();
     }
 
     public static void BeginDraw(uint clearArgb)
     {
         _clipStack.Clear();
+        _nativeClipDepth = 0;
         DC.BeginDraw();
         DC.Clear(ToColor4(clearArgb));
         Clip = new R(0, 0, W, H);
     }
 
+    public static void UnwindClips()
+    {
+        if (DC == null) { _nativeClipDepth = 0; _clipStack.Clear(); return; }
+        while (_nativeClipDepth > 0)
+        {
+            try { DC.PopAxisAlignedClip(); } catch { }
+            _nativeClipDepth--;
+        }
+        _clipStack.Clear();
+        Clip = new R(0, 0, W, H);
+    }
+
+    private static void RecoverDevice()
+    {
+        try
+        {
+            DisposeDevice();
+            CreateDevice();
+        }
+        catch (Exception ex)
+        {
+            SettingsStore.Log("Gfx RecoverDevice failed: " + ex.Message);
+        }
+    }
+
     public static void EndDraw()
     {
+        if (DC == null || _swap == null) return;
+        UnwindClips();
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var hr = DC.EndDraw();
         LastFlushMs = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
@@ -162,14 +196,14 @@ public static unsafe class Gfx
             var phr = _swap.Present(1, PresentFlags.None);
             if (phr.Code == unchecked((int)0x887A0005) || phr.Code == unchecked((int)0x887A0007)) // DXGI_ERROR_DEVICE_REMOVED / RESET
             {
-                DisposeDevice();
-                CreateDevice();
+                RecoverDevice();
             }
         }
-        else if (hr.Code == unchecked((int)0x8899000C) || hr.Code == unchecked((int)0x887A0005)) // D2DERR_RECREATE_TARGET
+        else
         {
-            DisposeDevice();
-            CreateDevice();
+            // Recover cleanly on ANY D2D EndDraw failure (D2DERR_RECREATE_TARGET, D2DERR_WRONG_STATE, etc.)
+            SettingsStore.Log($"Gfx EndDraw hr=0x{hr.Code:X8} -> recreating device");
+            RecoverDevice();
         }
         if (_layouts.Count > 1200)
         {
@@ -182,12 +216,22 @@ public static unsafe class Gfx
     {
         _clipStack.Push(Clip);
         DC.PushAxisAlignedClip(new Rect(r.X, r.Y, r.W, r.H), AntialiasMode.Aliased);
-        Clip = r;
+        _nativeClipDepth++;
+        // Intersect logical hit-test clip with parent clip so nested clips never leak hover/clicks outside scroll panes!
+        float x1 = MathF.Max(Clip.X, r.X);
+        float y1 = MathF.Max(Clip.Y, r.Y);
+        float x2 = MathF.Min(Clip.Right, r.Right);
+        float y2 = MathF.Min(Clip.Bottom, r.Bottom);
+        Clip = new R(x1, y1, MathF.Max(0, x2 - x1), MathF.Max(0, y2 - y1));
     }
 
     public static void PopClip()
     {
-        DC.PopAxisAlignedClip();
+        if (_nativeClipDepth > 0)
+        {
+            DC.PopAxisAlignedClip();
+            _nativeClipDepth--;
+        }
         Clip = _clipStack.Count > 0 ? _clipStack.Pop() : new R(0, 0, W, H);
     }
 
@@ -327,17 +371,26 @@ public static unsafe class Gfx
     {
         Shell.ClearShareBitmaps();
         ImageCache.ClearGpu();
-        foreach (var f in _iconFormats.Values) f.Dispose();
+        _nativeClipDepth = 0;
+        _clipStack.Clear();
+        foreach (var f in _iconFormats.Values) { try { f.Dispose(); } catch { } }
         _iconFormats.Clear();
-        foreach (var v in _layouts.Values) v.Layout.Dispose();
+        foreach (var v in _layouts.Values) { try { v.Layout.Dispose(); } catch { } }
         _layouts.Clear();
-        foreach (var f in _formats.Values) f.Dispose();
+        foreach (var f in _formats.Values) { try { f.Dispose(); } catch { } }
         _formats.Clear();
-        _brush?.Dispose();
-        _target?.Dispose();
-        DC?.Dispose();
-        _d2dDev?.Dispose();
-        _swap?.Dispose();
-        _dev?.Dispose();
+        try { if (DC != null) DC.Target = null; } catch { }
+        try { _brush?.Dispose(); } catch { }
+        try { _target?.Dispose(); } catch { }
+        try { DC?.Dispose(); } catch { }
+        try { _d2dDev?.Dispose(); } catch { }
+        try { _swap?.Dispose(); } catch { }
+        try { _dev?.Dispose(); } catch { }
+        _brush = null!;
+        _target = null;
+        DC = null!;
+        _d2dDev = null!;
+        _swap = null!;
+        _dev = null!;
     }
 }

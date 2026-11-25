@@ -5,9 +5,9 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <RootNamespace>FluxCord</RootNamespace>
     <AssemblyName>FluxCord</AssemblyName>
-    <Version>1.0.3</Version>
-    <FileVersion>1.0.3.0</FileVersion>
-    <AssemblyVersion>1.0.3.0</AssemblyVersion>
+    <Version>1.0.4</Version>
+    <FileVersion>1.0.4.0</FileVersion>
+    <AssemblyVersion>1.0.4.0</AssemblyVersion>
     <Platforms>x64</Platforms>
     <Platform>x64</Platform>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -41,5 +41,6 @@
   <ItemGroup>
     <None Include="Assets\fonts\lucide.ttf" CopyToOutputDirectory="PreserveNewest" Condition="Exists('Assets\fonts\lucide.ttf')" />
     <None Include="Assets\fluxcord.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('Assets\fluxcord.png')" />
+    <None Include="Assets\fluxcord.ico" CopyToOutputDirectory="PreserveNewest" Condition="Exists('Assets\fluxcord.ico')" />
   </ItemGroup>
 </Project>

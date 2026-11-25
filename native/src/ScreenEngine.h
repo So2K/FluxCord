@@ -21,6 +21,7 @@ public:
                HWND target_hwnd = nullptr, bool capture_system_audio = false, const char* render_device_id = nullptr);
     void setVideoSsrc(uint32_t ssrc) { video_ssrc_.store(ssrc); requestKeyframe(); }
     void requestKeyframe() { force_keyframe_.store(true); }
+    bool isCapturingAudio() const { return running_.load() && capture_audio_; }
     void stop();
     void resizePreview(int32_t width, int32_t height);
     void getStats(FcScreenStats* out) const;
@@ -35,6 +36,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> video_ssrc_{0};
     std::atomic<bool> force_keyframe_{true};
+    HANDLE worker_done_ev_ = nullptr;
     std::thread worker_;
     std::thread audio_worker_;
 

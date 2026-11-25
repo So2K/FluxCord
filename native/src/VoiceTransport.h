@@ -29,7 +29,7 @@ public:
     bool sendH264Nalu(const uint8_t* nalu, int len, uint32_t video_ssrc, uint32_t timestamp, bool marker);
     bool sendH264AccessUnit(const uint8_t* annexb, int len, uint32_t video_ssrc, uint32_t timestamp);
 
-    // DAVE E2EE (MLS) lifecycle
+    // DAVE E2EE (MLS) lifecycle (daveProcessCommit returns: 1=applied, 2=ignored, 0=failed)
     bool daveInit(uint16_t protocol_version, uint64_t channel_id, const char* self_user_id, uint32_t self_ssrc);
     void daveSetVideoSsrc(uint32_t video_ssrc);
     void daveAddUser(const char* user_id);
@@ -38,9 +38,12 @@ public:
     int32_t daveGetKeyPackage(uint8_t* out_buf, int32_t cap);
     void daveSetExternalSender(const uint8_t* data, int32_t len);
     int32_t daveProcessProposals(const uint8_t* data, int32_t len, uint8_t* out_commit_welcome, int32_t cap);
-    bool daveProcessCommit(const uint8_t* data, int32_t len);
+    int32_t daveProcessCommit(const uint8_t* data, int32_t len);
     bool daveProcessWelcome(const uint8_t* data, int32_t len);
     void daveExecuteTransition(uint16_t protocol_version);
+
+    // Authenticated compound RTCP decryption & PLI/FIR detection (exposed for deterministic unit tests)
+    static bool decryptAndCheckRtcpPli(const uint8_t* pkt, int n, const uint8_t key[32], bool use_xchacha);
 
     void setAudioRxCallback(AudioRxCallback cb) {
         std::lock_guard lk(cb_mtx_);
@@ -61,6 +64,7 @@ public:
 
 private:
     void rxLoop();
+    void closeTransportLocked();
     void disconnectLocked();
     void daveDestroyLocked();
     void daveRefreshRatchetsLocked(uint16_t protocol_version);
@@ -76,6 +80,7 @@ private:
     uint16_t video_seq_ = 0;
     uint32_t nonce_counter_ = 1;
     uint32_t last_audio_ts_ = 0;
+    bool has_audio_ts_ = false;
 
     std::mutex tx_mtx_;
     std::mutex key_mtx_;
@@ -98,6 +103,7 @@ private:
     DAVEEncryptorHandle dave_enc_ = nullptr;
     std::string self_user_id_;
     uint16_t dave_proto_ver_ = 0;
+    uint32_t video_ssrc_ = 0;
     std::map<uint32_t, std::string> ssrc_to_user_;
     std::map<std::string, DAVEDecryptorHandle> user_decryptors_;
     std::map<std::string, bool> user_has_ratchet_;

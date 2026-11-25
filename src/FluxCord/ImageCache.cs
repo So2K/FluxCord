@@ -23,6 +23,9 @@ public static partial class ImageCache
     [LibraryImport("ole32.dll")]
     private static partial int CoInitializeEx(nint pvReserved, uint dwCoInit);
 
+    [LibraryImport("ole32.dll")]
+    private static partial void CoUninitialize();
+
     private sealed class DecodedImg
     {
         public byte[] Pixels = [];
@@ -49,7 +52,9 @@ public static partial class ImageCache
     public static uint GetCardColor(string? url, string fallbackKey)
     {
         if (!string.IsNullOrEmpty(url) && _dominant.TryGetValue(url, out var col)) return col;
-        uint h = (uint)fallbackKey.GetHashCode();
+        uint h = 2166136261u;
+        if (!string.IsNullOrEmpty(fallbackKey))
+            foreach (char c in fallbackKey) h = (h ^ c) * 16777619u;
         uint[] palette = [0xFF15171E, 0xFF1B191C, 0xFF161A22, 0xFF1D1820, 0xFF161D1A];
         return palette[h % (uint)palette.Length];
     }
@@ -63,7 +68,8 @@ public static partial class ImageCache
     public static unsafe ID2D1Bitmap1? Get(string? url, int maxDim = 96, ImgMask mask = ImgMask.None)
     {
         if (string.IsNullOrEmpty(url) || Gfx.DC == null) return null;
-        string key = $"{url}|{maxDim}|{(int)mask}";
+        int physDim = maxDim > 0 ? Math.Clamp((int)MathF.Ceiling(maxDim * MathF.Max(1f, Gfx.Scale)), 16, 2048) : 0;
+        string key = $"{url}|{physDim}|{(int)mask}";
 
         if (_gpu.TryGetValue(key, out var bmp))
         {
@@ -92,7 +98,7 @@ public static partial class ImageCache
 
         if (_inflight.TryAdd(key, 1))
         {
-            _ = Task.Run(() => FetchAndDecodeAsync(url, key, maxDim, mask));
+            _ = Task.Run(() => FetchAndDecodeAsync(url, key, physDim, mask));
         }
         return null;
     }
@@ -103,7 +109,8 @@ public static partial class ImageCache
     public static unsafe ID2D1Bitmap1? GetLocal(string filePath, int maxDim = 96, ImgMask mask = ImgMask.None)
     {
         if (string.IsNullOrEmpty(filePath) || Gfx.DC == null) return null;
-        string key = $"local:{filePath}|{maxDim}|{(int)mask}";
+        int physDim = maxDim > 0 ? Math.Clamp((int)MathF.Ceiling(maxDim * MathF.Max(1f, Gfx.Scale)), 16, 2048) : 0;
+        string key = $"local:{filePath}|{physDim}|{(int)mask}";
         if (_gpu.TryGetValue(key, out var bmp))
         {
             _gpuLastUsed[key] = Environment.TickCount64;
@@ -113,7 +120,7 @@ public static partial class ImageCache
         try
         {
             var bytes = File.ReadAllBytes(filePath);
-            var dec = DecodeWic(bytes, maxDim, mask, key);
+            var dec = DecodeWic(bytes, physDim, mask, key);
             if (dec == null) return null;
             fixed (byte* p = dec.Pixels)
             {
@@ -168,7 +175,16 @@ public static partial class ImageCache
                 if (!resp.IsSuccessStatusCode) return;
                 bytes = await resp.Content.ReadAsByteArrayAsync();
                 if (bytes.Length > 0 && bytes.Length < 8 * 1024 * 1024)
-                    try { await File.WriteAllBytesAsync(diskPath, bytes); } catch { }
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(CacheDir);
+                        string tmp = diskPath + "." + Guid.NewGuid().ToString("N")[..8] + ".tmp";
+                        await File.WriteAllBytesAsync(tmp, bytes);
+                        File.Move(tmp, diskPath, overwrite: true);
+                    }
+                    catch { }
+                }
             }
 
             if (bytes == null || bytes.Length == 0) return;
@@ -194,9 +210,9 @@ public static partial class ImageCache
     /// <summary>Encodes raw 32bpp/24bpp BMP bytes into a compact PNG file (used by Ctrl+V screenshot paste!).</summary>
     public static byte[]? ConvertImageToPng(byte[] raw)
     {
+        int coHr = CoInitializeEx(0, 0); // COINIT_MULTITHREADED
         try
         {
-            CoInitializeEx(0, 0); // COINIT_MULTITHREADED (harmless if already initialized)
             using var fac = new IWICImagingFactory();
             using var inStream = fac.CreateStream(raw);
             using var decoder = fac.CreateDecoderFromStream(inStream, DecodeOptions.CacheOnLoad);
@@ -213,13 +229,14 @@ public static partial class ImageCache
             return ms.ToArray();
         }
         catch { return null; }
+        finally { if (coHr >= 0) CoUninitialize(); }
     }
 
     private static DecodedImg? DecodeWic(byte[] raw, int maxDim, ImgMask mask, string url)
     {
+        int coHr = CoInitializeEx(0, 0); // Ensure COM initialized & balanced on ThreadPool worker under NativeAOT
         try
         {
-            CoInitializeEx(0, 0); // Ensure COM initialized on arbitrary ThreadPool worker under NativeAOT
             using var fac = new IWICImagingFactory();
             using var stream = fac.CreateStream(raw);
             using var decoder = fac.CreateDecoderFromStream(stream, DecodeOptions.CacheOnLoad);
@@ -278,6 +295,7 @@ public static partial class ImageCache
             return new DecodedImg { Pixels = pixels, W = dstW, H = dstH };
         }
         catch { return null; }
+        finally { if (coHr >= 0) CoUninitialize(); }
     }
 
     private static void ApplyRoundedMask(byte[] px, int w, int h, float radius)

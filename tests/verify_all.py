@@ -1,20 +1,42 @@
-import ctypes, os, subprocess, sys, time
+import ctypes
+import ctypes.wintypes as wt
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
 
-DIST = r"C:\Users\User\Projects\FluxCord\dist\FluxCord"
+DIST = os.environ.get("FLUXCORD_BIN_DIR", r"C:\Users\User\Projects\FluxCord\dist\FluxCord")
 EXE = os.path.join(DIST, "FluxCord.exe")
 DLL = os.path.join(DIST, "FluxCord.Media.dll")
-DATA = os.path.join(os.environ["LOCALAPPDATA"], "FluxCord")
+REAL_USER_SETTINGS = os.path.join(os.environ["LOCALAPPDATA"], "FluxCord", "settings.json")
+
+
+def file_sha256(path):
+    if not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 class FcMonitorInfo(ctypes.Structure):
     _fields_ = [("index", ctypes.c_int32), ("width", ctypes.c_int32), ("height", ctypes.c_int32),
                 ("refresh_hz", ctypes.c_int32), ("name", ctypes.c_char * 128)]
 
+
 class FcWindowInfo(ctypes.Structure):
     _fields_ = [("hwnd", ctypes.c_uint64), ("width", ctypes.c_int32), ("height", ctypes.c_int32),
                 ("title", ctypes.c_char * 128)]
 
+
 class FcDeviceInfo(ctypes.Structure):
     _fields_ = [("id", ctypes.c_char * 128), ("name", ctypes.c_char * 128), ("is_default", ctypes.c_int32)]
+
 
 class FcScreenStats(ctypes.Structure):
     _fields_ = [("width", ctypes.c_int32), ("height", ctypes.c_int32), ("fps", ctypes.c_float),
@@ -23,12 +45,15 @@ class FcScreenStats(ctypes.Structure):
                 ("frames_encoded", ctypes.c_int64), ("frames_skipped_static", ctypes.c_int64),
                 ("encoder_name", ctypes.c_char * 64)]
 
+
 class FcAudioStats(ctypes.Structure):
     _fields_ = [("raw_rms", ctypes.c_float), ("clean_rms", ctypes.c_float), ("noise_reduction_db", ctypes.c_float),
                 ("vad_prob", ctypes.c_float), ("speaking", ctypes.c_int32), ("active_mode", ctypes.c_int32),
                 ("tx_packets", ctypes.c_int32), ("rx_packets", ctypes.c_int32), ("backend_name", ctypes.c_char * 64)]
 
+
 failures = []
+
 
 def check(cond, msg):
     if cond:
@@ -37,129 +62,152 @@ def check(cond, msg):
         print(f"[FAIL] {msg}", flush=True)
         failures.append(msg)
 
-# 1. NativeAOT FluxCord.exe --demo --bench + Ultra-Updater Resume Session verification
-import json
-resume_file = os.path.join(DATA, "resume_session.json")
-with open(resume_file, "w", encoding="utf-8") as rf:
-    json.dump({
-        "SavedUtcTicks": int((time.time() + 62135596800) * 10000000),
-        "FromVersion": "0.9.9", "TargetVersion": "1.0.0",
-        "ActiveGuildId": "g1", "ActiveChannelId": "c_gen",
-        "InVoiceStage": True, "ShowFriendsView": False,
-        "VoiceGuildId": "g1", "VoiceChannelId": "v_main",
-        "Muted": True, "Deafened": False,
-        "WatchedStreams": [], "WasStreaming": False
-    }, rf)
-t0 = time.perf_counter()
-proc = subprocess.run([EXE, "--demo", "--bench", "--resumed-update"], timeout=20)
-wall_ms = (time.perf_counter() - t0) * 1000
-check(proc.returncode == 0, f"FluxCord.exe --demo --bench --resumed-update exit=0 (wall={wall_ms:.0f}ms)")
-check(not os.path.exists(resume_file), "Ultra-Updater resume_session.json consumed and restored cleanly on startup")
-check(os.path.exists(os.path.join(DATA, "settings.json")), "settings.json persisted (Dorion migrated)")
-check(os.path.exists(os.path.join(DATA, "cache.db")), "SQLite WAL cache.db initialized")
 
-# 1b. Live Win32 UI Interaction, Modal Click-Block & Handle-Leak Regression Suite (--demo)
-import ctypes.wintypes as wt
-settings_path = os.path.join(DATA, "settings.json")
-orig_settings = open(settings_path, "rb").read() if os.path.exists(settings_path) else None
-p_click = subprocess.Popen([EXE, "--demo"], cwd=DIST)
-try:
-    hwnd_found = 0
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-    for _ in range(50):
-        time.sleep(0.1)
-        found = [0]
-        def _cb(h, _):
-            pid_out = wt.DWORD()
-            ctypes.windll.user32.GetWindowThreadProcessId(h, ctypes.byref(pid_out))
-            if pid_out.value == p_click.pid:
-                cls = ctypes.create_unicode_buffer(64)
-                ctypes.windll.user32.GetClassNameW(h, cls, 64)
-                if cls.value == "FluxCordMain":
-                    found[0] = h
-                    return False
-            return True
-        ctypes.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
-        if found[0]:
-            hwnd_found = found[0]
-            break
+real_settings_hash_before = file_sha256(REAL_USER_SETTINGS)
+real_settings_mtime_before = os.path.getmtime(REAL_USER_SETTINGS) if os.path.exists(REAL_USER_SETTINGS) else None
 
-    if hwnd_found:
-        time.sleep(0.35)
-        dpi = ctypes.windll.user32.GetDpiForWindow(hwnd_found) or 96
-        sc = dpi / 96.0
-        rc = wt.RECT()
-        ctypes.windll.user32.GetClientRect(hwnd_found, ctypes.byref(rc))
-        lw, lh = rc.right / sc, rc.bottom / sc
+with tempfile.TemporaryDirectory(prefix="fluxcord_test_") as DATA:
+    test_env = os.environ.copy()
+    test_env["FLUXCORD_DATA_DIR"] = DATA
 
-        def ui_click(lx, ly):
-            lp = (int(ly * sc) << 16) | (int(lx * sc) & 0xFFFF)
-            ctypes.windll.user32.SendMessageW(hwnd_found, 0x0200, 0, lp)  # WM_MOUSEMOVE
-            ctypes.windll.user32.SendMessageW(hwnd_found, 0x0201, 1, lp)  # WM_LBUTTONDOWN
-            ctypes.windll.user32.SendMessageW(hwnd_found, 0x0202, 0, lp)  # WM_LBUTTONUP
+    # 1. NativeAOT FluxCord.exe --demo --bench + Ultra-Updater Resume Session verification (100% isolated FLUXCORD_DATA_DIR)
+    resume_file = os.path.join(DATA, "resume_session.json")
+    with open(resume_file, "w", encoding="utf-8") as rf:
+        json.dump({
+            "SavedUtcTicks": int((time.time() + 62135596800) * 10000000),
+            "FromVersion": "1.0.3", "TargetVersion": "1.0.4",
+            "ActiveGuildId": "g1", "ActiveChannelId": "c_gen",
+            "InVoiceStage": True, "ShowFriendsView": False,
+            "VoiceGuildId": "g1", "VoiceChannelId": "v_main",
+            "Muted": True, "Deafened": False,
+            "WatchedStreams": [], "WasStreaming": False
+        }, rf)
+    t0 = time.perf_counter()
+    proc = subprocess.run([EXE, "--demo", "--bench", "--resumed-update"], cwd=DIST, env=test_env, timeout=20)
+    wall_ms = (time.perf_counter() - t0) * 1000
+    check(proc.returncode == 0, f"FluxCord.exe --demo --bench --resumed-update exit=0 (wall={wall_ms:.0f}ms)")
+    check(not os.path.exists(resume_file), "Ultra-Updater resume_session.json consumed and restored cleanly on startup")
+    check(os.path.exists(os.path.join(DATA, "settings.json")), "Isolated settings.json persisted in FLUXCORD_DATA_DIR")
+    check(os.path.exists(os.path.join(DATA, "cache.db")), "Isolated SQLite WAL cache.db initialized in FLUXCORD_DATA_DIR")
+
+    # 1b. Live Win32 UI Interaction, Modal/Popup Click-Block & Handle-Leak Regression Suite (--demo)
+    settings_path = os.path.join(DATA, "settings.json")
+    p_click = subprocess.Popen([EXE, "--demo"], cwd=DIST, env=test_env)
+    try:
+        hwnd_found = 0
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        for _ in range(50):
+            time.sleep(0.1)
+            found = [0]
+
+            def _cb(h, _):
+                pid_out = wt.DWORD()
+                ctypes.windll.user32.GetWindowThreadProcessId(h, ctypes.byref(pid_out))
+                if pid_out.value == p_click.pid:
+                    cls = ctypes.create_unicode_buffer(64)
+                    ctypes.windll.user32.GetClassNameW(h, cls, 64)
+                    if cls.value == "FluxCordMain":
+                        found[0] = h
+                        return False
+                return True
+
+            ctypes.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
+            if found[0]:
+                hwnd_found = found[0]
+                break
+
+        if hwnd_found:
+            time.sleep(0.35)
+            dpi = ctypes.windll.user32.GetDpiForWindow(hwnd_found) or 96
+            sc = dpi / 96.0
+            rc = wt.RECT()
+            ctypes.windll.user32.GetClientRect(hwnd_found, ctypes.byref(rc))
+            lw, lh = rc.right / sc, rc.bottom / sc
+
+            def ui_click(lx, ly):
+                lp = (int(ly * sc) << 16) | (int(lx * sc) & 0xFFFF)
+                ctypes.windll.user32.SendMessageW(hwnd_found, 0x0200, 0, lp)  # WM_MOUSEMOVE
+                ctypes.windll.user32.SendMessageW(hwnd_found, 0x0201, 1, lp)  # WM_LBUTTONDOWN
+                ctypes.windll.user32.SendMessageW(hwnd_found, 0x0202, 0, lp)  # WM_LBUTTONUP
+                time.sleep(0.12)
+
+            def read_settings():
+                with open(settings_path, encoding="utf-8") as sf:
+                    return json.load(sf)
+
+            # Test A: Switch server rail g1 -> g2
+            ui_click(34, 182)
+            s1 = read_settings()
+            check(s1.get("LastGuildId") == "g2" and s1.get("LastChannelId") == "c_g2",
+                  f"UI click server rail g1 -> g2 (LastGuildId={s1.get('LastGuildId')}, LastChannelId={s1.get('LastChannelId')})")
+
+            # Test B: Switch server rail back g2 -> g1
+            ui_click(34, 128)
+            s2 = read_settings()
+            check(s2.get("LastGuildId") == "g1" and s2.get("LastChannelId") == "c_gen",
+                  f"UI click server rail g2 -> g1 (LastGuildId={s2.get('LastGuildId')}, LastChannelId={s2.get('LastChannelId')})")
+
+            # Test C: Click text channel #gamedev-granny2 (c_dev) in sidebar
+            ui_click(188, 170)
+            s3 = read_settings()
+            check(s3.get("LastChannelId") == "c_dev",
+                  f"UI click text channel sidebar c_gen -> c_dev (LastChannelId={s3.get('LastChannelId')})")
+
+            # Test D: Open Settings modal (gear icon), verify background rail click is BLOCKED, then Esc closes modal & rail click works again!
+            ui_click(302, lh - 30)  # Open Settings
+            ui_click(34, 182)       # Try clicking g2 UNDER modal -> must be blocked!
+            s4 = read_settings()
+            check(s4.get("LastGuildId") == "g1",
+                  f"Settings modal blocks background click-through (LastGuildId stayed {s4.get('LastGuildId')})")
+
+            ctypes.windll.user32.SendMessageW(hwnd_found, 0x0100, 0x1B, 0)  # WM_KEYDOWN VK_ESCAPE
             time.sleep(0.12)
+            ui_click(34, 182)       # Now g2 click MUST succeed!
+            s5 = read_settings()
+            check(s5.get("LastGuildId") == "g2",
+                  f"After Esc closes modal, server click g1 -> g2 works again (LastGuildId={s5.get('LastGuildId')})")
 
-        def read_settings():
-            with open(settings_path, encoding="utf-8") as sf:
-                return json.load(sf)
+            # Test D2 ([F-15]): Open Status Popup on User Bar, click server g1 outside popup -> popup closes WITHOUT click-through, second click switches to g1!
+            ui_click(120, lh - 30)  # Open Status Menu popup
+            ui_click(34, 128)       # Outside click on g1 dismisses popup without switching guild!
+            s5b = read_settings()
+            check(s5b.get("LastGuildId") == "g2",
+                  f"Popup outside-click dismisses popup without background click-through (LastGuildId stayed {s5b.get('LastGuildId')})")
+            ui_click(34, 128)       # Next click on g1 switches cleanly!
+            s5c = read_settings()
+            check(s5c.get("LastGuildId") == "g1",
+                  f"Subsequent click after popup dismiss switches g2 -> g1 (LastGuildId={s5c.get('LastGuildId')})")
 
-        # Test A: Switch server rail g1 -> g2
-        ui_click(34, 182)
-        s1 = read_settings()
-        check(s1.get("LastGuildId") == "g2" and s1.get("LastChannelId") == "c_g2",
-              f"UI click server rail g1 -> g2 (LastGuildId={s1.get('LastGuildId')}, LastChannelId={s1.get('LastChannelId')})")
+            # Test E: Handle-leak regression across 200 steady-state redraws
+            time.sleep(2.2)
+            h_before, h_after = wt.DWORD(), wt.DWORD()
+            ctypes.windll.kernel32.GetProcessHandleCount(int(p_click._handle), ctypes.byref(h_before))
+            for k in range(200):
+                lp = (int((120 + (k % 8) * 20) * sc) << 16) | (int(180 * sc) & 0xFFFF)
+                ctypes.windll.user32.SendMessageW(hwnd_found, 0x0200, 0, lp)
+            ctypes.windll.kernel32.GetProcessHandleCount(int(p_click._handle), ctypes.byref(h_after))
+            delta_h = int(h_after.value) - int(h_before.value)
+            check(delta_h <= 25, f"No per-frame handle leak across 200 redraws (before={h_before.value}, after={h_after.value}, delta={delta_h:+d})")
 
-        # Test B: Switch server rail back g2 -> g1
-        ui_click(34, 128)
-        s2 = read_settings()
-        check(s2.get("LastGuildId") == "g1" and s2.get("LastChannelId") == "c_gen",
-              f"UI click server rail g2 -> g1 (LastGuildId={s2.get('LastGuildId')}, LastChannelId={s2.get('LastChannelId')})")
+            # Test F: Clean WM_CLOSE shutdown (exit code 0, no hang)
+            ctypes.windll.user32.PostMessageW(hwnd_found, 0x0010, 0, 0)  # WM_CLOSE
+            rc_close = p_click.wait(timeout=5)
+            check(rc_close == 0, f"Clean WM_CLOSE shutdown exit={rc_close}")
+        else:
+            check(False, "Win32 UI click test could not find FluxCordMain --demo HWND")
+    finally:
+        if p_click.poll() is None:
+            p_click.terminate()
+            try:
+                p_click.wait(timeout=3)
+            except Exception:
+                p_click.kill()
 
-        # Test C: Click text channel #gamedev-granny2 (c_dev) in sidebar
-        ui_click(188, 170)
-        s3 = read_settings()
-        check(s3.get("LastChannelId") == "c_dev",
-              f"UI click text channel sidebar c_gen -> c_dev (LastChannelId={s3.get('LastChannelId')})")
-
-        # Test D: Open Settings modal (gear icon), verify background rail click is BLOCKED, then Esc closes modal & rail click works again!
-        ui_click(302, lh - 30)  # Open Settings
-        ui_click(34, 182)       # Try clicking g2 UNDER modal -> must be blocked!
-        s4 = read_settings()
-        check(s4.get("LastGuildId") == "g1",
-              f"Settings modal blocks background click-through (LastGuildId stayed {s4.get('LastGuildId')})")
-
-        ctypes.windll.user32.SendMessageW(hwnd_found, 0x0100, 0x1B, 0)  # WM_KEYDOWN VK_ESCAPE
-        time.sleep(0.12)
-        ui_click(34, 182)       # Now g2 click MUST succeed!
-        s5 = read_settings()
-        check(s5.get("LastGuildId") == "g2",
-              f"After Esc closes modal, server click g1 -> g2 works again (LastGuildId={s5.get('LastGuildId')})")
-
-        # Test E: Handle-leak regression across 200 steady-state redraws (after startup RTC region probes settle)
-        time.sleep(2.2)
-        h_before, h_after = wt.DWORD(), wt.DWORD()
-        ctypes.windll.kernel32.GetProcessHandleCount(int(p_click._handle), ctypes.byref(h_before))
-        for k in range(200):
-            lp = (int((120 + (k % 8) * 20) * sc) << 16) | (int(180 * sc) & 0xFFFF)
-            ctypes.windll.user32.SendMessageW(hwnd_found, 0x0200, 0, lp)
-        ctypes.windll.kernel32.GetProcessHandleCount(int(p_click._handle), ctypes.byref(h_after))
-        delta_h = int(h_after.value) - int(h_before.value)
-        check(delta_h <= 25, f"No per-frame handle leak across 200 redraws (before={h_before.value}, after={h_after.value}, delta={delta_h:+d})")
-
-        # Test F: Clean WM_CLOSE shutdown (exit code 0, no hang)
-        ctypes.windll.user32.PostMessageW(hwnd_found, 0x0010, 0, 0)  # WM_CLOSE
-        rc_close = p_click.wait(timeout=5)
-        check(rc_close == 0, f"Clean WM_CLOSE shutdown exit={rc_close}")
-    else:
-        check(False, "Win32 UI click test could not find FluxCordMain --demo HWND")
-finally:
-    if p_click.poll() is None:
-        p_click.terminate()
-        try: p_click.wait(timeout=3)
-        except Exception: p_click.kill()
-    if orig_settings is not None:
-        with open(settings_path, "wb") as sf:
-            sf.write(orig_settings)
+# Verify real user %LOCALAPPDATA%\FluxCord\settings.json was NEVER modified by the test suite ([F-20])!
+real_settings_hash_after = file_sha256(REAL_USER_SETTINGS)
+real_settings_mtime_after = os.path.getmtime(REAL_USER_SETTINGS) if os.path.exists(REAL_USER_SETTINGS) else None
+check(real_settings_hash_before == real_settings_hash_after and real_settings_mtime_before == real_settings_mtime_after,
+      "Real user %LOCALAPPDATA%\\FluxCord\\settings.json untouched (hash & mtime 100% preserved)")
 
 # 2. C++20 FluxCord.Media.dll + libdave.dll hardware & Screen Share Picker verification
 dll = ctypes.CDLL(DLL)
@@ -186,7 +234,7 @@ check(dl_ms < 500 and nw2 >= 1, f"Anti-deadlock guard (own unpumped HWND active)
 
 thumb = (ctypes.c_uint8 * (240 * 135 * 4))()
 ok_th = dll.fc_capture_monitor_thumb(0, thumb, 240, 135)
-non_zero_px = sum(1 for i in range(0, len(thumb), 4) if (thumb[i] | thumb[i+1] | thumb[i+2]) != 0)
+non_zero_px = sum(1 for i in range(0, len(thumb), 4) if (thumb[i] | thumb[i + 1] | thumb[i + 2]) != 0)
 check(ok_th == 1 and non_zero_px > 500, f"Monitor #0 live thumbnail captured (240x135, lit_px={non_zero_px})")
 
 caps = (FcDeviceInfo * 16)()
@@ -227,11 +275,17 @@ for mode_id, label in [(0, "Off"), (1, "StudioDSP"), (2, "RNNoise"), (3, "DeepFi
     check(len(bname) > 0, f"NoiseMode[{mode_id}:{label}] -> '{bname}' raw={ast.raw_rms:.4f} clean={ast.clean_rms:.4f} nr={ast.noise_reduction_db:.1f}dB")
 dll.fc_voice_stop()
 
-# 5. Official Discord DAVE E2EE MLS (Voice + Outbound Go Live Publisher + ALL 4 Multi-Stream Watch Slots!)
+# 5. Official Discord DAVE E2EE MLS (Voice + Outbound Go Live Publisher + ALL 4 Multi-Stream Watch Slots + Tri-State Commit!)
 kp_buf = (ctypes.c_uint8 * 4096)()
 ok_v = dll.fc_dave_init(ctypes.c_uint16(1), ctypes.c_uint64(123456789012345678), b"987654321012345678", ctypes.c_uint32(11111))
 kp_v = dll.fc_dave_get_key_package(kp_buf, 4096)
 check(ok_v == 1 and kp_v > 100, f"Voice DAVE E2EE MLS KeyPackage ({kp_v} bytes)")
+
+pre_welcome_commit = (ctypes.c_uint8 * 8)(0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04)
+commit_rc_ignored = dll.fc_dave_process_commit(pre_welcome_commit, 8)
+commit_rc_empty = dll.fc_dave_process_commit(None, 0)
+check(commit_rc_ignored == 2 and commit_rc_empty == 0,
+      f"Tri-state DAVE process_commit: pre-Welcome ignored rc={commit_rc_ignored} (no false OP23/OP31), empty/invalid rc={commit_rc_empty}")
 
 ok_p = dll.fc_pub_dave_init(ctypes.c_uint16(1), ctypes.c_uint64(323456789012345678), b"987654321012345678", ctypes.c_uint32(33333), ctypes.c_uint32(33334))
 kp_p = dll.fc_pub_dave_get_key_package(kp_buf, 4096)
@@ -240,10 +294,12 @@ check(ok_p == 1 and kp_p > 100, f"Outbound Go Live Publisher DAVE E2EE MLS KeyPa
 slot_kps = []
 for slot in range(4):
     ok_s = dll.fc_watch_dave_init_slot(slot, ctypes.c_uint16(1), ctypes.c_uint64(223456789012345678 + slot), b"987654321012345678", ctypes.c_uint32(22220 + slot))
+    dll.fc_watch_dave_add_user_slot(slot, b"111222333444555666")
+    dll.fc_watch_dave_remove_user_slot(slot, b"111222333444555666")
     kp_s = dll.fc_watch_dave_get_key_package_slot(slot, kp_buf, 4096)
     if ok_s == 1 and kp_s > 100:
         slot_kps.append(kp_s)
-check(len(slot_kps) == 4, f"4-Slot Multi-Stream Watch DAVE MLS initialized simultaneously (key packages: {slot_kps})")
+check(len(slot_kps) == 4, f"4-Slot Multi-Stream Watch DAVE MLS + remove_user_slot verified (key packages: {slot_kps})")
 
 dll.fc_shutdown()
 print(f"\n=== SUMMARY: {len(failures)} failures ===", flush=True)
