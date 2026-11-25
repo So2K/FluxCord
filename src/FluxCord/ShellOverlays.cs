@@ -897,12 +897,16 @@ public static unsafe partial class Shell
             y += 30;
             if (UI.Toggle(UI.Id("tg_ptt"), new R(px, y, pw, 34), $"Push-to-Talk ({s.PushToTalkKey})", s.PushToTalk)) { s.PushToTalk = !s.PushToTalk; changed = true; }
             y += 38;
+            if (UI.Toggle(UI.Id("tg_tray"), new R(px, y, pw, 34), "Сворачивать в фоновый трей при закрытии на крестик (✕)", s.CloseToTray)) { s.CloseToTray = !s.CloseToTray; changed = true; }
+            y += 38;
             if (UI.Toggle(UI.Id("tg_not"), new R(px, y, pw, 34), "Уведомления рабочего стола", s.DesktopNotifications)) { s.DesktopNotifications = !s.DesktopNotifications; changed = true; }
             y += 38;
             if (UI.Toggle(UI.Id("tg_stm"), new R(px, y, pw, 34), "Режим стримера (скрывать личные данные)", s.StreamerMode)) { s.StreamerMode = !s.StreamerMode; changed = true; }
             y += 48;
-            if (UI.Button(UI.Id("btn_remig"), new R(px, y, 320, 36), "Повторно импортировать из Dorion/Discord", Th.Card, Th.Text, 6, 12.5f))
+            if (UI.Button(UI.Id("btn_remig"), new R(px, y, 310, 36), "Повторно импортировать из Dorion/Discord", Th.Card, Th.Text, 6, 12.5f))
             { SettingsStore.MigrateFromExistingClients(); SettingsStore.Save(); Toast(SettingsStore.MigrationSummary); }
+            if (UI.Button(UI.Id("btn_quit_full"), new R(px + 320, y, 210, 36), "Полностью закрыть (Ctrl+Q)", 0x22ED4245, Th.Red, 6, 12f))
+                App.RequestExit();
             y += 46;
         }
         else // Ультра-обновления (GitHub Releases + возврат в звонок и стримы!)
@@ -1214,7 +1218,7 @@ public static unsafe partial class Shell
     private static void DrawStatusPopup()
     {
         var dc = DiscordClient.Instance;
-        float w = 228, h = 212;
+        float w = 228, h = 246;
         var pop = new R(RailW + 8, Gfx.H - 68 - h, w, h);
         _overlayCutouts.Add(pop);
         if ((UI.Pressed || UI.RightClicked) && !pop.Contains(UI.MX, UI.MY))
@@ -1250,10 +1254,16 @@ public static unsafe partial class Shell
             y += 32;
         }
         Gfx.FillRect(new R(pop.X + 10, y + 2, pop.W - 20, 1), Th.Border);
-        if (UI.Button(UI.Id("st_logout"), new R(pop.X + 8, y + 8, pop.W - 16, 28), "Выйти из аккаунта", 0x22ED4245, Th.Red, 6, 12))
+        if (UI.Button(UI.Id("st_logout"), new R(pop.X + 8, y + 8, pop.W - 16, 28), "Выйти из аккаунта", Th.Card, Th.Sub, 6, 12))
         {
             _showStatusMenu = false;
             dc.Logout();
+            return;
+        }
+        if (UI.Button(UI.Id("st_quit"), new R(pop.X + 8, y + 40, pop.W - 16, 28), "Полностью закрыть (Ctrl+Q)", 0x22ED4245, Th.Red, 6, 12))
+        {
+            _showStatusMenu = false;
+            App.RequestExit();
         }
     }
 

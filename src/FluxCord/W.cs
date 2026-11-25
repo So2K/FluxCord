@@ -5,8 +5,10 @@ namespace FluxCord;
 internal static unsafe partial class W
 {
     public const uint WM_DESTROY = 0x0002, WM_SIZE = 0x0005, WM_SETFOCUS = 0x0007, WM_KILLFOCUS = 0x0008,
-        WM_PAINT = 0x000F, WM_CLOSE = 0x0010, WM_ERASEBKGND = 0x0014, WM_SETCURSOR = 0x0020,
-        WM_GETMINMAXINFO = 0x0024, WM_SETFONT = 0x0030, WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101,
+        WM_PAINT = 0x000F, WM_CLOSE = 0x0010, WM_QUERYENDSESSION = 0x0011, WM_ERASEBKGND = 0x0014,
+        WM_ENDSESSION = 0x0016, WM_SETCURSOR = 0x0020,
+        WM_GETMINMAXINFO = 0x0024, WM_SETFONT = 0x0030, WM_CONTEXTMENU = 0x007B,
+        WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101,
         WM_CHAR = 0x0102, WM_COMMAND = 0x0111, WM_TIMER = 0x0113, WM_CTLCOLOREDIT = 0x0133,
         WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203,
         WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_MOUSEWHEEL = 0x020A,
@@ -14,6 +16,10 @@ internal static unsafe partial class W
         WM_DROPFILES = 0x0233,
         WM_MOUSELEAVE = 0x02A3, WM_DPICHANGED = 0x02E0, WM_APP = 0x8000,
         WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_SETICON = 0x0080;
+    public const uint NIM_ADD = 0x00000000, NIM_MODIFY = 0x00000001, NIM_DELETE = 0x00000002,
+        NIF_MESSAGE = 0x00000001, NIF_ICON = 0x00000002, NIF_TIP = 0x00000004;
+    public const uint MF_STRING = 0x0000, MF_CHECKED = 0x0008, MF_SEPARATOR = 0x0800;
+    public const uint TPM_RIGHTBUTTON = 0x0002, TPM_BOTTOMALIGN = 0x0020, TPM_NONOTIFY = 0x0080, TPM_RETURNCMD = 0x0100;
     public const uint IMAGE_ICON = 1, LR_DEFAULTSIZE = 0x0040;
     public const int SM_CXICON = 11, SM_CYICON = 12, SM_CXSIZEFRAME = 32, SM_CYSIZEFRAME = 33,
         SM_CXSMICON = 49, SM_CYSMICON = 50, SM_CXPADDEDBORDER = 92;
@@ -26,7 +32,7 @@ internal static unsafe partial class W
     public const int SW_HIDE = 0, SW_SHOW = 5, SW_SHOWNORMAL = 1, SW_MAXIMIZE = 3, SW_MINIMIZE = 6;
     public const int GWLP_WNDPROC = -4;
     public const int VK_RETURN = 13, VK_ESCAPE = 27, VK_SHIFT = 16, VK_CONTROL = 17, VK_MENU = 18,
-        VK_UP = 0x26, VK_DOWN = 0x28, VK_A = 0x41, VK_D = 0x44, VK_F = 0x46, VK_K = 0x4B, VK_M = 0x4D, VK_V = 0x56, VK_RCONTROL = 0xA3;
+        VK_UP = 0x26, VK_DOWN = 0x28, VK_A = 0x41, VK_D = 0x44, VK_F = 0x46, VK_K = 0x4B, VK_M = 0x4D, VK_Q = 0x51, VK_V = 0x56, VK_RCONTROL = 0xA3;
     public const int EN_CHANGE = 0x0300;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -47,6 +53,26 @@ internal static unsafe partial class W
     [StructLayout(LayoutKind.Sequential)] public struct MINMAXINFO { public POINT reserved, maxSize, maxPosition, minTrackSize, maxTrackSize; }
     [StructLayout(LayoutKind.Sequential)] public struct TRACKMOUSEEVENT { public uint cbSize, dwFlags; public nint hwndTrack; public uint dwHoverTime; }
     [StructLayout(LayoutKind.Sequential)] public struct DATA_BLOB { public uint cbData; public byte* pbData; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NOTIFYICONDATAW
+    {
+        public uint cbSize;
+        public nint hWnd;
+        public uint uID;
+        public uint uFlags;
+        public uint uCallbackMessage;
+        public nint hIcon;
+        public fixed char szTip[128];
+        public uint dwState;
+        public uint dwStateMask;
+        public fixed char szInfo[256];
+        public uint uTimeoutOrVersion;
+        public fixed char szInfoTitle[64];
+        public uint dwInfoFlags;
+        public Guid guidItem;
+        public nint hBalloonIcon;
+    }
 
     [LibraryImport("user32.dll")] public static partial ushort RegisterClassExW(WNDCLASSEXW* wc);
     [LibraryImport("user32.dll", StringMarshalling = StringMarshalling.Utf16)]
@@ -105,6 +131,17 @@ internal static unsafe partial class W
     [LibraryImport("user32.dll")] public static partial int GetWindowTextLengthW(nint h);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool IsZoomed(nint h);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool IsIconic(nint h);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool IsWindowVisible(nint h);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool SetForegroundWindow(nint h);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool GetCursorPos(POINT* lpPoint);
+    [LibraryImport("user32.dll")] public static partial nint CreatePopupMenu();
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool DestroyMenu(nint hMenu);
+    [LibraryImport("user32.dll", StringMarshalling = StringMarshalling.Utf16)] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool AppendMenuW(nint hMenu, uint uFlags, nuint uIDNewItem, string? lpNewItem);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool SetMenuDefaultItem(nint hMenu, uint uItem, uint fByPos);
+    [LibraryImport("user32.dll")] public static partial int TrackPopupMenu(nint hMenu, uint uFlags, int x, int y, int nReserved, nint hWnd, nint prcRect);
+    [LibraryImport("user32.dll", StringMarshalling = StringMarshalling.Utf16)] public static partial uint RegisterWindowMessageW(string lpString);
+    [LibraryImport("user32.dll", StringMarshalling = StringMarshalling.Utf16)] public static partial nint FindWindowW(string? lpClassName, string? lpWindowName);
+    [LibraryImport("shell32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool Shell_NotifyIconW(uint dwMessage, NOTIFYICONDATAW* lpData);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool DestroyWindow(nint h);
 
     [LibraryImport("kernel32.dll")] public static partial nint GetModuleHandleW(nint name);

@@ -18,11 +18,24 @@ public static unsafe class App
     private static nint _chatEdit, _tokenEdit, _searchEdit, _editFont, _editBrush, _blackBrush;
     private static nint _origChatProc, _origTokenProc, _origSearchProc;
     private static bool _searchWasVisible;
-    private static nint _arrow, _hand;
+    private static nint _arrow, _hand, _trayIcon;
     private static bool _wakePending, _tracking, _inRender, _shuttingDown, _releasingCapture;
+    private static bool _trayAdded, _hiddenToTray, _wasZoomedBeforeHide, _forceExit;
+    private static uint _wmTaskbarCreated, _wmActivateExisting;
+    public const nuint ForceCloseWParam = 0xFC01;
+    public const uint WM_TRAY = W.WM_APP + 3;
     private const uint WM_WAKE = W.WM_APP + 1;
     private const uint WM_UI_ACTION = W.WM_APP + 2;
+    private const uint TrayIconId = 1;
     private static readonly ConcurrentQueue<Action> _uiActions = new();
+
+    public static bool IsHiddenToTray => _hiddenToTray;
+
+    public static void RequestExit()
+    {
+        _forceExit = true;
+        if (Hwnd != 0) W.PostMessageW(Hwnd, W.WM_CLOSE, ForceCloseWParam, 0);
+    }
 
     private static readonly (int X, int Y, int W, int H, bool Visible, bool HadCutout, int CutoutHash)[] _videoRects =
         new (int, int, int, int, bool, bool, int)[MaxWatchSlots + 1];
@@ -59,6 +72,121 @@ public static unsafe class App
         finally { ShutdownAll(); }
     }
 
+    private static void SaveWindowBoundsIfNormal()
+    {
+        if (Hwnd == 0 || !W.IsWindowVisible(Hwnd) || W.IsZoomed(Hwnd) || W.IsIconic(Hwnd) || Gfx.Scale <= 0.1f)
+            return;
+        W.RECT wr;
+        if (W.GetWindowRect(Hwnd, &wr))
+        {
+            int lw = (int)MathF.Round((wr.R - wr.L) / Gfx.Scale);
+            int lh = (int)MathF.Round((wr.B - wr.T) / Gfx.Scale);
+            if (lw >= 860 && lh >= 560 && lw <= 3840 && lh <= 2160)
+            {
+                SettingsStore.Current.WindowWidth = lw;
+                SettingsStore.Current.WindowHeight = lh;
+                SettingsStore.Save();
+            }
+        }
+    }
+
+    private static void AddOrUpdateTrayIcon(bool modify = false)
+    {
+        if (Hwnd == 0 || _shuttingDown) return;
+        var nid = new W.NOTIFYICONDATAW
+        {
+            cbSize = (uint)sizeof(W.NOTIFYICONDATAW),
+            hWnd = Hwnd,
+            uID = TrayIconId,
+            uFlags = W.NIF_MESSAGE | W.NIF_ICON | W.NIF_TIP,
+            uCallbackMessage = WM_TRAY,
+            hIcon = _trayIcon != 0 ? _trayIcon : W.LoadCursorW(0, 32512)
+        };
+        const string tip = "FluxCord — Discord";
+        for (int i = 0; i < tip.Length && i < 127; i++) nid.szTip[i] = tip[i];
+        nid.szTip[Math.Min(tip.Length, 127)] = '\0';
+
+        uint cmd = (modify && _trayAdded) ? W.NIM_MODIFY : W.NIM_ADD;
+        if (W.Shell_NotifyIconW(cmd, &nid)) _trayAdded = true;
+    }
+
+    private static void RemoveTrayIcon()
+    {
+        if (!_trayAdded || Hwnd == 0) return;
+        var nid = new W.NOTIFYICONDATAW
+        {
+            cbSize = (uint)sizeof(W.NOTIFYICONDATAW),
+            hWnd = Hwnd,
+            uID = TrayIconId
+        };
+        W.Shell_NotifyIconW(W.NIM_DELETE, &nid);
+        _trayAdded = false;
+    }
+
+    public static void HideToTray()
+    {
+        if (Hwnd == 0 || _shuttingDown) return;
+        SaveWindowBoundsIfNormal();
+        _wasZoomedBeforeHide = W.IsZoomed(Hwnd);
+        _hiddenToTray = true;
+        _tracking = false;
+        UI.CancelDrag();
+        UI.MX = UI.MY = -1;
+        W.KillTimer(Hwnd, 1);
+        if (!_trayAdded) AddOrUpdateTrayIcon(false);
+        W.ShowWindow(Hwnd, W.SW_HIDE);
+    }
+
+    public static void RestoreFromTray()
+    {
+        if (Hwnd == 0 || _shuttingDown) return;
+        bool wasHidden = _hiddenToTray || !W.IsWindowVisible(Hwnd) || W.IsIconic(Hwnd);
+        _hiddenToTray = false;
+        if (wasHidden)
+        {
+            int cmd = _wasZoomedBeforeHide ? W.SW_MAXIMIZE : W.SW_SHOWNORMAL;
+            W.ShowWindow(Hwnd, cmd);
+        }
+        W.SetForegroundWindow(Hwnd);
+        Invalidate();
+        Render();
+    }
+
+    private static void ShowTrayContextMenu()
+    {
+        if (Hwnd == 0 || _shuttingDown) return;
+        nint menu = W.CreatePopupMenu();
+        if (menu == 0) return;
+        try
+        {
+            W.AppendMenuW(menu, W.MF_STRING, 1, "Открыть FluxCord");
+            W.SetMenuDefaultItem(menu, 1, 0);
+            W.AppendMenuW(menu, W.MF_SEPARATOR, 0, null);
+            W.AppendMenuW(menu, W.MF_STRING | (Shell.IsMuted ? W.MF_CHECKED : 0), 2, "Отключить микрофон (Ctrl+Shift+M)");
+            W.AppendMenuW(menu, W.MF_STRING | (Shell.IsDeafened ? W.MF_CHECKED : 0), 3, "Отключить звук (Ctrl+Shift+D)");
+            W.AppendMenuW(menu, W.MF_SEPARATOR, 0, null);
+            W.AppendMenuW(menu, W.MF_STRING, 4, "Выйти из FluxCord");
+
+            W.POINT pt;
+            W.GetCursorPos(&pt);
+            W.SetForegroundWindow(Hwnd);
+            int picked = W.TrackPopupMenu(menu, W.TPM_RIGHTBUTTON | W.TPM_BOTTOMALIGN | W.TPM_NONOTIFY | W.TPM_RETURNCMD, pt.X, pt.Y, 0, Hwnd, 0);
+            W.PostMessageW(Hwnd, 0, 0, 0);
+
+            switch (picked)
+            {
+                case 1: RestoreFromTray(); break;
+                case 2: Shell.ToggleMute(); break;
+                case 3: Shell.ToggleDeafen(); break;
+                case 4: RequestExit(); break;
+            }
+        }
+        finally
+        {
+            W.DestroyMenu(menu);
+        }
+    }
+
     private static void ShutdownAll()
     {
         if (_shuttingDown) return;
@@ -70,21 +198,8 @@ public static unsafe class App
                 W.KillTimer(Hwnd, 1);
                 W.KillTimer(Hwnd, 2);
                 W.KillTimer(Hwnd, 99);
-                if (!W.IsZoomed(Hwnd) && !W.IsIconic(Hwnd) && Gfx.Scale > 0.1f)
-                {
-                    W.RECT wr;
-                    if (W.GetWindowRect(Hwnd, &wr))
-                    {
-                        int lw = (int)MathF.Round((wr.R - wr.L) / Gfx.Scale);
-                        int lh = (int)MathF.Round((wr.B - wr.T) / Gfx.Scale);
-                        if (lw >= 860 && lh >= 560 && lw <= 3840 && lh <= 2160)
-                        {
-                            SettingsStore.Current.WindowWidth = lw;
-                            SettingsStore.Current.WindowHeight = lh;
-                            SettingsStore.Save();
-                        }
-                    }
-                }
+                SaveWindowBoundsIfNormal();
+                RemoveTrayIcon();
             }
         }
         catch { }
@@ -98,12 +213,28 @@ public static unsafe class App
 
     private static int Run()
     {
+        _wmTaskbarCreated = W.RegisterWindowMessageW("TaskbarCreated");
+        _wmActivateExisting = W.RegisterWindowMessageW("FluxCord_ActivateExisting");
+
+        // Single-instance behavior like official Discord: clicking shortcut while hidden in tray pops up existing window!
+        if (!DemoArg && !BenchArg && !ResumedUpdateArg &&
+            string.IsNullOrEmpty(Environment.GetEnvironmentVariable("FLUXCORD_DATA_DIR")))
+        {
+            nint existing = W.FindWindowW("FluxCordMain", null);
+            if (existing != 0 && _wmActivateExisting != 0)
+            {
+                W.PostMessageW(existing, _wmActivateExisting, 0, 0);
+                return 0;
+            }
+        }
+
         W.SetPreferredAppMode(2);
         var inst = W.GetModuleHandleW(0);
         _arrow = W.LoadCursorW(0, 32512);
         _hand = W.LoadCursorW(0, 32649);
         nint iconBig = W.LoadImageW(inst, 32512, W.IMAGE_ICON, W.GetSystemMetrics(W.SM_CXICON), W.GetSystemMetrics(W.SM_CYICON), 0);
         nint iconSm = W.LoadImageW(inst, 32512, W.IMAGE_ICON, W.GetSystemMetrics(W.SM_CXSMICON), W.GetSystemMetrics(W.SM_CYSMICON), 0);
+        _trayIcon = iconSm != 0 ? iconSm : iconBig;
 
         fixed (char* cls = "FluxCordMain")
         fixed (char* scls = "FluxCordStreamHost")
@@ -168,6 +299,7 @@ public static unsafe class App
         Gfx.Init(Hwnd);
         Shell.Init();
         RebuildEditFont();
+        if (!BenchArg) AddOrUpdateTrayIcon(false);
 
         W.ShowWindow(Hwnd, W.SW_SHOWNORMAL);
 
@@ -367,7 +499,7 @@ public static unsafe class App
 
     private static void Render()
     {
-        if (_inRender || _shuttingDown || Gfx.DC == null) return;
+        if (_inRender || _shuttingDown || _hiddenToTray || W.IsIconic(Hwnd) || Gfx.DC == null) return;
         _inRender = true;
         bool beganDraw = false;
         try
@@ -470,6 +602,11 @@ public static unsafe class App
                     return 0;
                 }
             }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_Q && W.KeyDown(W.VK_CONTROL))
+            {
+                RequestExit();
+                return 0;
+            }
             if (msg == W.WM_KEYDOWN && (int)w == W.VK_ESCAPE)
             {
                 Shell.OnEscape();
@@ -522,6 +659,11 @@ public static unsafe class App
                 Shell.StepQuickSwitch(1);
                 return 0;
             }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_Q && W.KeyDown(W.VK_CONTROL))
+            {
+                RequestExit();
+                return 0;
+            }
             if (msg == W.WM_KEYDOWN && (int)w == W.VK_ESCAPE)
             {
                 Shell.OnEscape();
@@ -571,6 +713,18 @@ public static unsafe class App
     {
         try
         {
+            if (msg != 0 && msg == _wmTaskbarCreated)
+            {
+                _trayAdded = false;
+                if (!BenchArg) AddOrUpdateTrayIcon(false);
+                return 0;
+            }
+            if (msg != 0 && msg == _wmActivateExisting)
+            {
+                RestoreFromTray();
+                return 0;
+            }
+
             switch (msg)
             {
                 case W.WM_NCCALCSIZE when w != 0:
@@ -672,16 +826,25 @@ public static unsafe class App
                         using var p = System.Diagnostics.Process.GetCurrentProcess();
                         long ramMb = p.WorkingSet64 / (1024 * 1024);
                         SettingsStore.Log($"BENCH_OK RAM={ramMb}MB FlushMs={Gfx.LastFlushMs:F2}");
-                        W.PostMessageW(hwnd, W.WM_CLOSE, 0, 0);
+                        RequestExit();
                         return 0;
                     }
                     if (w == 2)
                     {
-                        if (Shell.PollBackgroundTick()) Render();
+                        if (Shell.PollBackgroundTick() && !_hiddenToTray && !W.IsIconic(hwnd)) Render();
                         return 0;
                     }
                     Render();
                     return 0;
+                case WM_TRAY:
+                {
+                    uint ev = (uint)(l.ToInt64() & 0xFFFF);
+                    if (ev is W.WM_LBUTTONUP or W.WM_LBUTTONDBLCLK)
+                        RestoreFromTray();
+                    else if (ev is W.WM_RBUTTONUP or W.WM_CONTEXTMENU)
+                        ShowTrayContextMenu();
+                    return 0;
+                }
                 case W.WM_MOUSEMOVE:
                     if (!_tracking)
                     {
@@ -760,14 +923,34 @@ public static unsafe class App
                 case W.WM_KEYDOWN when ((int)w == W.VK_UP || (int)w == W.VK_DOWN) && W.KeyDown(W.VK_MENU):
                     Shell.StepChannel((int)w == W.VK_UP ? -1 : 1);
                     return 0;
+                case W.WM_KEYDOWN when (int)w == W.VK_Q && W.KeyDown(W.VK_CONTROL):
+                    RequestExit();
+                    return 0;
                 case W.WM_KEYDOWN when (int)w == W.VK_ESCAPE:
                     Shell.OnEscape();
                     return 0;
+                case W.WM_QUERYENDSESSION:
+                    return 1;
+                case W.WM_ENDSESSION:
+                    if (w != 0)
+                    {
+                        _forceExit = true;
+                        ShutdownAll();
+                    }
+                    return 0;
                 case W.WM_CLOSE:
-                    // Cleanly stop media, Discord sessions, and D2D BEFORE destroying child video HWNDs!
+                {
+                    bool forceQuit = _forceExit || w == ForceCloseWParam || BenchArg || !SettingsStore.Current.CloseToTray;
+                    if (!forceQuit)
+                    {
+                        HideToTray();
+                        return 0;
+                    }
+                    // Cleanly stop media, tray icon, Discord sessions, and D2D BEFORE destroying child video HWNDs!
                     ShutdownAll();
                     W.DestroyWindow(hwnd);
                     return 0;
+                }
                 case W.WM_DESTROY:
                     W.PostQuitMessage(0);
                     return 0;

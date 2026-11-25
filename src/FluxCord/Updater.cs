@@ -42,7 +42,7 @@ public sealed class ResumeSession
 /// </summary>
 public static class Updater
 {
-    public const string CurrentVersion = "1.0.4";
+    public const string CurrentVersion = "1.0.5";
     public const string Repo = "So2K/FluxCord";
     public static readonly string UpdatesDir = Path.Combine(SettingsStore.DataDir, "updates");
     public static readonly string ResumePath = Path.Combine(SettingsStore.DataDir, "resume_session.json");
@@ -599,7 +599,7 @@ Remove-Item $MyInvocation.MyCommand.Path -Force
                 WindowStyle = ProcessWindowStyle.Hidden
             });
 
-            W.PostMessageW(App.Hwnd, W.WM_CLOSE, 0, 0);
+            App.RequestExit();
         }
         catch (Exception ex)
         {

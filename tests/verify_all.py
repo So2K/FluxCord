@@ -189,10 +189,25 @@ with tempfile.TemporaryDirectory(prefix="fluxcord_test_") as DATA:
             delta_h = int(h_after.value) - int(h_before.value)
             check(delta_h <= 25, f"No per-frame handle leak across 200 redraws (before={h_before.value}, after={h_after.value}, delta={delta_h:+d})")
 
-            # Test F: Clean WM_CLOSE shutdown (exit code 0, no hang)
-            ctypes.windll.user32.PostMessageW(hwnd_found, 0x0010, 0, 0)  # WM_CLOSE
+            # Test F1: Close on 'X' (WM_CLOSE wParam=0) flies to background tray instead of quitting!
+            ctypes.windll.user32.SendMessageW(hwnd_found, 0x0010, 0, 0)  # WM_CLOSE (normal close button)
+            time.sleep(0.15)
+            vis_after_close = ctypes.windll.user32.IsWindowVisible(hwnd_found)
+            alive_in_bg = (p_click.poll() is None)
+            check(vis_after_close == 0 and alive_in_bg,
+                  f"Close on 'X' hides window to background tray while keeping Discord alive (visible={vis_after_close}, running={alive_in_bg})")
+
+            # Test F2: Clicking system tray icon (WM_TRAY = WM_APP+3 = 0x8003, lParam = WM_LBUTTONUP = 0x0202) restores window!
+            ctypes.windll.user32.SendMessageW(hwnd_found, 0x8003, 1, 0x0202)
+            time.sleep(0.15)
+            vis_restored = ctypes.windll.user32.IsWindowVisible(hwnd_found)
+            check(vis_restored != 0 and p_click.poll() is None,
+                  f"Clicking system tray icon restores FluxCord window from background (visible={vis_restored})")
+
+            # Test F3: Explicit Full Quit (ForceCloseWParam = 0xFC01 / Tray Exit / Ctrl+Q) exits 0 cleanly!
+            ctypes.windll.user32.PostMessageW(hwnd_found, 0x0010, 0xFC01, 0)  # WM_CLOSE ForceQuit
             rc_close = p_click.wait(timeout=5)
-            check(rc_close == 0, f"Clean WM_CLOSE shutdown exit={rc_close}")
+            check(rc_close == 0, f"Explicit Full Quit from tray/Ctrl+Q exits cleanly (exit={rc_close})")
         else:
             check(False, "Win32 UI click test could not find FluxCordMain --demo HWND")
     finally:

@@ -28,6 +28,7 @@ public sealed class FluxSettings
     public bool TurboLowLatency { get; set; } = true;
     public bool AutoCheckUpdates { get; set; } = true;
     public bool AutoDownloadUpdates { get; set; } = true;
+    public bool CloseToTray { get; set; } = true;
 
     // Voice & Multi-Backend Noise Suppression
     public string CaptureDeviceId { get; set; } = "";
