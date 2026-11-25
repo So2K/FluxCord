@@ -64,7 +64,17 @@ Write-Host "Packed: $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1MB, 
 if ($SkipUpload) { exit 0 }
 
 # 5. Upload GitHub Release atomically (draft=true -> upload ZIP -> PATCH draft=false so clients never see an empty release!)
-$credRaw = ("protocol=https`nhost=github.com`n`n" | git credential fill) -join "`n"
+$psi = New-Object System.Diagnostics.ProcessStartInfo("git", "credential fill")
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.UseShellExecute = $false
+$proc = [System.Diagnostics.Process]::Start($psi)
+$proc.StandardInput.WriteLine("protocol=https")
+$proc.StandardInput.WriteLine("host=github.com")
+$proc.StandardInput.WriteLine("")
+$proc.StandardInput.Close()
+$credRaw = $proc.StandardOutput.ReadToEnd()
+$proc.WaitForExit()
 if ($credRaw -notmatch "password=([^\r\n]+)") { throw "No GitHub token in Git Credential Manager" }
 $tok = $Matches[1].Trim()
 $hdrs = @{
