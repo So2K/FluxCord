@@ -19,7 +19,7 @@ public static unsafe class App
     private static nint _origChatProc, _origTokenProc, _origSearchProc;
     private static bool _searchWasVisible;
     private static nint _arrow, _hand;
-    private static bool _wakePending, _tracking, _inRender, _shuttingDown;
+    private static bool _wakePending, _tracking, _inRender, _shuttingDown, _releasingCapture;
     private const uint WM_WAKE = W.WM_APP + 1;
     private const uint WM_UI_ACTION = W.WM_APP + 2;
     private static readonly ConcurrentQueue<Action> _uiActions = new();
@@ -683,16 +683,21 @@ public static unsafe class App
                     Render();
                     return 0;
                 case W.WM_LBUTTONUP:
-                    W.ReleaseCapture();
                     UI.MX = W.LoWord(l) / Gfx.Scale;
                     UI.MY = W.HiWord(l) / Gfx.Scale;
                     UI.Down = false;
                     UI.Released = true;
                     Render();
+                    _releasingCapture = true;
+                    W.ReleaseCapture();
+                    _releasingCapture = false;
                     return 0;
                 case W.WM_CAPTURECHANGED:
-                    UI.CancelDrag();
-                    Render();
+                    if (!_releasingCapture)
+                    {
+                        UI.CancelDrag();
+                        Render();
+                    }
                     return 0;
                 case W.WM_RBUTTONUP:
                     UI.MX = W.LoWord(l) / Gfx.Scale;

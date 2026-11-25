@@ -450,8 +450,8 @@ public static unsafe partial class Shell
         RemoteAuthQr.Instance.Changed += () => App.WakeUi();
 
         var savedToken = SettingsStore.GetToken();
-        if (!string.IsNullOrEmpty(savedToken)) _ = DiscordClient.Instance.ConnectAsync(savedToken);
-        else if (App.DemoArg) DiscordClient.Instance.EnterDemoMode();
+        if (App.DemoArg) DiscordClient.Instance.EnterDemoMode();
+        else if (!string.IsNullOrEmpty(savedToken)) _ = DiscordClient.Instance.ConnectAsync(savedToken);
         else RemoteAuthQr.Instance.Start();
     }
 
