@@ -193,6 +193,30 @@ void testVideoDepacketizerReorderAndLoss() {
     bool emittedPacedIdr = dp.pushPacket(123, 96000, true, fu3.data(), int(fu3.size()), 320, out, pli);
     check(emittedPacedIdr && out.is_keyframe && out.annexb == expected,
           "VideoDepacketizer preserves 120ms WebRTC-paced IDR keyframe after prior packet loss");
+
+    // Regression: SFU temporal-layer frame skip (small seq gap 124..125 skipped, clean intact P-frame at 126) MUST NOT lock needKeyframe()!
+    dp.setNeedKeyframe(false);
+    bool emittedCleanGap = dp.pushPacket(126, 99000, true, pSlice.data(), int(pSlice.size()), 360, out, pli);
+    if (!emittedCleanGap) emittedCleanGap = dp.tryEmit(410, out, pli); // +50ms > 40ms marker wait
+    check(emittedCleanGap && !dp.needKeyframe(),
+          "VideoDepacketizer survives SFU temporal-layer seq gap without stalling stream to 1fps");
+}
+
+// 8. Verify NoiseSuppressor NaN/Inf immunity (zero state poisoning even on corrupted audio driver input!)
+void testNoiseSuppressorNanImmunity() {
+    fc::NoiseSuppressor ns;
+    ns.configure(FC_NOISE_DEEPFILTERNET3, 0.8f, true, true, -50.0f);
+    std::vector<float> buf(960, 0.1f);
+    buf[10] = std::numeric_limits<float>::quiet_NaN();
+    buf[20] = std::numeric_limits<float>::infinity();
+    buf[30] = -std::numeric_limits<float>::infinity();
+    ns.process(buf.data(), 960);
+    // Feed a normal sine next and verify 100% finite non-dead output
+    for (int i = 0; i < 960; ++i) buf[i] = 0.2f * std::sin(2.0f * 3.14159265f * 440.0f * float(i) / 48000.0f);
+    ns.process(buf.data(), 960);
+    bool ok = true;
+    for (float s : buf) if (!std::isfinite(s)) ok = false;
+    check(ok && rms(buf.data(), 960) > 0.01f, "NoiseSuppressor NaN/Inf driver-glitch immunity verified");
 }
 
 // 5. Verify Discord aead_xchacha20_poly1305_rtpsize encryption/decryption with RTP Padding + Encrypted RTCP PLI!
@@ -293,6 +317,7 @@ int main() {
     testAeadRtpPaddingAndEncryptedRtcpPli();
     testOutboundGoLiveDaveInit();
     testGoLiveSystemAudioOpus128k();
+    testNoiseSuppressorNanImmunity();
     std::printf("\n=== C++ MEDIA UNIT TESTS: %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

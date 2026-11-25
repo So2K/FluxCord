@@ -14,6 +14,7 @@ public:
 
     void configure(int32_t mode, float strength, bool hpf, bool agc, float gate_db);
     void reset();
+    void clearTelemetry();
     // Process arbitrary frame size (480 or 960 mono float32 samples @ 48 kHz) in-place with zero boundary discontinuities
     void process(float* pcm, int32_t count);
 
@@ -28,6 +29,7 @@ public:
 
 private:
     void probeExternalPlugins();
+    void fft512(float* re, float* im, bool inverse) const;
     void processSpectralMmse(float* pcm, int32_t count, float strength, bool keyboard_killer);
     void processStudioDsp(float* pcm, int32_t count);
 
@@ -45,9 +47,6 @@ private:
     std::atomic<bool> voice_active_{false};
 
     HMODULE h_rnnoise_ = nullptr;
-    HMODULE h_dfnet_ = nullptr;
-    HMODULE h_nvafx_ = nullptr;
-
     using RnnoiseCreateFn = void* (*)(void*);
     using RnnoiseDestroyFn = void (*)(void*);
     using RnnoiseProcessFn = float (*)(void*, float*, const float*);
@@ -55,6 +54,7 @@ private:
     RnnoiseDestroyFn rnnoise_destroy_ = nullptr;
     RnnoiseProcessFn rnnoise_process_ = nullptr;
     void* rnnoise_state_ = nullptr;
+    int32_t prev_proc_mode_ = -1;
 
     // 80 Hz 2nd-order Butterworth HPF state (48 kHz)
     float hpf_x1_ = 0, hpf_x2_ = 0, hpf_y1_ = 0, hpf_y2_ = 0;
@@ -65,18 +65,22 @@ private:
     static constexpr int kBins = kFft / 2 + 1;
 
     float win_[kFft]{};
+    float tw_cos_[kFft / 2]{};
+    float tw_sin_[kFft / 2]{};
     float in_ring_[kFft]{};
     float out_ola_[kFft]{};
     int ring_fill_ = kHop; // starts half-filled with zeros for exact 256-sample COLA alignment
     std::vector<float> out_fifo_;
 
     float noise_psd_[kBins]{};
+    float min_psd_[kBins]{};
     float prev_post_snr_[kBins]{};
     float prev_gain_[kBins]{};
     float smooth_gain_[kBins]{};
     float prev_mag_[kBins]{};
     bool noise_init_ = false;
     int init_frames_ = 0;
+    int min_track_frames_ = 0;
 
     // Smooth AGC & Gate state
     float agc_env_ = 0.08f;

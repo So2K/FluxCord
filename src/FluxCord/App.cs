@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -18,20 +19,31 @@ public static unsafe class App
     private static nint _origChatProc, _origTokenProc, _origSearchProc;
     private static bool _searchWasVisible;
     private static nint _arrow, _hand;
-    private static bool _wakePending, _tracking;
+    private static bool _wakePending, _tracking, _inRender, _shuttingDown;
     private const uint WM_WAKE = W.WM_APP + 1;
+    private const uint WM_UI_ACTION = W.WM_APP + 2;
+    private static readonly ConcurrentQueue<Action> _uiActions = new();
 
-    // Pixel bounds of each native video child HWND (0..3 = watch slots, 4 = self preview) for mouse forwarding & cutout regions
-    private static readonly (int X, int Y, int W, int H, bool Visible, bool HadCutout)[] _videoRects = new (int, int, int, int, bool, bool)[MaxWatchSlots + 1];
+    private static readonly (int X, int Y, int W, int H, bool Visible, bool HadCutout, int CutoutHash)[] _videoRects =
+        new (int, int, int, int, bool, bool, int)[MaxWatchSlots + 1];
+    private static readonly Dictionary<nint, (int X, int Y, int W, int H, bool Visible)> _childState = new();
 
     public static void WakeUi()
     {
-        if (Hwnd == 0) return;
+        if (Hwnd == 0 || _shuttingDown) return;
         if (Interlocked.Exchange(ref _wakePending, true)) return;
         W.PostMessageW(Hwnd, WM_WAKE, 0, 0);
     }
 
-    public static void Invalidate() { if (Hwnd != 0) W.InvalidateRect(Hwnd, null, 0); }
+    /// <summary>Marshals an action safely onto the Win32 UI thread OUTSIDE Direct2D BeginDraw..EndDraw!</summary>
+    public static void InvokeOnUiThread(Action action)
+    {
+        if (Hwnd == 0 || _shuttingDown) return;
+        _uiActions.Enqueue(action);
+        W.PostMessageW(Hwnd, WM_UI_ACTION, 0, 0);
+    }
+
+    public static void Invalidate() { if (Hwnd != 0 && !_shuttingDown) W.InvalidateRect(Hwnd, null, 0); }
 
     [STAThread]
     private static int Main(string[] args)
@@ -44,7 +56,44 @@ public static unsafe class App
 
         try { return Run(); }
         catch (Exception ex) { SettingsStore.Log("FATAL: " + ex); return 1; }
-        finally { MediaNative.fc_shutdown(); LocalCache.Close(); }
+        finally { ShutdownAll(); }
+    }
+
+    private static void ShutdownAll()
+    {
+        if (_shuttingDown) return;
+        _shuttingDown = true;
+        try
+        {
+            if (Hwnd != 0)
+            {
+                W.KillTimer(Hwnd, 1);
+                W.KillTimer(Hwnd, 2);
+                W.KillTimer(Hwnd, 99);
+                if (!W.IsZoomed(Hwnd) && !W.IsIconic(Hwnd) && Gfx.Scale > 0.1f)
+                {
+                    W.RECT wr;
+                    if (W.GetWindowRect(Hwnd, &wr))
+                    {
+                        int lw = (int)MathF.Round((wr.R - wr.L) / Gfx.Scale);
+                        int lh = (int)MathF.Round((wr.B - wr.T) / Gfx.Scale);
+                        if (lw >= 860 && lh >= 560 && lw <= 3840 && lh <= 2160)
+                        {
+                            SettingsStore.Current.WindowWidth = lw;
+                            SettingsStore.Current.WindowHeight = lh;
+                            SettingsStore.Save();
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        try { Shell.StopStream(); } catch { }
+        try { RemoteAuthQr.Instance.Stop(); } catch { }
+        try { DiscordClient.Instance.Disconnect(); } catch { }
+        try { MediaNative.fc_shutdown(); } catch { }
+        try { Gfx.DisposeDevice(); } catch { }
+        try { LocalCache.Close(); } catch { }
     }
 
     private static int Run()
@@ -118,6 +167,7 @@ public static unsafe class App
 
         Gfx.Init(Hwnd);
         Shell.Init();
+        RebuildEditFont();
 
         W.ShowWindow(Hwnd, W.SW_SHOWNORMAL);
 
@@ -132,8 +182,20 @@ public static unsafe class App
             W.DispatchMessageW(&msg);
         }
 
-        Gfx.DisposeDevice();
+        ShutdownAll();
         return 0;
+    }
+
+    private static void RebuildEditFont()
+    {
+        if (Gfx.Scale <= 0.1f) return;
+        nint newFont = W.CreateFontW(-(int)(15 * Gfx.Scale), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
+        if (newFont == 0) return;
+        if (_chatEdit != 0) W.SendMessageW(_chatEdit, W.WM_SETFONT, (nuint)newFont, 1);
+        if (_tokenEdit != 0) W.SendMessageW(_tokenEdit, W.WM_SETFONT, (nuint)newFont, 1);
+        if (_searchEdit != 0) W.SendMessageW(_searchEdit, W.WM_SETFONT, (nuint)newFont, 1);
+        if (_editFont != 0) W.DeleteObject(_editFont);
+        _editFont = newFont;
     }
 
     private static string ReadEdit(nint h)
@@ -168,6 +230,7 @@ public static unsafe class App
     }
 
     public static string GetTokenInputText() => ReadEdit(_tokenEdit);
+    public static void ClearTokenInput() { if (_tokenEdit != 0) W.SetWindowTextW(_tokenEdit, ""); }
     public static string GetSearchInputText() => ReadEdit(_searchEdit);
     public static void SetSearchInputText(string text)
     {
@@ -207,6 +270,12 @@ public static unsafe class App
         {
             if (prev.Visible)
             {
+                if (prev.HadCutout)
+                {
+                    W.SetWindowRgn(hwnd, 0, false);
+                    prev.HadCutout = false;
+                    prev.CutoutHash = 0;
+                }
                 W.ShowWindow(hwnd, W.SW_HIDE);
                 prev.Visible = false;
             }
@@ -225,10 +294,12 @@ public static unsafe class App
             if (isSelf) MediaNative.fc_screen_resize_preview(pw, ph);
             else MediaNative.fc_watch_resize_slot(idx, pw, ph);
             prev.X = px; prev.Y = py; prev.W = pw; prev.H = ph; prev.Visible = true;
+            prev.CutoutHash = -1; // force cutout re-eval on resize
         }
 
+        // Compute deterministic hash of intersecting cutouts so we NEVER churn GDI SetWindowRgn on unchanged frames!
+        int hash = 17;
         bool hasAnyCutout = false;
-        nint rgn = 0;
         for (int c = 0; c < cutouts.Length; c++)
         {
             var cr = cutouts[c];
@@ -237,306 +308,441 @@ public static unsafe class App
             int cx2 = (int)MathF.Ceiling(cr.Right * sc) - px;
             int cy2 = (int)MathF.Ceiling(cr.Bottom * sc) - py;
             if (cx2 <= 0 || cy2 <= 0 || cx1 >= pw || cy1 >= ph) continue;
-
-            if (rgn == 0) rgn = W.CreateRectRgn(0, 0, pw, ph);
-            nint hole = W.CreateRectRgn(Math.Max(0, cx1), Math.Max(0, cy1), Math.Min(pw, cx2), Math.Min(ph, cy2));
-            W.CombineRgn(rgn, rgn, hole, 4); // RGN_DIFF = 4
-            W.DeleteObject(hole);
             hasAnyCutout = true;
+            hash = HashCode.Combine(hash, Math.Max(0, cx1), Math.Max(0, cy1), Math.Min(pw, cx2), Math.Min(ph, cy2));
         }
+        if (!hasAnyCutout) hash = 0;
+        if (hash == prev.CutoutHash && hasAnyCutout == prev.HadCutout) return;
 
         if (hasAnyCutout)
         {
-            W.SetWindowRgn(hwnd, rgn, true);
+            nint rgn = W.CreateRectRgn(0, 0, pw, ph);
+            for (int c = 0; c < cutouts.Length; c++)
+            {
+                var cr = cutouts[c];
+                int cx1 = (int)MathF.Floor(cr.X * sc) - px;
+                int cy1 = (int)MathF.Floor(cr.Y * sc) - py;
+                int cx2 = (int)MathF.Ceiling(cr.Right * sc) - px;
+                int cy2 = (int)MathF.Ceiling(cr.Bottom * sc) - py;
+                if (cx2 <= 0 || cy2 <= 0 || cx1 >= pw || cy1 >= ph) continue;
+                nint hole = W.CreateRectRgn(Math.Max(0, cx1), Math.Max(0, cy1), Math.Min(pw, cx2), Math.Min(ph, cy2));
+                W.CombineRgn(rgn, rgn, hole, 4); // RGN_DIFF
+                W.DeleteObject(hole);
+            }
+            if (W.SetWindowRgn(hwnd, rgn, true) == 0) W.DeleteObject(rgn);
             prev.HadCutout = true;
+            prev.CutoutHash = hash;
         }
         else if (prev.HadCutout)
         {
             W.SetWindowRgn(hwnd, 0, true);
             prev.HadCutout = false;
+            prev.CutoutHash = 0;
         }
     }
 
     private static void SyncChild(nint h, bool show, R r, float sc)
     {
         if (h == 0) return;
-        if (show)
-            W.SetWindowPos(h, 0, (int)(r.X * sc), (int)(r.Y * sc), Math.Max(10, (int)(r.W * sc)), Math.Max(16, (int)(r.H * sc)), W.SWP_NOZORDER | W.SWP_NOACTIVATE | W.SWP_SHOWWINDOW);
-        else
-            W.ShowWindow(h, W.SW_HIDE);
+        _childState.TryGetValue(h, out var prev);
+        if (!show)
+        {
+            if (prev.Visible)
+            {
+                W.ShowWindow(h, W.SW_HIDE);
+                _childState[h] = (prev.X, prev.Y, prev.W, prev.H, false);
+            }
+            return;
+        }
+        int x = (int)(r.X * sc), y = (int)(r.Y * sc);
+        int w = Math.Max(10, (int)(r.W * sc)), ch = Math.Max(16, (int)(r.H * sc));
+        if (!prev.Visible || prev.X != x || prev.Y != y || prev.W != w || prev.H != ch)
+        {
+            W.SetWindowPos(h, 0, x, y, w, ch, W.SWP_NOZORDER | W.SWP_NOACTIVATE | W.SWP_SHOWWINDOW);
+            _childState[h] = (x, y, w, ch, true);
+        }
     }
 
     private static void Render()
     {
-        UI.BeginFrame();
-        Gfx.BeginDraw(Th.Bg);
-        Shell.Draw();
-        Gfx.EndDraw();
-        UI.EndFrame();
+        if (_inRender || _shuttingDown || Gfx.DC == null) return;
+        _inRender = true;
+        try
+        {
+            UI.BeginFrame();
+            Gfx.BeginDraw(Th.Bg);
+            Shell.Draw();
+            Gfx.EndDraw();
+            UI.EndFrame();
 
-        if (UI.TakeAnimate()) W.SetTimer(Hwnd, 1, 16, 0);
-        else W.KillTimer(Hwnd, 1);
+            if (UI.TakeAnimate()) W.SetTimer(Hwnd, 1, 16, 0);
+            else W.KillTimer(Hwnd, 1);
+        }
+        catch (Exception ex)
+        {
+            SettingsStore.Log("Render error: " + ex.Message);
+        }
+        finally
+        {
+            _inRender = false;
+        }
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
     private static nint StreamProc(nint hwnd, uint msg, nuint w, nint l)
     {
-        if (msg is W.WM_MOUSEMOVE or W.WM_LBUTTONDOWN or W.WM_LBUTTONUP or W.WM_RBUTTONUP)
+        try
         {
-            int idx = -1;
-            if (hwnd == SelfStreamHwnd) idx = MaxWatchSlots;
-            else
+            if (msg is W.WM_MOUSEMOVE or W.WM_LBUTTONDOWN or W.WM_LBUTTONUP or W.WM_RBUTTONUP)
             {
-                for (int i = 0; i < MaxWatchSlots; i++)
-                    if (StreamHwnds[i] == hwnd) { idx = i; break; }
+                int idx = -1;
+                if (hwnd == SelfStreamHwnd) idx = MaxWatchSlots;
+                else
+                {
+                    for (int i = 0; i < MaxWatchSlots; i++)
+                        if (StreamHwnds[i] == hwnd) { idx = i; break; }
+                }
+                if (idx >= 0)
+                {
+                    int px = W.LoWord(l) + _videoRects[idx].X;
+                    int py = W.HiWord(l) + _videoRects[idx].Y;
+                    nint mapped = (nint)(((py & 0xFFFF) << 16) | (px & 0xFFFF));
+                    W.PostMessageW(Hwnd, msg, w, mapped);
+                    return 0;
+                }
             }
-            if (idx >= 0)
+            if (msg == W.WM_MOUSEWHEEL)
             {
-                int px = W.LoWord(l) + _videoRects[idx].X;
-                int py = W.HiWord(l) + _videoRects[idx].Y;
-                nint mapped = (nint)(((py & 0xFFFF) << 16) | (px & 0xFFFF));
-                W.PostMessageW(Hwnd, msg, w, mapped);
+                W.PostMessageW(Hwnd, W.WM_MOUSEWHEEL, w, l);
                 return 0;
             }
         }
-        if (msg == W.WM_MOUSEWHEEL)
-        {
-            W.PostMessageW(Hwnd, W.WM_MOUSEWHEEL, w, l);
-            return 0;
-        }
+        catch (Exception ex) { SettingsStore.Log("StreamProc error: " + ex.Message); }
         return W.DefWindowProcW(hwnd, msg, w, l);
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
     private static nint ChatEditProc(nint hwnd, uint msg, nuint w, nint l)
     {
-        if (msg == W.WM_MOUSEWHEEL)
+        try
         {
-            W.PostMessageW(Hwnd, W.WM_MOUSEWHEEL, w, l);
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL))
-        {
-            Shell.ToggleQuickSwitch();
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_F && W.KeyDown(W.VK_CONTROL))
-        {
-            Shell.ToggleChannelSearch();
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_V && W.KeyDown(W.VK_CONTROL))
-        {
-            if (W.IsClipboardFormatAvailable(8) && !W.IsClipboardFormatAvailable(13))
+            if (msg == W.WM_MOUSEWHEEL)
             {
-                Shell.OnClipboardImagePaste();
+                W.PostMessageW(Hwnd, W.WM_MOUSEWHEEL, w, l);
                 return 0;
             }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_A && W.KeyDown(W.VK_CONTROL))
+            {
+                W.SendMessageW(hwnd, 0x00B1 /*EM_SETSEL*/, 0, -1);
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL))
+            {
+                Shell.ToggleQuickSwitch();
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_F && W.KeyDown(W.VK_CONTROL))
+            {
+                Shell.ToggleChannelSearch();
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_V && W.KeyDown(W.VK_CONTROL))
+            {
+                // Allow pasting screenshots & browser "Copy Image" (CF_DIB) seamlessly!
+                if (W.IsClipboardFormatAvailable(8) && !W.IsClipboardFormatAvailable(13))
+                {
+                    Shell.OnClipboardImagePaste();
+                    return 0;
+                }
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_ESCAPE)
+            {
+                Shell.OnEscape();
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_M && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT))
+            {
+                Shell.ToggleMute();
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_D && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT))
+            {
+                Shell.ToggleDeafen();
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN && !W.KeyDown(W.VK_SHIFT))
+            {
+                Shell.OnChatEnter(TakeChatInputText());
+                return 0;
+            }
+            // Suppress Windows error beep on Enter/Esc/Ctrl+A in single-line EDIT control
+            if (msg == W.WM_CHAR && ((int)w == 13 || (int)w == 27 || (int)w == 1))
+                return 0;
+            if (msg == W.WM_CHAR && (int)w >= 32)
+            {
+                Shell.OnChatTyping();
+            }
         }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_ESCAPE)
-        {
-            Shell.OnEscape();
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_M && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT))
-        {
-            Shell.ToggleMute();
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_D && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT))
-        {
-            Shell.ToggleDeafen();
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN && !W.KeyDown(W.VK_SHIFT))
-        {
-            Shell.OnChatEnter(TakeChatInputText());
-            return 0;
-        }
-        if (msg == W.WM_CHAR && (int)w >= 32)
-        {
-            Shell.OnChatTyping();
-        }
+        catch (Exception ex) { SettingsStore.Log("ChatEditProc error: " + ex.Message); }
         return W.CallWindowProcW(_origChatProc, hwnd, msg, w, l);
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
     private static nint SearchEditProc(nint hwnd, uint msg, nuint w, nint l)
     {
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_ESCAPE)
+        try
         {
-            Shell.OnEscape();
-            return 0;
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_A && W.KeyDown(W.VK_CONTROL))
+            {
+                W.SendMessageW(hwnd, 0x00B1, 0, -1);
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_UP)
+            {
+                Shell.StepQuickSwitch(-1);
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_DOWN)
+            {
+                Shell.StepQuickSwitch(1);
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_ESCAPE)
+            {
+                Shell.OnEscape();
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN)
+            {
+                Shell.OnSearchEnter(GetSearchInputText());
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL))
+            {
+                Shell.ToggleQuickSwitch();
+                return 0;
+            }
+            if (msg == W.WM_CHAR && ((int)w == 13 || (int)w == 27 || (int)w == 1))
+                return 0;
         }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN)
-        {
-            Shell.OnSearchEnter(GetSearchInputText());
-            return 0;
-        }
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL))
-        {
-            Shell.ToggleQuickSwitch();
-            return 0;
-        }
+        catch (Exception ex) { SettingsStore.Log("SearchEditProc error: " + ex.Message); }
         return W.CallWindowProcW(_origSearchProc, hwnd, msg, w, l);
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
     private static nint TokenEditProc(nint hwnd, uint msg, nuint w, nint l)
     {
-        if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN)
+        try
         {
-            Shell.OnTokenSubmit(GetTokenInputText());
-            return 0;
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_A && W.KeyDown(W.VK_CONTROL))
+            {
+                W.SendMessageW(hwnd, 0x00B1, 0, -1);
+                return 0;
+            }
+            if (msg == W.WM_KEYDOWN && (int)w == W.VK_RETURN)
+            {
+                Shell.OnTokenSubmit(GetTokenInputText());
+                return 0;
+            }
+            if (msg == W.WM_CHAR && ((int)w == 13 || (int)w == 27 || (int)w == 1))
+                return 0;
         }
+        catch (Exception ex) { SettingsStore.Log("TokenEditProc error: " + ex.Message); }
         return W.CallWindowProcW(_origTokenProc, hwnd, msg, w, l);
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
     private static nint WndProc(nint hwnd, uint msg, nuint w, nint l)
     {
-        switch (msg)
+        try
         {
-            case W.WM_NCCALCSIZE when w != 0:
-                return 0;
-            case W.WM_NCHITTEST:
+            switch (msg)
             {
-                W.RECT wr;
-                W.GetWindowRect(hwnd, &wr);
-                int sx = W.LoWord(l), sy = W.HiWord(l);
-                const int b = 6;
-                bool left = sx < wr.L + b, right = sx >= wr.R - b, top = sy < wr.T + b, bot = sy >= wr.B - b;
-                if (top && left) return 13;
-                if (top && right) return 14;
-                if (bot && left) return 16;
-                if (bot && right) return 17;
-                if (left) return 10;
-                if (right) return 11;
-                if (top) return 12;
-                if (bot) return 15;
-                float cy = (sy - wr.T) / Gfx.Scale;
-                float cx = (sx - wr.L) / Gfx.Scale;
-                float rightZone = (Updater.HasUpdate || Updater.Downloading || Updater.Applying) ? 380f : 140f;
-                if (cy < Shell.TopH && cx < Gfx.W - rightZone) return 2;
-                return 1;
-            }
-            case W.WM_ERASEBKGND:
-                return 1;
-            case W.WM_CTLCOLOREDIT:
-                W.SetTextColor((nint)w, W.Rgb(0xF3, 0xF4, 0xF6));
-                W.SetBkColor((nint)w, W.Rgb(0x17, 0x19, 0x20));
-                return _editBrush;
-            case W.WM_COMMAND:
-                if (l == _searchEdit && (((uint)w >> 16) & 0xFFFF) == W.EN_CHANGE)
+                case W.WM_NCCALCSIZE when w != 0:
                 {
-                    Shell.OnSearchChanged(GetSearchInputText());
+                    // When maximized, inset client rect by exact OS border frame so top bar & close button NEVER clip off screen!
+                    if (W.IsZoomed(hwnd))
+                    {
+                        var ncp = (W.NCCALCSIZE_PARAMS*)l;
+                        int pad = W.GetSystemMetrics(W.SM_CXPADDEDBORDER);
+                        int fx = W.GetSystemMetrics(W.SM_CXSIZEFRAME) + pad;
+                        int fy = W.GetSystemMetrics(W.SM_CYSIZEFRAME) + pad;
+                        ncp->r0.L += fx;
+                        ncp->r0.T += fy;
+                        ncp->r0.R -= fx;
+                        ncp->r0.B -= fy;
+                    }
                     return 0;
                 }
-                break;
-            case W.WM_DROPFILES:
-                Shell.OnFilesDropped(W.ReadDroppedFiles((nint)w));
-                return 0;
-            case W.WM_SIZE when Gfx.DC != null:
-                Gfx.Resize(W.LoWord(l), W.HiWord(l));
-                Render();
-                return 0;
-            case W.WM_PAINT:
-                W.ValidateRect(hwnd, null);
-                if (Gfx.DC != null) Render();
-                return 0;
-            case WM_WAKE:
-                _wakePending = false;
-                Render();
-                return 0;
-            case W.WM_TIMER:
-                if (w == 99)
+                case W.WM_NCHITTEST:
                 {
-                    long ramMb = System.Diagnostics.Process.GetCurrentProcess().WorkingSet64 / (1024 * 1024);
-                    SettingsStore.Log($"BENCH_OK RAM={ramMb}MB FlushMs={Gfx.LastFlushMs:F2}");
+                    W.RECT wr;
+                    W.GetWindowRect(hwnd, &wr);
+                    int sx = W.LoWord(l), sy = W.HiWord(l);
+                    if (!W.IsZoomed(hwnd))
+                    {
+                        const int b = 6;
+                        bool left = sx < wr.L + b, right = sx >= wr.R - b, top = sy < wr.T + b, bot = sy >= wr.B - b;
+                        if (top && left) return 13;
+                        if (top && right) return 14;
+                        if (bot && left) return 16;
+                        if (bot && right) return 17;
+                        if (left) return 10;
+                        if (right) return 11;
+                        if (top) return 12;
+                        if (bot) return 15;
+                    }
+                    int pad = W.IsZoomed(hwnd) ? W.GetSystemMetrics(W.SM_CYSIZEFRAME) + W.GetSystemMetrics(W.SM_CXPADDEDBORDER) : 0;
+                    float cy = (sy - (wr.T + pad)) / MathF.Max(0.1f, Gfx.Scale);
+                    float cx = (sx - (wr.L + pad)) / MathF.Max(0.1f, Gfx.Scale);
+                    float rightZone = Shell.TopBarRightZoneWidth;
+                    if (cy < Shell.TopH && cx < Gfx.W - rightZone) return 2;
+                    return 1;
+                }
+                case W.WM_DPICHANGED:
+                {
+                    Gfx.RefreshDpi();
+                    RebuildEditFont();
+                    var nr = (W.RECT*)l;
+                    W.SetWindowPos(hwnd, 0, nr->L, nr->T, nr->R - nr->L, nr->B - nr->T, W.SWP_NOZORDER | W.SWP_NOACTIVATE);
+                    Render();
+                    return 0;
+                }
+                case W.WM_ERASEBKGND:
+                    return 1;
+                case W.WM_CTLCOLOREDIT:
+                    W.SetTextColor((nint)w, W.Rgb(0xF3, 0xF4, 0xF6));
+                    W.SetBkColor((nint)w, W.Rgb(0x17, 0x19, 0x20));
+                    return _editBrush;
+                case W.WM_COMMAND:
+                    if (l == _searchEdit && (((uint)w >> 16) & 0xFFFF) == W.EN_CHANGE)
+                    {
+                        Shell.OnSearchChanged(GetSearchInputText());
+                        return 0;
+                    }
+                    break;
+                case W.WM_DROPFILES:
+                    Shell.OnFilesDropped(W.ReadDroppedFiles((nint)w));
+                    return 0;
+                case W.WM_SIZE when Gfx.DC != null:
+                    Gfx.Resize(W.LoWord(l), W.HiWord(l));
+                    Render();
+                    return 0;
+                case W.WM_PAINT:
+                    W.ValidateRect(hwnd, null);
+                    if (Gfx.DC != null) Render();
+                    return 0;
+                case WM_WAKE:
+                    _wakePending = false;
+                    Render();
+                    return 0;
+                case WM_UI_ACTION:
+                    while (_uiActions.TryDequeue(out var act))
+                    {
+                        try { act(); } catch (Exception ex) { SettingsStore.Log("UI action error: " + ex.Message); }
+                    }
+                    Render();
+                    return 0;
+                case W.WM_TIMER:
+                    if (w == 99)
+                    {
+                        using var p = System.Diagnostics.Process.GetCurrentProcess();
+                        long ramMb = p.WorkingSet64 / (1024 * 1024);
+                        SettingsStore.Log($"BENCH_OK RAM={ramMb}MB FlushMs={Gfx.LastFlushMs:F2}");
+                        W.PostMessageW(hwnd, W.WM_CLOSE, 0, 0);
+                        return 0;
+                    }
+                    if (w == 2)
+                    {
+                        if (Shell.PollBackgroundTick()) Render();
+                        return 0;
+                    }
+                    Render();
+                    return 0;
+                case W.WM_MOUSEMOVE:
+                    if (!_tracking)
+                    {
+                        var tme = new W.TRACKMOUSEEVENT { cbSize = (uint)sizeof(W.TRACKMOUSEEVENT), dwFlags = 2, hwndTrack = hwnd };
+                        W.TrackMouseEvent(&tme);
+                        _tracking = true;
+                    }
+                    UI.MX = W.LoWord(l) / Gfx.Scale;
+                    UI.MY = W.HiWord(l) / Gfx.Scale;
+                    Render();
+                    return 0;
+                case W.WM_MOUSELEAVE:
+                    _tracking = false;
+                    if (!UI.Down) UI.MX = UI.MY = -1;
+                    Render();
+                    return 0;
+                case W.WM_LBUTTONDOWN:
+                    W.SetCapture(hwnd);
+                    UI.MX = W.LoWord(l) / Gfx.Scale;
+                    UI.MY = W.HiWord(l) / Gfx.Scale;
+                    UI.Down = UI.Pressed = true;
+                    Render();
+                    return 0;
+                case W.WM_LBUTTONUP:
+                    W.ReleaseCapture();
+                    UI.MX = W.LoWord(l) / Gfx.Scale;
+                    UI.MY = W.HiWord(l) / Gfx.Scale;
+                    UI.Down = false;
+                    UI.Released = true;
+                    Render();
+                    return 0;
+                case W.WM_CAPTURECHANGED:
+                    UI.CancelDrag();
+                    Render();
+                    return 0;
+                case W.WM_RBUTTONUP:
+                    UI.MX = W.LoWord(l) / Gfx.Scale;
+                    UI.MY = W.HiWord(l) / Gfx.Scale;
+                    UI.RightClicked = true;
+                    Render();
+                    return 0;
+                case W.WM_MOUSEWHEEL:
+                    UI.Wheel = W.HiWord((nint)w) / 120f;
+                    Render();
+                    return 0;
+                case W.WM_SETCURSOR when (l.ToInt64() & 0xFFFF) == 1:
+                    W.SetCursor(UI.WantHand ? _hand : _arrow);
+                    return 1;
+                case W.WM_GETMINMAXINFO:
+                {
+                    var mmi = (W.MINMAXINFO*)l;
+                    mmi->minTrackSize.X = 860;
+                    mmi->minTrackSize.Y = 560;
+                    return 0;
+                }
+                case W.WM_KEYDOWN when (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL):
+                    Shell.ToggleQuickSwitch();
+                    return 0;
+                case W.WM_KEYDOWN when (int)w == W.VK_F && W.KeyDown(W.VK_CONTROL):
+                    Shell.ToggleChannelSearch();
+                    return 0;
+                case W.WM_KEYDOWN when (int)w == W.VK_M && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT):
+                    Shell.ToggleMute();
+                    return 0;
+                case W.WM_KEYDOWN when (int)w == W.VK_D && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT):
+                    Shell.ToggleDeafen();
+                    return 0;
+                case W.WM_KEYDOWN when ((int)w == W.VK_UP || (int)w == W.VK_DOWN) && W.KeyDown(W.VK_MENU):
+                    Shell.StepChannel((int)w == W.VK_UP ? -1 : 1);
+                    return 0;
+                case W.WM_KEYDOWN when (int)w == W.VK_ESCAPE:
+                    Shell.OnEscape();
+                    return 0;
+                case W.WM_CLOSE:
+                    // Cleanly stop media, Discord sessions, and D2D BEFORE destroying child video HWNDs!
+                    ShutdownAll();
+                    W.DestroyWindow(hwnd);
+                    return 0;
+                case W.WM_DESTROY:
                     W.PostQuitMessage(0);
                     return 0;
-                }
-                if (w == 2)
-                {
-                    if (Shell.PollBackgroundTick()) Render();
-                    return 0;
-                }
-                Render();
-                return 0;
-            case W.WM_MOUSEMOVE:
-                if (!_tracking)
-                {
-                    var tme = new W.TRACKMOUSEEVENT { cbSize = (uint)sizeof(W.TRACKMOUSEEVENT), dwFlags = 2, hwndTrack = hwnd };
-                    W.TrackMouseEvent(&tme);
-                    _tracking = true;
-                }
-                UI.MX = W.LoWord(l) / Gfx.Scale;
-                UI.MY = W.HiWord(l) / Gfx.Scale;
-                Render();
-                return 0;
-            case W.WM_MOUSELEAVE:
-                _tracking = false;
-                UI.MX = UI.MY = -1;
-                Render();
-                return 0;
-            case W.WM_LBUTTONDOWN:
-                UI.MX = W.LoWord(l) / Gfx.Scale;
-                UI.MY = W.HiWord(l) / Gfx.Scale;
-                UI.Down = UI.Pressed = true;
-                Render();
-                return 0;
-            case W.WM_LBUTTONUP:
-                UI.MX = W.LoWord(l) / Gfx.Scale;
-                UI.MY = W.HiWord(l) / Gfx.Scale;
-                UI.Down = false;
-                UI.Released = true;
-                Render();
-                return 0;
-            case W.WM_RBUTTONUP:
-                UI.MX = W.LoWord(l) / Gfx.Scale;
-                UI.MY = W.HiWord(l) / Gfx.Scale;
-                UI.RightClicked = true;
-                Render();
-                return 0;
-            case W.WM_MOUSEWHEEL:
-                UI.Wheel = W.HiWord((nint)w) / 120f;
-                Render();
-                return 0;
-            case W.WM_SETCURSOR when (l.ToInt64() & 0xFFFF) == 1:
-                W.SetCursor(UI.WantHand ? _hand : _arrow);
-                return 1;
-            case W.WM_GETMINMAXINFO:
-            {
-                var mmi = (W.MINMAXINFO*)l;
-                mmi->minTrackSize.X = 860;
-                mmi->minTrackSize.Y = 560;
-                return 0;
             }
-            case W.WM_KEYDOWN when (int)w == W.VK_K && W.KeyDown(W.VK_CONTROL):
-                Shell.ToggleQuickSwitch();
-                return 0;
-            case W.WM_KEYDOWN when (int)w == W.VK_F && W.KeyDown(W.VK_CONTROL):
-                Shell.ToggleChannelSearch();
-                return 0;
-            case W.WM_KEYDOWN when (int)w == W.VK_M && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT):
-                Shell.ToggleMute();
-                return 0;
-            case W.WM_KEYDOWN when (int)w == W.VK_D && W.KeyDown(W.VK_CONTROL) && W.KeyDown(W.VK_SHIFT):
-                Shell.ToggleDeafen();
-                return 0;
-            case W.WM_KEYDOWN when ((int)w == W.VK_UP || (int)w == W.VK_DOWN) && W.KeyDown(W.VK_MENU):
-                Shell.StepChannel((int)w == W.VK_UP ? -1 : 1);
-                return 0;
-            case W.WM_KEYDOWN when (int)w == W.VK_ESCAPE:
-                Shell.OnEscape();
-                return 0;
-            case W.WM_CLOSE:
-                W.DestroyWindow(hwnd);
-                return 0;
-            case W.WM_DESTROY:
-                W.PostQuitMessage(0);
-                return 0;
         }
+        catch (Exception ex) { SettingsStore.Log("WndProc error: " + ex.Message); }
         return W.DefWindowProcW(hwnd, msg, w, l);
     }
 }

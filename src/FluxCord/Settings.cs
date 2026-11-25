@@ -66,46 +66,69 @@ public static class SettingsStore
     public static readonly string SettingsPath = Path.Combine(DataDir, "settings.json");
     public static readonly string LogPath = Path.Combine(DataDir, "fluxcord.log");
 
+    private static readonly object _saveLock = new();
+    private static readonly object _logLock = new();
+    private static int _logWrites;
+
     public static FluxSettings Current { get; private set; } = new();
     public static string MigrationSummary { get; private set; } = "";
 
     public static void Log(string msg)
     {
-        try
+        lock (_logLock)
         {
-            Directory.CreateDirectory(DataDir);
-            File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss.fff}] {msg}\n");
+            try
+            {
+                Directory.CreateDirectory(DataDir);
+                if ((++_logWrites & 127) == 0 && File.Exists(LogPath) && new FileInfo(LogPath).Length > 2 * 1024 * 1024)
+                {
+                    string prev = Path.Combine(DataDir, "fluxcord.prev.log");
+                    File.Move(LogPath, prev, overwrite: true);
+                }
+                File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss.fff}] {msg}\n");
+            }
+            catch { }
         }
-        catch { }
     }
 
     public static void Load()
     {
-        Directory.CreateDirectory(DataDir);
-        if (File.Exists(SettingsPath))
+        lock (_saveLock)
         {
-            try
+            Directory.CreateDirectory(DataDir);
+            if (File.Exists(SettingsPath))
             {
-                var json = File.ReadAllText(SettingsPath);
-                Current = JsonSerializer.Deserialize(json, FluxJsonContext.Default.FluxSettings) ?? new();
+                try
+                {
+                    var json = File.ReadAllText(SettingsPath);
+                    Current = JsonSerializer.Deserialize(json, FluxJsonContext.Default.FluxSettings) ?? new();
+                }
+                catch { Current = new(); }
             }
-            catch { Current = new(); }
-        }
 
-        if (!Current.MigratedFromDorion)
-        {
-            MigrateFromExistingClients();
-            Save();
+            if (!Current.MigratedFromDorion)
+            {
+                MigrateFromExistingClients();
+                SaveLocked();
+            }
         }
     }
 
     public static void Save()
     {
+        lock (_saveLock) SaveLocked();
+    }
+
+    private static void SaveLocked()
+    {
         try
         {
             Directory.CreateDirectory(DataDir);
             var json = JsonSerializer.Serialize(Current, FluxJsonContext.Default.FluxSettings);
-            File.WriteAllText(SettingsPath, json);
+            // Atomic temp-file write prevents settings.json / DPAPI token corruption on concurrent save or power loss
+            string tmp = SettingsPath + ".tmp";
+            File.WriteAllText(tmp, json);
+            File.Move(tmp, SettingsPath, overwrite: true);
         }
         catch { }
     }
@@ -132,6 +155,11 @@ public static class SettingsStore
         else
         {
             var enc = W.ProtectDpapi(Encoding.UTF8.GetBytes(token));
+            if (enc.Length == 0)
+            {
+                Log("SetToken: DPAPI ProtectData failed, preserving previous token");
+                return;
+            }
             Current.EncryptedTokenB64 = Convert.ToBase64String(enc);
         }
         Save();
@@ -142,7 +170,6 @@ public static class SettingsStore
         var imported = new List<string>();
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
 
-        // 1. Migrate Dorion config.json
         var dorionCfg = Path.Combine(appData, "dorion", "config.json");
         if (File.Exists(dorionCfg))
         {
@@ -156,14 +183,18 @@ public static class SettingsStore
                 if (r.TryGetProperty("desktop_notifications", out var dn)) Current.DesktopNotifications = dn.ValueKind == JsonValueKind.True;
                 if (r.TryGetProperty("streamer_mode_detection", out var sm)) Current.StreamerMode = sm.ValueKind == JsonValueKind.True;
                 if (r.TryGetProperty("unread_badge", out var ub)) Current.UnreadBadge = ub.ValueKind == JsonValueKind.True;
-                if (r.TryGetProperty("zoom", out var zm) && float.TryParse(zm.GetString(), System.Globalization.CultureInfo.InvariantCulture, out var z))
-                    Current.UiScale = Math.Clamp(z, 0.8f, 1.5f);
+                if (r.TryGetProperty("zoom", out var zm))
+                {
+                    if (zm.ValueKind == JsonValueKind.Number && zm.TryGetSingle(out var zf))
+                        Current.UiScale = Math.Clamp(zf, 0.8f, 1.5f);
+                    else if (zm.ValueKind == JsonValueKind.String && float.TryParse(zm.GetString(), System.Globalization.CultureInfo.InvariantCulture, out var zs))
+                        Current.UiScale = Math.Clamp(zs, 0.8f, 1.5f);
+                }
                 imported.Add("Dorion (PTT, уведомления, масштаб, значки)");
             }
             catch { }
         }
 
-        // 2. Migrate official Discord settings.json if present
         var discordCfg = Path.Combine(appData, "discord", "settings.json");
         if (File.Exists(discordCfg))
         {
@@ -173,8 +204,8 @@ public static class SettingsStore
                 var r = doc.RootElement;
                 if (r.TryGetProperty("WINDOW_BOUNDS", out var wb))
                 {
-                    if (wb.TryGetProperty("width", out var w)) Current.WindowWidth = Math.Clamp(w.GetInt32(), 960, 2560);
-                    if (wb.TryGetProperty("height", out var h)) Current.WindowHeight = Math.Clamp(h.GetInt32(), 640, 1440);
+                    if (wb.TryGetProperty("width", out var w) && w.ValueKind == JsonValueKind.Number) Current.WindowWidth = Math.Clamp(w.GetInt32(), 960, 2560);
+                    if (wb.TryGetProperty("height", out var h) && h.ValueKind == JsonValueKind.Number) Current.WindowHeight = Math.Clamp(h.GetInt32(), 640, 1440);
                 }
                 imported.Add("Discord Desktop (геометрия окна)");
             }

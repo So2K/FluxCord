@@ -31,30 +31,35 @@ inline uint16_t getBE16(const uint8_t* p) { return uint16_t((uint16_t(p[0]) << 8
 inline uint32_t getBE32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
 }
+inline bool isSilenceFrame(const uint8_t* p, int len) {
+    return p && len == 3 && p[0] == 0xF8 && p[1] == 0xFF && p[2] == 0xFE;
+}
 int64_t steadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 } // namespace
 
-StreamReceiver::StreamReceiver(VoiceEngine* voice) : voice_(voice) {
+StreamReceiver::StreamReceiver(VoiceEngine* voice, int32_t slot_index) : voice_(voice), slot_index_(slot_index) {
     WSADATA wsa{};
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    wsa_ok_ = (WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
     sodium_init();
 }
 
 StreamReceiver::~StreamReceiver() {
     stop();
+    if (wsa_ok_) WSACleanup();
 }
 
 void StreamReceiver::daveDestroyLocked() {
     if (dave_dec_) { daveDecryptorDestroy(dave_dec_); dave_dec_ = nullptr; }
     if (dave_session_) { daveSessionDestroy(dave_session_); dave_session_ = nullptr; }
+    streamer_uid_.clear();
     dave_proto_ver_ = 0;
 }
 
 bool StreamReceiver::daveInit(uint16_t proto_ver, uint64_t channel_id, const char* self_user_id, uint32_t self_ssrc) {
-    local_ssrc_ = self_ssrc;
+    if (self_ssrc != 0) local_ssrc_.store(self_ssrc);
     std::lock_guard lk(dave_mtx_);
     dave_proto_ver_ = proto_ver;
     if (!dave_session_) dave_session_ = daveSessionCreate(nullptr, nullptr, nullptr, nullptr);
@@ -84,8 +89,11 @@ int32_t StreamReceiver::daveGetKeyPackage(uint8_t* out_buf, int32_t cap) {
     size_t len = 0;
     daveSessionGetMarshalledKeyPackage(dave_session_, &kp, &len);
     if (!kp || len == 0) return 0;
-    int32_t n = int32_t(std::min<size_t>(len, size_t(cap)));
-    std::memcpy(out_buf, kp, size_t(n));
+    int32_t n = 0;
+    if (len <= size_t(cap)) {
+        n = int32_t(len);
+        std::memcpy(out_buf, kp, len);
+    }
     daveFree(kp);
     return n;
 }
@@ -102,8 +110,11 @@ int32_t StreamReceiver::daveProcessProposals(const uint8_t* data, int32_t len, u
     size_t cwLen = 0;
     daveSessionProcessProposals(dave_session_, data, size_t(len), &cw, &cwLen);
     if (!cw || cwLen == 0) return 0;
-    int32_t n = (out_cw && cap > 0) ? int32_t(std::min<size_t>(cwLen, size_t(cap))) : 0;
-    if (n > 0) std::memcpy(out_cw, cw, size_t(n));
+    int32_t n = 0;
+    if (out_cw && cap > 0 && cwLen <= size_t(cap)) {
+        n = int32_t(cwLen);
+        std::memcpy(out_cw, cw, cwLen);
+    }
     daveFree(cw);
     return n;
 }
@@ -147,10 +158,15 @@ void StreamReceiver::daveExecuteTransition(uint16_t proto_ver) {
 }
 
 void StreamReceiver::setRemoteStreams(uint32_t video_ssrc, uint32_t audio_ssrc, const char* streamer_user_id) {
-    if (video_ssrc != 0) video_ssrc_.store(video_ssrc);
+    if (video_ssrc != 0) {
+        uint32_t prev = video_ssrc_.exchange(video_ssrc);
+        if (prev != 0 && prev != video_ssrc) {
+            reset_depack_.store(true);
+        }
+    }
     if (audio_ssrc != 0) {
         audio_ssrc_.store(audio_ssrc);
-        if (voice_) voice_->setUserVolume(audio_ssrc ^ 0x80000000u, stream_vol_.load());
+        if (voice_) voice_->setUserVolume(makeVoiceAudioKey(audio_ssrc), stream_vol_.load());
     }
     std::lock_guard lk(dave_mtx_);
     if (streamer_user_id && *streamer_user_id) {
@@ -171,27 +187,30 @@ void StreamReceiver::setVolume(float vol) {
     vol = std::clamp(vol, 0.0f, 2.0f);
     stream_vol_.store(vol);
     uint32_t as = audio_ssrc_.load();
-    if (voice_ && as != 0) voice_->setUserVolume(as ^ 0x80000000u, vol);
+    if (voice_ && as != 0) voice_->setUserVolume(makeVoiceAudioKey(as), vol);
 }
 
 bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t ssrc, HWND hwnd, std::string& out_ext_ip, uint16_t& out_ext_port) {
-    stop();
+    if (!ip || !*ip) return false;
+    std::lock_guard life(lifecycle_mtx_);
+    stopLocked();
     hwnd_ = hwnd;
-    local_ssrc_ = ssrc;
+    local_ssrc_.store(ssrc);
     rtcp_nonce_ = 1;
-    sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock_ == INVALID_SOCKET) return false;
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return false;
 
     int rcvBuf = 8 * 1024 * 1024;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
     DWORD timeoutMs = 1500;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
-    std::memset(&remote_, 0, sizeof(remote_));
-    remote_.sin_family = AF_INET;
-    remote_.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &remote_.sin_addr) != 1) {
-        stop();
+    sockaddr_in rem{};
+    rem.sin_family = AF_INET;
+    rem.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &rem.sin_addr) != 1) {
+        closesocket(s);
         return false;
     }
 
@@ -199,19 +218,19 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
     putBE16(req + 0, 0x0001);
     putBE16(req + 2, 70);
     putBE32(req + 4, ssrc);
-    if (sendto(sock_, reinterpret_cast<const char*>(req), sizeof(req), 0,
-               reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_)) != sizeof(req)) {
-        stop();
+    if (sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
+               reinterpret_cast<sockaddr*>(&rem), sizeof(rem)) != sizeof(req)) {
+        closesocket(s);
         return false;
     }
 
     uint8_t resp[128]{};
     sockaddr_in from{};
     int fromLen = sizeof(from);
-    int n = recvfrom(sock_, reinterpret_cast<char*>(resp), sizeof(resp), 0,
+    int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
                      reinterpret_cast<sockaddr*>(&from), &fromLen);
     if (n < 74 || getBE16(resp) != 0x0002) {
-        stop();
+        closesocket(s);
         return false;
     }
     char ipBuf[65]{};
@@ -220,8 +239,13 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
     out_ext_port = getBE16(resp + 72);
 
     DWORD rxTimeout = 4;
-    setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rxTimeout), sizeof(rxTimeout));
-    optimizeUdpSocket(sock_, true, &remote_);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rxTimeout), sizeof(rxTimeout));
+    ULONG flowId = 0;
+    optimizeUdpSocket(s, true, &rem, &flowId);
+
+    sock_ = s;
+    qos_flow_id_ = flowId;
+    remote_ = rem;
 
     {
         std::lock_guard lk(stats_mtx_);
@@ -237,6 +261,8 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
 }
 
 void StreamReceiver::setKey(const uint8_t key[32], bool use_xchacha_rtpsize) {
+    if (!key) return;
+    std::lock_guard lk(key_mtx_);
     std::memcpy(key_, key, 32);
     use_xchacha_ = use_xchacha_rtpsize;
     has_key_.store(true);
@@ -250,15 +276,24 @@ void StreamReceiver::resize(int32_t w, int32_t h) {
 }
 
 void StreamReceiver::stop() {
+    std::lock_guard life(lifecycle_mtx_);
+    stopLocked();
+}
+
+void StreamReceiver::stopLocked() {
     running_.store(false);
     has_key_.store(false);
     video_ssrc_.store(0);
     audio_ssrc_.store(0);
+    reset_depack_.store(false);
+
+    if (sock_ != INVALID_SOCKET) shutdown(sock_, SD_BOTH);
+    if (worker_.joinable()) worker_.join();
     if (sock_ != INVALID_SOCKET) {
+        removeUdpQosFlow(sock_, qos_flow_id_);
         closesocket(sock_);
         sock_ = INVALID_SOCKET;
     }
-    if (worker_.joinable()) worker_.join();
     {
         std::lock_guard lk(dave_mtx_);
         daveDestroyLocked();
@@ -289,15 +324,35 @@ void StreamReceiver::rxDecodeLoop() {
 
     UINT resetToken = 0;
     ComPtr<IMFDXGIDeviceManager> dxgiMgr;
-    if (dev) {
-        MFCreateDXGIDeviceManager(&resetToken, &dxgiMgr);
+    if (dev && SUCCEEDED(MFCreateDXGIDeviceManager(&resetToken, &dxgiMgr)) && dxgiMgr) {
         dxgiMgr->ResetDevice(dev.Get(), resetToken);
     }
 
+    // Obtain DXGI factory from dev's own adapter (MSDN multi-adapter best practice)
     ComPtr<IDXGIFactory2> fac;
-    CreateDXGIFactory1(IID_PPV_ARGS(&fac));
+    if (dev) {
+        ComPtr<IDXGIDevice> dxgiDev;
+        ComPtr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(dev.As(&dxgiDev)) && SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
+            adapter->GetParent(IID_PPV_ARGS(&fac));
+        }
+    }
+    if (!fac) CreateDXGIFactory1(IID_PPV_ARGS(&fac));
+
     ComPtr<IDXGISwapChain1> swap;
     UINT sw = 1280, sh = 720;
+    auto clearSwapBlack = [&]() {
+        if (!swap || !dev || !ctx) return;
+        ComPtr<ID3D11Texture2D> bb;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&bb))) &&
+            SUCCEEDED(dev->CreateRenderTargetView(bb.Get(), nullptr, &rtv))) {
+            const float blk[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            ctx->ClearRenderTargetView(rtv.Get(), blk);
+            swap->Present(0, 0);
+        }
+    };
+
     if (dev && fac && hwnd_ && IsWindow(hwnd_)) {
         RECT rc{};
         GetClientRect(hwnd_, &rc);
@@ -312,16 +367,8 @@ void StreamReceiver::rxDecodeLoop() {
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        if (SUCCEEDED(fac->CreateSwapChainForHwnd(dev.Get(), hwnd_, &scd, nullptr, nullptr, &swap)) && swap && ctx) {
-            // Present an immediate opaque black frame so DWM NEVER shows a transparent hole behind the window!
-            ComPtr<ID3D11Texture2D> bb;
-            ComPtr<ID3D11RenderTargetView> rtv;
-            if (SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&bb))) &&
-                SUCCEEDED(dev->CreateRenderTargetView(bb.Get(), nullptr, &rtv))) {
-                const float blk[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-                ctx->ClearRenderTargetView(rtv.Get(), blk);
-                swap->Present(0, 0);
-            }
+        if (SUCCEEDED(fac->CreateSwapChainForHwnd(dev.Get(), hwnd_, &scd, nullptr, nullptr, &swap))) {
+            clearSwapBlack();
         }
     }
 
@@ -332,10 +379,11 @@ void StreamReceiver::rxDecodeLoop() {
         if (SUCCEEDED(decMft->GetAttributes(&attrs))) attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
 
         ComPtr<IMFMediaType> mtIn;
-        MFCreateMediaType(&mtIn);
-        mtIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        mtIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-        decMft->SetInputType(0, mtIn.Get(), 0);
+        if (SUCCEEDED(MFCreateMediaType(&mtIn)) && mtIn) {
+            mtIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            mtIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+            decMft->SetInputType(0, mtIn.Get(), 0);
+        }
 
         for (DWORD i = 0; ; ++i) {
             ComPtr<IMFMediaType> mtOut;
@@ -356,6 +404,7 @@ void StreamReceiver::rxDecodeLoop() {
     ComPtr<ID3D11VideoProcessor> vp;
     if (dev) { dev.As(&vdev); ctx.As(&vctx); }
     UINT curDecW = 0, curDecH = 0;
+    RECT dispAperture{ 0, 0, 0, 0 }; // Exact visible crop (fixes 1920x1088 DXVA bottom green bar -> 1920x1080!)
 
     VideoDepacketizer depack;
     VideoDepacketizer::FrameOut readyFrame;
@@ -363,24 +412,23 @@ void StreamReceiver::rxDecodeLoop() {
     uint8_t pkt[2048];
     uint8_t plain[2048];
     std::vector<uint8_t> daveBuf(2 * 1024 * 1024);
-    std::vector<uint8_t> cachedSpsPps;
+    std::vector<uint8_t> cachedSps;
+    std::vector<uint8_t> cachedPps;
     std::vector<uint8_t> prependBuf;
 
     int64_t framesDecoded = 0;
     int64_t framesWindow = 0;
     int64_t bytesWindow = 0;
     int64_t rxUdpPkts = 0;
-    int64_t depackFrames = 0;
     int64_t daveOk = 0;
     int64_t daveFail = 0;
     int64_t kfSkipped = 0;
     int64_t mftFed = 0;
-    uint8_t lastVideoPt = 0;
     uint8_t lastNaluType = 0;
     int64_t lastRatchetRetryMs = 0;
     auto windowStart = std::chrono::steady_clock::now();
     int64_t lastPliMs = 0;
-    bool sentKeepalive = false;
+    int64_t lastKeepaliveMs = 0;
 
     auto updateDiagText = [&]() {
         char diag[64]{};
@@ -392,12 +440,11 @@ void StreamReceiver::rxDecodeLoop() {
     };
 
     auto cacheSpsPpsFromFrame = [&](const uint8_t* data, size_t len) {
-        std::vector<uint8_t> found;
         size_t pos = 0;
-        while (pos + 4 <= len) {
+        while (pos + 3 < len) {
             size_t sc = 0;
             if (data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 1) sc = 3;
-            else if (data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 0 && data[pos + 3] == 1) sc = 4;
+            else if (pos + 4 <= len && data[pos] == 0 && data[pos + 1] == 0 && data[pos + 2] == 0 && data[pos + 3] == 1) sc = 4;
             if (sc == 0) { pos++; continue; }
             size_t start = pos + sc;
             size_t next = start;
@@ -409,37 +456,44 @@ void StreamReceiver::rxDecodeLoop() {
             if (next + 3 >= len) next = len;
             if (start < next) {
                 uint8_t nt = data[start] & 0x1F;
-                if (nt == 7 || nt == 8) {
-                    found.push_back(0); found.push_back(0); found.push_back(0); found.push_back(1);
-                    found.insert(found.end(), data + start, data + next);
+                if (nt == 7) {
+                    cachedSps.assign({0, 0, 0, 1});
+                    cachedSps.insert(cachedSps.end(), data + start, data + next);
+                } else if (nt == 8) {
+                    cachedPps.assign({0, 0, 0, 1});
+                    cachedPps.insert(cachedPps.end(), data + start, data + next);
                 }
             }
             pos = next;
         }
-        if (!found.empty()) cachedSpsPps = std::move(found);
     };
 
-    auto frameHasSps = [](const uint8_t* data, size_t len) -> bool {
-        for (size_t i = 0; i + 4 < len; ++i) {
+    auto frameHasNalu = [](const uint8_t* data, size_t len, uint8_t targetNt) -> bool {
+        for (size_t i = 0; i + 3 < len; ++i) {
             if (data[i] == 0 && data[i + 1] == 0) {
-                size_t sc = (data[i + 2] == 1) ? 3 : ((data[i + 2] == 0 && data[i + 3] == 1) ? 4 : 0);
-                if (sc > 0 && i + sc < len && ((data[i + sc] & 0x1F) == 7)) return true;
+                size_t sc = (data[i + 2] == 1) ? 3 : ((i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1) ? 4 : 0);
+                if (sc > 0 && i + sc < len && ((data[i + sc] & 0x1F) == targetNt)) return true;
             }
         }
         return false;
     };
 
-    // Send ENCRYPTED RTCP PLI per Discord aead_xchacha20_poly1305_rtpsize spec (8B RTCP header AAD + encrypted payload + 16B tag + 4B LE nonce)
     auto sendEncryptedRtcpPli = [&](uint32_t mediaSsrc) {
         if (sock_ == INVALID_SOCKET || !has_key_.load() || mediaSsrc == 0) return;
+        uint8_t localKey[32];
+        bool useXchacha = true;
+        {
+            std::lock_guard klk(key_mtx_);
+            std::memcpy(localKey, key_, 32);
+            useXchacha = use_xchacha_;
+        }
+
         uint8_t outPkt[64]{};
-        // 8-byte unencrypted RTCP header (AAD)
         outPkt[0] = 0x81; // V=2, P=0, FMT=1 (PLI)
         outPkt[1] = 206;  // PT=PSFB
         putBE16(outPkt + 2, 2);
-        putBE32(outPkt + 4, local_ssrc_);
+        putBE32(outPkt + 4, local_ssrc_.load());
 
-        // 4-byte RTCP PLI body (Media SSRC) -> encrypted!
         uint8_t body[4];
         putBE32(body, mediaSsrc);
 
@@ -447,14 +501,14 @@ void StreamReceiver::rxDecodeLoop() {
         uint8_t nonce[24]{};
         std::memcpy(nonce, &ctr, 4);
         int totalLen = 0;
-        if (use_xchacha_) {
+        if (useXchacha) {
             unsigned long long clen = 0;
             if (crypto_aead_xchacha20poly1305_ietf_encrypt(
-                    outPkt + 8, &clen, body, 4, outPkt, 8, nullptr, nonce, key_) != 0) return;
+                    outPkt + 8, &clen, body, 4, outPkt, 8, nullptr, nonce, localKey) != 0) return;
             std::memcpy(outPkt + 8 + clen, &ctr, 4);
             totalLen = int(8 + clen + 4);
         } else {
-            if (crypto_secretbox_easy(outPkt + 8, body, 4, nonce, key_) != 0) return;
+            if (crypto_secretbox_easy(outPkt + 8, body, 4, nonce, localKey) != 0) return;
             std::memcpy(outPkt + 8 + 4 + crypto_secretbox_MACBYTES, &ctr, 4);
             totalLen = 8 + 4 + crypto_secretbox_MACBYTES + 4;
         }
@@ -462,87 +516,13 @@ void StreamReceiver::rxDecodeLoop() {
                reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
     };
 
-    auto decodeAndPresent = [&](const VideoDepacketizer::FrameOut& fr, uint32_t mediaSsrc) {
-        if (fr.annexb.empty() || !decMft) return;
-        depackFrames++;
-        const uint8_t* frameData = fr.annexb.data();
-        size_t frameLen = fr.annexb.size();
-
-        // DAVE E2EE Video Frame Decryption (only pass clean decrypted Annex-B into NVDEC!)
-        {
-            std::lock_guard lk(dave_mtx_);
-            if (dave_dec_ && dave_proto_ver_ > 0) {
-                size_t w = 0;
-                if (daveDecryptorDecrypt(dave_dec_, DAVE_MEDIA_TYPE_VIDEO, frameData, frameLen,
-                                         daveBuf.data(), daveBuf.size(), &w) == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS && w > 0) {
-                    frameData = daveBuf.data();
-                    frameLen = w;
-                    daveOk++;
-                } else {
-                    daveFail++;
-                    // Lazy ratchet refresh in case MLS Welcome arrived before OP 12 set streamer_uid_
-                    int64_t nowMs = steadyMs();
-                    if (dave_session_ && !streamer_uid_.empty() && nowMs - lastRatchetRetryMs > 400) {
-                        lastRatchetRetryMs = nowMs;
-                        DAVEKeyRatchetHandle kr = daveSessionGetKeyRatchet(dave_session_, streamer_uid_.c_str());
-                        if (kr) {
-                            daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
-                            daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
-                            daveKeyRatchetDestroy(kr);
-                        }
-                    }
-                    depack.setNeedKeyframe(true);
-                    return;
-                }
-            }
-        }
-
-        // Cache SPS/PPS so NVDEC always has codec config even if IDR arrives without repeated SPS
-        cacheSpsPpsFromFrame(frameData, frameLen);
-        if (frameLen >= 5 && frameData[0] == 0 && frameData[1] == 0) {
-            lastNaluType = (frameData[2] == 1 ? frameData[3] : frameData[4]) & 0x1F;
-        }
-
-        // Gate on clean IDR/SPS keyframe after start or packet loss so NVDEC NEVER smears macroblocks!
-        if (depack.needKeyframe()) {
-            if (!VideoDepacketizer::hasIdrOrSps(frameData, frameLen)) {
-                kfSkipped++;
-                int64_t nowMs = steadyMs();
-                if (nowMs - lastPliMs > 450) {
-                    sendEncryptedRtcpPli(mediaSsrc);
-                    lastPliMs = nowMs;
-                }
-                return;
-            }
-            if (!frameHasSps(frameData, frameLen) && !cachedSpsPps.empty()) {
-                prependBuf.clear();
-                prependBuf.insert(prependBuf.end(), cachedSpsPps.begin(), cachedSpsPps.end());
-                prependBuf.insert(prependBuf.end(), frameData, frameData + frameLen);
-                frameData = prependBuf.data();
-                frameLen = prependBuf.size();
-            }
-            depack.setNeedKeyframe(false);
-        }
-
-        auto tDec0 = std::chrono::steady_clock::now();
-        mftFed++;
-        ComPtr<IMFSample> inSamp;
-        ComPtr<IMFMediaBuffer> mb;
-        if (SUCCEEDED(MFCreateSample(&inSamp)) && SUCCEEDED(MFCreateMemoryBuffer(DWORD(frameLen), &mb))) {
-            BYTE* dst = nullptr;
-            if (SUCCEEDED(mb->Lock(&dst, nullptr, nullptr))) {
-                std::memcpy(dst, frameData, frameLen);
-                mb->Unlock();
-                mb->SetCurrentLength(DWORD(frameLen));
-                inSamp->AddBuffer(mb.Get());
-                decMft->ProcessInput(0, inSamp.Get(), 0);
-            }
-        }
-
-        for (int drain = 0; drain < 4; ++drain) {
+    auto drainDecoderOutputs = [&]() {
+        if (!decMft) return;
+        for (int drain = 0; drain < 6; ++drain) {
             MFT_OUTPUT_DATA_BUFFER outBuf{};
             DWORD status = 0;
             HRESULT ohr = decMft->ProcessOutput(0, 1, &outBuf, &status);
+            if (outBuf.pEvents) { outBuf.pEvents->Release(); outBuf.pEvents = nullptr; }
             if (ohr == MF_E_TRANSFORM_STREAM_CHANGE) {
                 for (DWORD i = 0; ; ++i) {
                     ComPtr<IMFMediaType> mtOut;
@@ -553,6 +533,17 @@ void StreamReceiver::rxDecodeLoop() {
                         UINT32 dw = 0, dh = 0;
                         MFGetAttributeSize(mtOut.Get(), MF_MT_FRAME_SIZE, &dw, &dh);
                         curDecW = dw; curDecH = dh;
+                        MFVideoArea area{};
+                        UINT32 areaSize = 0;
+                        if (SUCCEEDED(mtOut->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&area), sizeof(area), &areaSize)) &&
+                            areaSize >= sizeof(area) && area.Area.cx > 0 && area.Area.cy > 0) {
+                            dispAperture.left = area.OffsetX.value;
+                            dispAperture.top = area.OffsetY.value;
+                            dispAperture.right = area.OffsetX.value + area.Area.cx;
+                            dispAperture.bottom = area.OffsetY.value + area.Area.cy;
+                        } else {
+                            dispAperture = { 0, 0, LONG(dw), LONG(dh) };
+                        }
                         vp.Reset(); vpenum.Reset();
                         break;
                     }
@@ -572,6 +563,9 @@ void StreamReceiver::rxDecodeLoop() {
                     decTex->GetDesc(&td);
                     if (curDecW != td.Width || curDecH != td.Height || !vp) {
                         curDecW = td.Width; curDecH = td.Height;
+                        if (dispAperture.right <= dispAperture.left || dispAperture.right > LONG(curDecW) || dispAperture.bottom > LONG(curDecH)) {
+                            dispAperture = { 0, 0, LONG(curDecW), LONG(curDecH) };
+                        }
                         vp.Reset(); vpenum.Reset();
                         D3D11_VIDEO_PROCESSOR_CONTENT_DESC vcd{};
                         vcd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -592,7 +586,9 @@ void StreamReceiver::rxDecodeLoop() {
                         ComPtr<ID3D11VideoProcessorOutputView> pout;
                         if (SUCCEEDED(vdev->CreateVideoProcessorInputView(decTex.Get(), vpenum.Get(), &ivd, &pin)) &&
                             SUCCEEDED(vdev->CreateVideoProcessorOutputView(backBuf.Get(), vpenum.Get(), &ovd, &pout))) {
-                            float srcAsp = float(curDecW) / float(std::max<UINT>(1, curDecH));
+                            LONG visW = std::max<LONG>(1, dispAperture.right - dispAperture.left);
+                            LONG visH = std::max<LONG>(1, dispAperture.bottom - dispAperture.top);
+                            float srcAsp = float(visW) / float(visH);
                             float dstAsp = float(sw) / float(std::max<UINT>(1, sh));
                             RECT dstRc{ 0, 0, LONG(sw), LONG(sh) };
                             if (srcAsp > dstAsp) {
@@ -607,21 +603,109 @@ void StreamReceiver::rxDecodeLoop() {
                             D3D11_VIDEO_COLOR bg{};
                             bg.RGBA = { 0.0f, 0.0f, 0.0f, 1.0f };
                             vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bg);
+                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &dispAperture);
                             vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
                             D3D11_VIDEO_PROCESSOR_STREAM pst{};
                             pst.Enable = TRUE;
                             pst.pInputSurface = pin.Get();
                             vctx->VideoProcessorBlt(vp.Get(), pout.Get(), 0, 1, &pst);
                             swap->Present(0, 0);
+                            framesDecoded++;
+                            framesWindow++;
                         }
                     }
                 }
             }
             outBuf.pSample->Release();
-            if (outBuf.pEvents) outBuf.pEvents->Release();
-            framesDecoded++;
-            framesWindow++;
         }
+    };
+
+    auto decodeAndPresent = [&](const VideoDepacketizer::FrameOut& fr, uint32_t mediaSsrc) {
+        if (fr.annexb.empty() || !decMft) return;
+        const uint8_t* frameData = fr.annexb.data();
+        size_t frameLen = fr.annexb.size();
+
+        // DAVE E2EE Video Frame Decryption (dynamic buffer size handles >2MB 4K IDR keyframes cleanly!)
+        {
+            std::lock_guard lk(dave_mtx_);
+            if (dave_dec_ && dave_proto_ver_ > 0) {
+                size_t needCap = daveDecryptorGetMaxPlaintextByteSize(dave_dec_, DAVE_MEDIA_TYPE_VIDEO, frameLen);
+                if (needCap > daveBuf.size()) daveBuf.resize(std::max(needCap, frameLen + 1024));
+                size_t w = 0;
+                if (daveDecryptorDecrypt(dave_dec_, DAVE_MEDIA_TYPE_VIDEO, frameData, frameLen,
+                                         daveBuf.data(), daveBuf.size(), &w) == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS && w > 0) {
+                    frameData = daveBuf.data();
+                    frameLen = w;
+                    daveOk++;
+                } else {
+                    daveFail++;
+                    int64_t nowMs = steadyMs();
+                    if (dave_session_ && !streamer_uid_.empty() && nowMs - lastRatchetRetryMs > 400) {
+                        lastRatchetRetryMs = nowMs;
+                        DAVEKeyRatchetHandle kr = daveSessionGetKeyRatchet(dave_session_, streamer_uid_.c_str());
+                        if (kr) {
+                            daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
+                            daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
+                            daveKeyRatchetDestroy(kr);
+                        }
+                    }
+                    depack.setNeedKeyframe(true);
+                    return;
+                }
+            }
+        }
+
+        // Cache SPS(7) and PPS(8) separately so NVDEC always has codec config even if IDR omits repeated SPS/PPS
+        cacheSpsPpsFromFrame(frameData, frameLen);
+        if (frameLen >= 5 && frameData[0] == 0 && frameData[1] == 0) {
+            lastNaluType = (frameData[2] == 1 ? frameData[3] : frameData[4]) & 0x1F;
+        }
+
+        // Gate strictly on an actual IDR (NAL type 5) + valid SPS/PPS (in-frame or cached) so NVDEC never smears or hangs!
+        if (depack.needKeyframe()) {
+            bool hasIdr = VideoDepacketizer::hasIdr(frameData, frameLen);
+            bool hasSps = frameHasNalu(frameData, frameLen, 7);
+            bool hasPps = frameHasNalu(frameData, frameLen, 8);
+            bool configReady = (hasSps || !cachedSps.empty()) && (hasPps || !cachedPps.empty());
+            if (!hasIdr || !configReady) {
+                kfSkipped++;
+                int64_t nowMs = steadyMs();
+                if (nowMs - lastPliMs > 450) {
+                    sendEncryptedRtcpPli(mediaSsrc);
+                    lastPliMs = nowMs;
+                }
+                return;
+            }
+            if ((!hasSps && !cachedSps.empty()) || (!hasPps && !cachedPps.empty())) {
+                prependBuf.clear();
+                if (!hasSps) prependBuf.insert(prependBuf.end(), cachedSps.begin(), cachedSps.end());
+                if (!hasPps) prependBuf.insert(prependBuf.end(), cachedPps.begin(), cachedPps.end());
+                prependBuf.insert(prependBuf.end(), frameData, frameData + frameLen);
+                frameData = prependBuf.data();
+                frameLen = prependBuf.size();
+            }
+            depack.setNeedKeyframe(false);
+        }
+
+        auto tDec0 = std::chrono::steady_clock::now();
+        mftFed++;
+        ComPtr<IMFSample> inSamp;
+        ComPtr<IMFMediaBuffer> mb;
+        if (SUCCEEDED(MFCreateSample(&inSamp)) && SUCCEEDED(MFCreateMemoryBuffer(DWORD(frameLen), &mb))) {
+            BYTE* dst = nullptr;
+            if (SUCCEEDED(mb->Lock(&dst, nullptr, nullptr))) {
+                std::memcpy(dst, frameData, frameLen);
+                mb->Unlock();
+                mb->SetCurrentLength(DWORD(frameLen));
+                inSamp->AddBuffer(mb.Get());
+                HRESULT phr = decMft->ProcessInput(0, inSamp.Get(), 0);
+                if (phr == MF_E_NOTACCEPTING) {
+                    drainDecoderOutputs();
+                    decMft->ProcessInput(0, inSamp.Get(), 0);
+                }
+            }
+        }
+        drainDecoderOutputs();
 
         float decMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tDec0).count();
         auto now = std::chrono::steady_clock::now();
@@ -629,8 +713,10 @@ void StreamReceiver::rxDecodeLoop() {
         if (sec >= 0.5f) {
             {
                 std::lock_guard lk(stats_mtx_);
-                stats_.width = int32_t(curDecW);
-                stats_.height = int32_t(curDecH);
+                LONG visW = dispAperture.right - dispAperture.left;
+                LONG visH = dispAperture.bottom - dispAperture.top;
+                stats_.width = int32_t(visW > 0 ? visW : LONG(curDecW));
+                stats_.height = int32_t(visH > 0 ? visH : LONG(curDecH));
                 stats_.fps = float(framesWindow) / sec;
                 stats_.bitrate_kbps = (float(bytesWindow) * 8.0f / 1000.0f) / sec;
                 stats_.decode_ms = decMs;
@@ -647,12 +733,19 @@ void StreamReceiver::rxDecodeLoop() {
     int64_t lastDiagMs = steadyMs();
 
     while (running_.load()) {
+        if (reset_depack_.exchange(false)) {
+            depack.reset();
+            cachedSps.clear();
+            cachedPps.clear();
+        }
+
         int32_t rw = pending_w_.exchange(0);
         int32_t rh = pending_h_.exchange(0);
         if (swap && rw > 16 && rh > 16) {
             sw = UINT(rw); sh = UINT(rh);
             swap->ResizeBuffers(2, sw, sh, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
             vp.Reset(); vpenum.Reset();
+            clearSwapBlack();
         }
 
         int64_t nowMs = steadyMs();
@@ -661,11 +754,12 @@ void StreamReceiver::rxDecodeLoop() {
             updateDiagText();
         }
         if (has_key_.load()) {
-            if (!sentKeepalive) {
+            // Periodic 12s UDP NAT keepalive so strict NATs never time out watched streams!
+            if (nowMs - lastKeepaliveMs >= 12000) {
                 uint8_t ka[8] = { 0x13, 0x37, 0xCA, 0xFE, 0, 0, 0, 1 };
                 sendto(sock_, reinterpret_cast<const char*>(ka), sizeof(ka), 0,
                        reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
-                sentKeepalive = true;
+                lastKeepaliveMs = nowMs;
             }
             uint32_t vs = video_ssrc_.load();
             if (vs != 0 && depack.needKeyframe() && (nowMs - lastPliMs > 600)) {
@@ -679,11 +773,14 @@ void StreamReceiver::rxDecodeLoop() {
         int n = recvfrom(sock_, reinterpret_cast<char*>(pkt), sizeof(pkt), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n < 28 || !has_key_.load()) {
-            bool wantPli = false;
-            while (depack.tryEmit(steadyMs(), readyFrame, wantPli)) {
+            bool anyPli = false;
+            bool stepPli = false;
+            while (depack.tryEmit(steadyMs(), readyFrame, stepPli)) {
+                anyPli |= stepPli;
                 decodeAndPresent(readyFrame, video_ssrc_.load());
             }
-            if (wantPli && (steadyMs() - lastPliMs > 400)) {
+            anyPli |= stepPli;
+            if (anyPli && (steadyMs() - lastPliMs > 400)) {
                 sendEncryptedRtcpPli(video_ssrc_.load());
                 lastPliMs = steadyMs();
             }
@@ -696,45 +793,63 @@ void StreamReceiver::rxDecodeLoop() {
         bool hasPad = (pkt[0] & 0x20) != 0;
         uint8_t cc = pkt[0] & 0x0F;
         bool ext = (pkt[0] & 0x10) != 0;
-        int hdrLen = 12 + cc * 4;
-        uint16_t extWords = 0;
-        if (ext && n > hdrLen + 4) {
-            extWords = getBE16(pkt + hdrLen + 2);
-            hdrLen += 4;
-        }
-        if (n <= hdrLen + 20) continue;
-
         uint16_t seq = getBE16(pkt + 2);
         uint32_t rtpTs = getBE32(pkt + 4);
         uint32_t ssrc = getBE32(pkt + 8);
         uint8_t nonce[24]{};
         std::memcpy(nonce, pkt + n - 4, 4);
 
-        int cipherLen = n - hdrLen - 4;
+        uint8_t localKey[32];
+        bool useXchacha = true;
+        {
+            std::lock_guard klk(key_mtx_);
+            std::memcpy(localKey, key_, 32);
+            useXchacha = use_xchacha_;
+        }
+
         unsigned long long plen = 0;
         bool ok = false;
-        if (use_xchacha_) {
+        int payOff = 0;
+
+        if (useXchacha) {
+            int hdrLen = 12 + cc * 4;
+            uint16_t extWords = 0;
+            if (ext && n > hdrLen + 4) {
+                extWords = getBE16(pkt + hdrLen + 2);
+                hdrLen += 4;
+            }
+            if (n < hdrLen + 20) continue; // allow exact 0-byte BWE probe packets (n == hdrLen + 20)!
+            int cipherLen = n - hdrLen - 4;
             ok = crypto_aead_xchacha20poly1305_ietf_decrypt(
                      plain, &plen, nullptr,
                      pkt + hdrLen, size_t(cipherLen),
                      pkt, size_t(hdrLen),
-                     nonce, key_) == 0;
+                     nonce, localKey) == 0;
+            payOff = ext ? int(extWords) * 4 : 0;
         } else {
-            ok = crypto_secretbox_open_easy(plain, pkt + hdrLen, size_t(cipherLen), nonce, key_) == 0;
+            int hdrLen = 12;
+            if (n < hdrLen + int(crypto_secretbox_MACBYTES) + 4) continue;
+            int cipherLen = n - hdrLen - 4;
+            ok = crypto_secretbox_open_easy(plain, pkt + hdrLen, size_t(cipherLen), nonce, localKey) == 0;
             plen = size_t(cipherLen - crypto_secretbox_MACBYTES);
+            if (ok) {
+                payOff = cc * 4;
+                if (ext && payOff + 4 <= int(plen)) {
+                    uint16_t extWords = getBE16(plain + payOff + 2);
+                    payOff += 4 + int(extWords) * 4;
+                }
+            }
         }
-        if (!ok || plen == 0) continue;
+        if (!ok) continue;
         rxUdpPkts++;
 
-        // CRITICAL: Strip RFC 3550 RTP Padding bytes if P bit (0x20) is set!
+        // Strip RFC 3550 RTP Padding bytes if P bit (0x20) is set!
         if (hasPad && plen > 0) {
             int padLen = int(plain[plen - 1]);
             if (padLen > 0 && padLen <= int(plen)) plen -= size_t(padLen);
         }
 
-        int payOff = ext ? int(extWords) * 4 : 0;
         if (payOff >= int(plen)) {
-            // 0-byte Discord BWE padding probe packet! Record seq so VideoDepacketizer doesn't mistake it for loss!
             uint32_t vsCheck = video_ssrc_.load();
             if ((pt == 101 || pt == 103) && (vsCheck == 0 || ssrc == vsCheck)) depack.noteEmptyProbeSeq(seq);
             continue;
@@ -743,15 +858,19 @@ void StreamReceiver::rxDecodeLoop() {
         int payLen = int(plen) - payOff;
         bytesWindow += payLen;
 
-        // Stream audio (PT 120) -> DAVE decrypt + feed into WASAPI mixer
+        // Stream audio (PT 120) -> DAVE decrypt + feed into slot-isolated WASAPI mixer key (zero cross-slot collision!)
         if (pt == 120 && voice_) {
-            if (audio_ssrc_.load() == 0) {
+            uint32_t expectedAs = audio_ssrc_.load();
+            if (expectedAs == 0) {
                 audio_ssrc_.store(ssrc);
-                voice_->setUserVolume(ssrc ^ 0x80000000u, stream_vol_.load());
+                expectedAs = ssrc;
+                voice_->setUserVolume(makeVoiceAudioKey(ssrc), stream_vol_.load());
+            } else if (ssrc != expectedAs) {
+                continue;
             }
             const uint8_t* opPtr = pay;
             int opLen = payLen;
-            {
+            if (!isSilenceFrame(pay, payLen)) {
                 std::lock_guard lk(dave_mtx_);
                 if (dave_dec_ && dave_proto_ver_ > 0) {
                     size_t w = 0;
@@ -759,16 +878,28 @@ void StreamReceiver::rxDecodeLoop() {
                                              daveBuf.data(), daveBuf.size(), &w) == DAVE_DECRYPTOR_RESULT_CODE_SUCCESS && w > 0) {
                         opPtr = daveBuf.data();
                         opLen = int(w);
+                    } else {
+                        // NEVER pass failed DAVE ciphertext into Opus decoder!
+                        int64_t tNow = steadyMs();
+                        if (dave_session_ && !streamer_uid_.empty() && tNow - lastRatchetRetryMs > 400) {
+                            lastRatchetRetryMs = tNow;
+                            DAVEKeyRatchetHandle kr = daveSessionGetKeyRatchet(dave_session_, streamer_uid_.c_str());
+                            if (kr) {
+                                daveDecryptorTransitionToPassthroughMode(dave_dec_, false);
+                                daveDecryptorTransitionToKeyRatchet(dave_dec_, kr);
+                                daveKeyRatchetDestroy(kr);
+                            }
+                        }
+                        continue;
                     }
                 }
             }
-            voice_->onRemoteOpus(ssrc ^ 0x80000000u, seq, opPtr, opLen);
+            voice_->onRemoteOpus(makeVoiceAudioKey(ssrc), seq, opPtr, opLen);
             continue;
         }
 
-        // Stream video H.264 (PT 101 / 103; skip RTX 102/104 and secondary simulcast SSRCs!) -> Reorder Buffer -> Clean Annex-B -> DAVE -> NVDEC!
+        // Stream video H.264 (PT 101 / 103; skip RTX 102/104 and secondary simulcast SSRCs)
         if (pt != 101 && pt != 103) continue;
-        lastVideoPt = pt;
         uint32_t targetVssrc = video_ssrc_.load();
         if (targetVssrc == 0) {
             video_ssrc_.store(ssrc);
@@ -777,16 +908,29 @@ void StreamReceiver::rxDecodeLoop() {
             continue;
         }
 
-        bool wantPli = false;
-        if (depack.pushPacket(seq, rtpTs, marker, pay, payLen, steadyMs(), readyFrame, wantPli)) {
+        bool anyPli = false;
+        bool stepPli = false;
+        if (depack.pushPacket(seq, rtpTs, marker, pay, payLen, steadyMs(), readyFrame, stepPli)) {
+            anyPli |= stepPli;
             decodeAndPresent(readyFrame, ssrc);
+            while (depack.tryEmit(steadyMs(), readyFrame, stepPli)) {
+                anyPli |= stepPli;
+                decodeAndPresent(readyFrame, ssrc);
+            }
         }
-        if (wantPli && (steadyMs() - lastPliMs > 400)) {
+        anyPli |= stepPli;
+        if (anyPli && (steadyMs() - lastPliMs > 400)) {
             sendEncryptedRtcpPli(ssrc);
             lastPliMs = steadyMs();
         }
     }
 
+    if (decMft) {
+        decMft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        ComPtr<IMFShutdown> shut;
+        if (SUCCEEDED(decMft.As(&shut))) shut->Shutdown();
+    }
     decMft.Reset();
     dxgiMgr.Reset();
     swap.Reset();

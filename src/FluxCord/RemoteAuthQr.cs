@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -8,17 +7,15 @@ namespace FluxCord;
 
 /// <summary>
 /// Discord Remote Auth Gateway v2 (QR Code Login).
-/// Connects to wss://remote-auth-gateway.discord.gg/?v=2, performs RSA-2048 OAEP-SHA256 handshake,
-/// generates https://discord.com/ra/&lt;fingerprint&gt; QR matrix, and exchanges ticket for Discord token.
+/// Full WebSocket EndOfMessage reassembly + serialized sends + clean lifecycle disposal.
 /// </summary>
 public sealed class RemoteAuthQr
 {
     public static readonly RemoteAuthQr Instance = new();
 
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly object _lifeLock = new();
     private CancellationTokenSource? _cts;
-    private RSA? _rsa;
-    private ClientWebSocket? _ws;
 
     public bool[,]? Matrix { get; private set; }
     public string Status { get; private set; } = "Генерация QR-кода...";
@@ -40,60 +37,90 @@ public sealed class RemoteAuthQr
 
     public void Start()
     {
-        Stop();
-        IsRunning = true;
-        IsExpired = false;
-        ScannedUser = "";
-        Matrix = null;
-        Status = "Подключение к Discord...";
-        ExpiresAtTick = 0;
+        CancellationToken ct;
+        lock (_lifeLock)
+        {
+            StopLocked();
+            IsRunning = true;
+            IsExpired = false;
+            ScannedUser = "";
+            Matrix = null;
+            Status = "Подключение к Discord...";
+            ExpiresAtTick = 0;
+            _cts = new CancellationTokenSource();
+            ct = _cts.Token;
+        }
         Notify();
-
-        _cts = new CancellationTokenSource();
-        var ct = _cts.Token;
-
         _ = Task.Run(() => RunAsync(ct), ct);
     }
 
     public void Stop()
     {
+        lock (_lifeLock) StopLocked();
+    }
+
+    private void StopLocked()
+    {
         IsRunning = false;
-        try { _cts?.Cancel(); } catch { }
-        try { _ws?.Dispose(); } catch { }
-        try { _rsa?.Dispose(); } catch { }
-        _ws = null;
-        _rsa = null;
+        var old = _cts;
+        _cts = null;
+        if (old != null)
+        {
+            try { old.Cancel(); } catch { }
+            try { old.Dispose(); } catch { }
+        }
     }
 
     private async Task RunAsync(CancellationToken ct)
     {
+        using var rsa = RSA.Create(2048);
+        using var ws = new ClientWebSocket();
+        using var sendLock = new SemaphoreSlim(1, 1);
+
+        async Task SendJsonAsync(string json)
+        {
+            if (ws.State != WebSocketState.Open || ct.IsCancellationRequested) return;
+            await sendLock.WaitAsync(ct);
+            try
+            {
+                if (ws.State == WebSocketState.Open)
+                    await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, ct);
+            }
+            finally { sendLock.Release(); }
+        }
+
         try
         {
-            _rsa = RSA.Create(2048);
-            string pubKeyB64 = Convert.ToBase64String(_rsa.ExportSubjectPublicKeyInfo());
-
-            _ws = new ClientWebSocket();
-            _ws.Options.SetRequestHeader("Origin", "https://discord.com");
-            _ws.Options.SetRequestHeader("User-Agent",
+            string pubKeyB64 = Convert.ToBase64String(rsa.ExportSubjectPublicKeyInfo());
+            ws.Options.SetRequestHeader("Origin", "https://discord.com");
+            ws.Options.SetRequestHeader("User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-            await _ws.ConnectAsync(new Uri("wss://remote-auth-gateway.discord.gg/?v=2"), ct);
+            await ws.ConnectAsync(new Uri("wss://remote-auth-gateway.discord.gg/?v=2"), ct);
 
             var buf = new byte[16384];
-            while (!ct.IsCancellationRequested && _ws.State == WebSocketState.Open)
+            using var msgStream = new MemoryStream();
+            while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
             {
-                var res = await _ws.ReceiveAsync(buf, ct);
-                if (res.MessageType == WebSocketMessageType.Close)
+                msgStream.SetLength(0);
+                WebSocketReceiveResult res;
+                do
                 {
-                    if (!DiscordClient.Instance.IsConnected)
+                    res = await ws.ReceiveAsync(buf, ct);
+                    if (res.MessageType == WebSocketMessageType.Close)
                     {
-                        IsExpired = true;
-                        Status = "QR-код истёк — нажми «Обновить»";
-                        Notify();
+                        if (!DiscordClient.Instance.IsConnected)
+                        {
+                            IsExpired = true;
+                            Status = "QR-код истёк — нажми «Обновить»";
+                            Notify();
+                        }
+                        return;
                     }
-                    break;
-                }
+                    msgStream.Write(buf, 0, res.Count);
+                } while (!res.EndOfMessage);
 
-                using var doc = JsonDocument.Parse(buf.AsMemory(0, res.Count));
+                if (msgStream.Length == 0) continue;
+                using var doc = JsonDocument.Parse(msgStream.GetBuffer().AsMemory(0, (int)msgStream.Length));
                 var root = doc.RootElement;
                 string op = root.TryGetProperty("op", out var opEl) ? opEl.GetString() ?? "" : "";
 
@@ -104,25 +131,34 @@ public sealed class RemoteAuthQr
                         int hbMs = root.TryGetProperty("heartbeat_interval", out var hb) ? hb.GetInt32() : 41250;
                         int timeoutMs = root.TryGetProperty("timeout_ms", out var tm) ? tm.GetInt32() : 120000;
                         ExpiresAtTick = Environment.TickCount64 + timeoutMs;
-                        _ = HeartbeatLoopAsync(hbMs, ct);
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
+                                {
+                                    await Task.Delay(hbMs, ct);
+                                    await SendJsonAsync("{\"op\":\"heartbeat\"}");
+                                }
+                            }
+                            catch { }
+                        }, ct);
                         _ = CountdownTickAsync(ct);
-                        await SendJsonAsync($"{{\"op\":\"init\",\"encoded_public_key\":\"{pubKeyB64}\"}}", ct);
+                        await SendJsonAsync(BuildJsonObj("op", "init", "encoded_public_key", pubKeyB64));
                         break;
                     }
                     case "nonce_proof":
                     {
                         string encNonce = root.GetProperty("encrypted_nonce").GetString() ?? "";
-                        byte[] dec = _rsa.Decrypt(Convert.FromBase64String(encNonce), RSAEncryptionPadding.OaepSHA256);
-                        byte[] hash = SHA256.HashData(dec);
-                        string proof = Base64Url(hash);
-                        await SendJsonAsync($"{{\"op\":\"nonce_proof\",\"proof\":\"{proof}\"}}", ct);
+                        byte[] dec = rsa.Decrypt(Convert.FromBase64String(encNonce), RSAEncryptionPadding.OaepSHA256);
+                        string proof = Base64Url(SHA256.HashData(dec));
+                        await SendJsonAsync(BuildJsonObj("op", "nonce_proof", "proof", proof));
                         break;
                     }
                     case "pending_remote_init":
                     {
                         string fp = root.GetProperty("fingerprint").GetString() ?? "";
-                        string url = "https://discord.com/ra/" + fp;
-                        Matrix = QrCode.Encode(url);
+                        Matrix = QrCode.Encode("https://discord.com/ra/" + fp);
                         Status = "Отсканируй в Discord на телефоне";
                         SettingsStore.Log("QR ready: fingerprint=" + fp);
                         Notify();
@@ -133,9 +169,8 @@ public sealed class RemoteAuthQr
                     {
                         if (root.TryGetProperty("encrypted_user_payload", out var eup) && eup.ValueKind == JsonValueKind.String)
                         {
-                            byte[] dec = _rsa.Decrypt(Convert.FromBase64String(eup.GetString()!), RSAEncryptionPadding.OaepSHA256);
-                            string payload = Encoding.UTF8.GetString(dec); // user_id:discrim:avatar:username
-                            var parts = payload.Split(':');
+                            byte[] dec = rsa.Decrypt(Convert.FromBase64String(eup.GetString()!), RSAEncryptionPadding.OaepSHA256);
+                            var parts = Encoding.UTF8.GetString(dec).Split(':');
                             ScannedUser = parts.Length >= 4 ? parts[3] : "аккаунт";
                         }
                         Status = $"Отсканировано: {ScannedUser} — подтверди на телефоне!";
@@ -147,7 +182,7 @@ public sealed class RemoteAuthQr
                         string ticket = root.GetProperty("ticket").GetString() ?? "";
                         Status = "Получение токена...";
                         Notify();
-                        string token = await ExchangeTicketAsync(ticket, ct);
+                        string token = await ExchangeTicketAsync(rsa, ticket, ct);
                         if (!string.IsNullOrEmpty(token))
                         {
                             Status = "Успешно! Подключаемся...";
@@ -164,7 +199,7 @@ public sealed class RemoteAuthQr
                     case "finish":
                     {
                         string encTok = root.GetProperty("encrypted_token").GetString() ?? "";
-                        byte[] dec = _rsa.Decrypt(Convert.FromBase64String(encTok), RSAEncryptionPadding.OaepSHA256);
+                        byte[] dec = rsa.Decrypt(Convert.FromBase64String(encTok), RSAEncryptionPadding.OaepSHA256);
                         string token = Encoding.UTF8.GetString(dec);
                         Status = "Успешно! Подключаемся...";
                         Notify();
@@ -195,11 +230,10 @@ public sealed class RemoteAuthQr
         }
     }
 
-    private async Task<string> ExchangeTicketAsync(string ticket, CancellationToken ct)
+    private async Task<string> ExchangeTicketAsync(RSA rsa, string ticket, CancellationToken ct)
     {
-        if (_rsa == null) return "";
         using var req = new HttpRequestMessage(HttpMethod.Post, "https://discord.com/api/v9/users/@me/remote-auth/login");
-        req.Content = new StringContent($"{{\"ticket\":\"{ticket}\"}}", Encoding.UTF8, "application/json");
+        req.Content = new StringContent(BuildJsonObj("ticket", ticket), Encoding.UTF8, "application/json");
         using var resp = await _http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)
         {
@@ -209,8 +243,20 @@ public sealed class RemoteAuthQr
         var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
         using var doc = JsonDocument.Parse(bytes);
         if (!doc.RootElement.TryGetProperty("encrypted_token", out var et)) return "";
-        byte[] dec = _rsa.Decrypt(Convert.FromBase64String(et.GetString()!), RSAEncryptionPadding.OaepSHA256);
+        byte[] dec = rsa.Decrypt(Convert.FromBase64String(et.GetString()!), RSAEncryptionPadding.OaepSHA256);
         return Encoding.UTF8.GetString(dec);
+    }
+
+    private static string BuildJsonObj(params string[] kv)
+    {
+        using var ms = new MemoryStream();
+        using (var w = new Utf8JsonWriter(ms))
+        {
+            w.WriteStartObject();
+            for (int i = 0; i + 1 < kv.Length; i += 2) w.WriteString(kv[i], kv[i + 1]);
+            w.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
     }
 
     private async Task CountdownTickAsync(CancellationToken ct)
@@ -224,25 +270,6 @@ public sealed class RemoteAuthQr
             }
         }
         catch { }
-    }
-
-    private async Task HeartbeatLoopAsync(int intervalMs, CancellationToken ct)
-    {
-        try
-        {
-            while (!ct.IsCancellationRequested && _ws?.State == WebSocketState.Open)
-            {
-                await Task.Delay(intervalMs, ct);
-                await SendJsonAsync("{\"op\":\"heartbeat\"}", ct);
-            }
-        }
-        catch { }
-    }
-
-    private Task SendJsonAsync(string json, CancellationToken ct)
-    {
-        if (_ws == null || _ws.State != WebSocketState.Open) return Task.CompletedTask;
-        return _ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, ct);
     }
 
     private static string Base64Url(byte[] data)

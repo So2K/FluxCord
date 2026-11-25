@@ -10,11 +10,13 @@ internal static unsafe partial class W
         WM_CHAR = 0x0102, WM_COMMAND = 0x0111, WM_TIMER = 0x0113, WM_CTLCOLOREDIT = 0x0133,
         WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203,
         WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_MOUSEWHEEL = 0x020A,
+        WM_CAPTURECHANGED = 0x0215,
         WM_DROPFILES = 0x0233,
         WM_MOUSELEAVE = 0x02A3, WM_DPICHANGED = 0x02E0, WM_APP = 0x8000,
         WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_SETICON = 0x0080;
     public const uint IMAGE_ICON = 1, LR_DEFAULTSIZE = 0x0040;
-    public const int SM_CXICON = 11, SM_CYICON = 12, SM_CXSMICON = 49, SM_CYSMICON = 50;
+    public const int SM_CXICON = 11, SM_CYICON = 12, SM_CXSIZEFRAME = 32, SM_CYSIZEFRAME = 33,
+        SM_CXSMICON = 49, SM_CYSMICON = 50, SM_CXPADDEDBORDER = 92;
 
     public const uint WS_OVERLAPPEDWINDOW = 0x00CF0000, WS_VISIBLE = 0x10000000, WS_CHILD = 0x40000000,
         WS_CLIPCHILDREN = 0x02000000, WS_CLIPSIBLINGS = 0x04000000,
@@ -24,7 +26,7 @@ internal static unsafe partial class W
     public const int SW_HIDE = 0, SW_SHOW = 5, SW_SHOWNORMAL = 1, SW_MAXIMIZE = 3, SW_MINIMIZE = 6;
     public const int GWLP_WNDPROC = -4;
     public const int VK_RETURN = 13, VK_ESCAPE = 27, VK_SHIFT = 16, VK_CONTROL = 17, VK_MENU = 18,
-        VK_UP = 0x26, VK_DOWN = 0x28, VK_D = 0x44, VK_F = 0x46, VK_K = 0x4B, VK_M = 0x4D, VK_V = 0x56, VK_RCONTROL = 0xA3;
+        VK_UP = 0x26, VK_DOWN = 0x28, VK_A = 0x41, VK_D = 0x44, VK_F = 0x46, VK_K = 0x4B, VK_M = 0x4D, VK_V = 0x56, VK_RCONTROL = 0xA3;
     public const int EN_CHANGE = 0x0300;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -40,6 +42,7 @@ internal static unsafe partial class W
 
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] public struct NCCALCSIZE_PARAMS { public RECT r0, r1, r2; public nint lppos; }
     [StructLayout(LayoutKind.Sequential)] public struct MSG { public nint hwnd; public uint message; public nuint wParam; public nint lParam; public uint time; public POINT pt; public uint priv; }
     [StructLayout(LayoutKind.Sequential)] public struct MINMAXINFO { public POINT reserved, maxSize, maxPosition, minTrackSize, maxTrackSize; }
     [StructLayout(LayoutKind.Sequential)] public struct TRACKMOUSEEVENT { public uint cbSize, dwFlags; public nint hwndTrack; public uint dwHoverTime; }
@@ -67,6 +70,8 @@ internal static unsafe partial class W
     [LibraryImport("user32.dll")] public static partial nint LoadImageW(nint inst, nint name, uint type, int cx, int cy, uint fuLoad);
     [LibraryImport("user32.dll")] public static partial int GetSystemMetrics(int nIndex);
     [LibraryImport("user32.dll")] public static partial nint SetCursor(nint cur);
+    [LibraryImport("user32.dll")] public static partial nint SetCapture(nint h);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool ReleaseCapture();
     [LibraryImport("user32.dll")] public static partial short GetKeyState(int vk);
     [LibraryImport("user32.dll")] public static partial short GetAsyncKeyState(int vk);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool OpenClipboard(nint h);
@@ -76,6 +81,7 @@ internal static unsafe partial class W
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool IsClipboardFormatAvailable(uint fmt);
     [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool CloseClipboard();
     [LibraryImport("kernel32.dll")] public static partial nint GlobalAlloc(uint flags, nuint bytes);
+    [LibraryImport("kernel32.dll")] public static partial nint GlobalFree(nint mem);
     [LibraryImport("kernel32.dll")] public static partial nint GlobalLock(nint mem);
     [LibraryImport("kernel32.dll")] public static partial nuint GlobalSize(nint mem);
     [LibraryImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool GlobalUnlock(nint mem);
@@ -131,6 +137,25 @@ internal static unsafe partial class W
     public static bool AsyncKeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
     public static uint Rgb(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
 
+    public static int ResolveKeyVk(string keyName) => (keyName ?? "").Trim().ToUpperInvariant() switch
+    {
+        "LCONTROL" or "CTRL" or "CONTROL" => 0xA2,
+        "RCONTROL" or "RCTRL" => 0xA3,
+        "LSHIFT" or "SHIFT" => 0xA0,
+        "RSHIFT" => 0xA1,
+        "LMENU" or "LALT" or "ALT" => 0xA4,
+        "RMENU" or "RALT" => 0xA5,
+        "CAPSLOCK" or "CAPS" => 0x14,
+        "XBUTTON1" or "MOUSE4" => 0x05,
+        "XBUTTON2" or "MOUSE5" => 0x06,
+        "SPACE" => 0x20,
+        "V" => 0x56,
+        "T" => 0x54,
+        "G" => 0x47,
+        "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
+        _ => VK_RCONTROL
+    };
+
     public static void CopyText(nint hwnd, string text)
     {
         if (string.IsNullOrEmpty(text) || !OpenClipboard(hwnd)) return;
@@ -147,7 +172,7 @@ internal static unsafe partial class W
                 ((char*)ptr)[text.Length] = '\0';
                 GlobalUnlock(mem);
             }
-            SetClipboardData(13, mem); // CF_UNICODETEXT
+            if (SetClipboardData(13, mem) == 0) GlobalFree(mem); // prevent leak if SetClipboardData fails
         }
         finally { CloseClipboard(); }
     }
@@ -158,11 +183,14 @@ internal static unsafe partial class W
             ShellExecuteW(0, "open", url, null, null, 5);
     }
 
-    // Save CF_DIB clipboard image (e.g. Win+Shift+S / ShareX screenshot) to a temp .bmp file for instant Discord Ctrl+V upload!
+    /// <summary>
+    /// Converts clipboard CF_DIB screenshot into a compact PNG file (10-30x smaller than raw BMP, never hits Discord 413!).
+    /// </summary>
     public static string? SaveClipboardImageToTemp(nint hwnd)
     {
         const uint CF_DIB = 8;
         if (!IsClipboardFormatAvailable(CF_DIB) || !OpenClipboard(hwnd)) return null;
+        byte[]? bmp = null;
         try
         {
             nint hMem = GetClipboardData(CF_DIB);
@@ -181,22 +209,34 @@ internal static unsafe partial class W
                 uint pixelOff = 14 + biSize + paletteBytes;
                 uint fileSize = 14 + (uint)dibSize;
 
-                var bmp = new byte[fileSize];
+                bmp = new byte[fileSize];
                 bmp[0] = (byte)'B'; bmp[1] = (byte)'M';
                 bmp[2] = (byte)(fileSize & 0xFF); bmp[3] = (byte)((fileSize >> 8) & 0xFF);
                 bmp[4] = (byte)((fileSize >> 16) & 0xFF); bmp[5] = (byte)((fileSize >> 24) & 0xFF);
                 bmp[10] = (byte)(pixelOff & 0xFF); bmp[11] = (byte)((pixelOff >> 8) & 0xFF);
                 bmp[12] = (byte)((pixelOff >> 16) & 0xFF); bmp[13] = (byte)((pixelOff >> 24) & 0xFF);
                 Marshal.Copy(ptr, bmp, 14, (int)dibSize);
-
-                string path = Path.Combine(Path.GetTempPath(), $"fluxcord_paste_{DateTime.Now:yyyyMMdd_HHmmss_fff}.bmp");
-                File.WriteAllBytes(path, bmp);
-                return path;
             }
             finally { GlobalUnlock(hMem); }
         }
         catch { return null; }
         finally { CloseClipboard(); }
+
+        if (bmp == null) return null;
+        try
+        {
+            var png = ImageCache.ConvertImageToPng(bmp);
+            if (png != null && png.Length > 0)
+            {
+                string pngPath = Path.Combine(Path.GetTempPath(), $"fluxcord_paste_{DateTime.Now:yyyyMMdd_HHmmss_fff}.png");
+                File.WriteAllBytes(pngPath, png);
+                return pngPath;
+            }
+            string bmpPath = Path.Combine(Path.GetTempPath(), $"fluxcord_paste_{DateTime.Now:yyyyMMdd_HHmmss_fff}.bmp");
+            File.WriteAllBytes(bmpPath, bmp);
+            return bmpPath;
+        }
+        catch { return null; }
     }
 
     public static List<string> ReadDroppedFiles(nint hDrop)
@@ -254,7 +294,7 @@ internal static unsafe partial class W
                 lpstrFilter = pFilter,
                 lpstrFile = pBuf,
                 nMaxFile = (uint)buf.Length,
-                Flags = 0x00080000 | 0x00001000 // OFN_EXPLORER | OFN_FILEMUSTEXIST
+                Flags = 0x00080000 | 0x00001000 | 0x00000008 // OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR
             };
             if (GetOpenFileNameW(&ofn)) return new string(pBuf).TrimEnd('\0');
         }

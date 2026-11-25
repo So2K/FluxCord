@@ -4,7 +4,7 @@ namespace FluxCord;
 
 /// <summary>
 /// Instant local SQLite WAL cache (%LOCALAPPDATA%\FluxCord\cache.db).
-/// Stores recent messages per channel so switching channels is <2ms with zero wait.
+/// Stores recent messages per channel with proper numeric Snowflake ordering & live edit/delete sync.
 /// </summary>
 public static class LocalCache
 {
@@ -72,7 +72,7 @@ public static class LocalCache
                 var pTs = cmd.Parameters.Add("$ts", SqliteType.Text);
                 var pRp = cmd.Parameters.Add("$rp", SqliteType.Text);
 
-                int start = Math.Max(0, msgs.Count - 60);
+                int start = Math.Max(0, msgs.Count - 80);
                 for (int i = start; i < msgs.Count; i++)
                 {
                     var m = msgs[i];
@@ -88,7 +88,55 @@ public static class LocalCache
                     pRp.Value = m.ReplyPreview;
                     cmd.ExecuteNonQuery();
                 }
+
+                // Prune older cached messages per channel (>120 rows) so cache.db stays tiny & fast
+                using var prune = _conn.CreateCommand();
+                prune.Transaction = tx;
+                prune.CommandText = """
+                    DELETE FROM messages
+                    WHERE channel_id = $ch AND id NOT IN (
+                        SELECT id FROM messages WHERE channel_id = $ch ORDER BY CAST(id AS INTEGER) DESC LIMIT 120
+                    );
+                    """;
+                prune.Parameters.AddWithValue("$ch", channelId);
+                prune.ExecuteNonQuery();
+
                 tx.Commit();
+            }
+            catch { }
+        }
+    }
+
+    public static void UpdateMessage(string messageId, string newContent)
+    {
+        if (string.IsNullOrEmpty(messageId)) return;
+        lock (_lock)
+        {
+            if (_conn == null) return;
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "UPDATE messages SET content=$cnt WHERE id=$id;";
+                cmd.Parameters.AddWithValue("$cnt", newContent);
+                cmd.Parameters.AddWithValue("$id", messageId);
+                cmd.ExecuteNonQuery();
+            }
+            catch { }
+        }
+    }
+
+    public static void DeleteMessage(string messageId)
+    {
+        if (string.IsNullOrEmpty(messageId)) return;
+        lock (_lock)
+        {
+            if (_conn == null) return;
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "DELETE FROM messages WHERE id=$id;";
+                cmd.Parameters.AddWithValue("$id", messageId);
+                cmd.ExecuteNonQuery();
             }
             catch { }
         }
@@ -104,7 +152,8 @@ public static class LocalCache
             try
             {
                 using var cmd = _conn.CreateCommand();
-                cmd.CommandText = "SELECT id, author_id, author_name, author_avatar, author_color, content, timestamp, reply_preview FROM messages WHERE channel_id=$ch ORDER BY id DESC LIMIT $lim;";
+                // Numeric Snowflake ordering (handles 18-digit vs 19-digit IDs accurately!)
+                cmd.CommandText = "SELECT id, author_id, author_name, author_avatar, author_color, content, timestamp, reply_preview FROM messages WHERE channel_id=$ch ORDER BY CAST(id AS INTEGER) DESC LIMIT $lim;";
                 cmd.Parameters.AddWithValue("$ch", channelId);
                 cmd.Parameters.AddWithValue("$lim", limit);
                 using var r = cmd.ExecuteReader();

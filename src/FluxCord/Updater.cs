@@ -37,18 +37,18 @@ public sealed class ResumeSession
 
 /// <summary>
 /// Ultra-fast GitHub Releases Auto-Updater (So2K/FluxCord) with silent background pre-download,
-/// SHA-256 verification, atomic zero-window binary swap (<1s downtime), rollback safety,
+/// SHA-256 verification, Unicode-safe PowerShell atomic binary swap (<1s downtime), full rollback safety,
 /// and 100% seamless Discord call + multi-stream + Go Live session restoration!
 /// </summary>
 public static class Updater
 {
-    public const string CurrentVersion = "1.0.1";
+    public const string CurrentVersion = "1.0.2";
     public const string Repo = "So2K/FluxCord";
     public static readonly string UpdatesDir = Path.Combine(SettingsStore.DataDir, "updates");
     public static readonly string ResumePath = Path.Combine(SettingsStore.DataDir, "resume_session.json");
 
     private static readonly HttpClient Http = MakeClient();
-    private static volatile bool _checking, _downloading, _applying;
+    private static volatile bool _checking, _downloading, _applying, _autoApplyQueued;
 
     public static bool Checking => _checking;
     public static bool Downloading => _downloading;
@@ -76,19 +76,32 @@ public static class Updater
         return c;
     }
 
-    /// <summary>
-    /// Cleans leftover .old/.bak updater files and loads a fresh resume snapshot if launched after an update.
-    /// </summary>
+    private static string? FindStagedExeDir(string stageRoot)
+    {
+        if (!Directory.Exists(stageRoot)) return null;
+        if (File.Exists(Path.Combine(stageRoot, "FluxCord.exe"))) return stageRoot;
+        return Directory.GetDirectories(stageRoot).FirstOrDefault(d => File.Exists(Path.Combine(d, "FluxCord.exe")));
+    }
+
     public static void InitOnStartup(bool resumedArg)
     {
-        // Clean leftover hot-swap files in app directory
+        // Clean leftover hot-swap files & old cached update folders
         try
         {
             string appDir = AppContext.BaseDirectory;
-            foreach (var f in Directory.GetFiles(appDir, "*.old"))
+            foreach (var f in Directory.GetFiles(appDir, "*.old*"))
                 try { File.Delete(f); } catch { }
             foreach (var f in Directory.GetFiles(appDir, "*.bak"))
                 try { File.Delete(f); } catch { }
+            if (Directory.Exists(UpdatesDir))
+            {
+                foreach (var d in Directory.GetDirectories(UpdatesDir, "v*"))
+                {
+                    string verName = Path.GetFileName(d).TrimStart('v', 'V');
+                    if (!IsNewer(verName, CurrentVersion))
+                        try { Directory.Delete(d, true); } catch { }
+                }
+            }
         }
         catch { }
 
@@ -106,7 +119,7 @@ public static class Updater
                     if (age.TotalSeconds >= -5 && age.TotalSeconds <= 120)
                     {
                         PendingResume = sess;
-                        SettingsStore.Log($"Updater: loaded resume snapshot (age={age.TotalSeconds:F1}s, voice={sess.VoiceChannelId}, watches={sess.WatchedStreams.Count}, streaming={sess.WasStreaming})");
+                        SettingsStore.Log($"Updater: loaded resume snapshot (resumedArg={resumedArg}, age={age.TotalSeconds:F1}s, voice={sess.VoiceChannelId}, watches={sess.WatchedStreams.Count}, streaming={sess.WasStreaming})");
                     }
                 }
             }
@@ -173,21 +186,25 @@ public static class Updater
                 long zipSize = 0;
                 if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
                 {
+                    // Prefer win-x64 FluxCord portable zip specifically
                     foreach (var a in assets.EnumerateArray())
                     {
                         string an = a.TryGetProperty("name", out var ne) ? ne.GetString() ?? "" : "";
                         string au = a.TryGetProperty("browser_download_url", out var ue) ? ue.GetString() ?? "" : "";
-                        if (an.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(au))
+                        if (!an.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(au)) continue;
+                        bool preferred = an.Contains("win-x64", StringComparison.OrdinalIgnoreCase) || an.Contains("FluxCord", StringComparison.OrdinalIgnoreCase);
+                        if (zipUrl == null || preferred)
                         {
                             zipName = Path.GetFileName(an);
                             zipUrl = au;
                             zipSize = a.TryGetProperty("size", out var se) && se.ValueKind == JsonValueKind.Number ? se.GetInt64() : 0;
+                            sha256 = null;
                             if (a.TryGetProperty("digest", out var de) && de.ValueKind == JsonValueKind.String)
                             {
                                 string d = de.GetString() ?? "";
                                 if (d.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)) sha256 = d[7..].Trim().ToLowerInvariant();
                             }
-                            break;
+                            if (preferred) break;
                         }
                     }
                 }
@@ -202,10 +219,10 @@ public static class Updater
                     AssetName = zipName ?? $"FluxCord-{tag}-win-x64.zip";
                     AssetSize = zipSize;
                     ExpectedSha256 = sha256;
-                    ReleaseNotes = body.Length > 420 ? body[..420] + "…" : body;
+                    ReleaseNotes = TruncateSafe(body, 420);
 
-                    string preStage = Path.Combine(UpdatesDir, "v" + tag, "stage");
-                    if (File.Exists(Path.Combine(preStage, "FluxCord.exe")))
+                    string? preStage = FindStagedExeDir(Path.Combine(UpdatesDir, "v" + tag, "stage"));
+                    if (preStage != null)
                     {
                         StagedDir = preStage;
                         Progress = 1.0;
@@ -218,7 +235,6 @@ public static class Updater
                         StatusText = $"Доступно обновление v{tag} ({FormatSize(zipSize)})";
                         if (SettingsStore.Current.AutoDownloadUpdates)
                         {
-                            // Ultra-update: silently pre-download & extract in the background so applying takes <1 second!
                             _ = DownloadAndStageAsync(autoApply: false);
                         }
                         else if (manual)
@@ -256,21 +272,32 @@ public static class Updater
             ApplyStagedUpdateAndRestart();
             return;
         }
-        if (!_downloading && !string.IsNullOrEmpty(DownloadUrl))
+        if (_downloading)
+        {
+            // User clicked update while background download is already running -> auto-apply immediately on finish!
+            _autoApplyQueued = true;
+            Shell.Toast("Обновление докачивается — установится сразу после загрузки!", 2500);
+            return;
+        }
+        if (!string.IsNullOrEmpty(DownloadUrl))
+        {
+            _autoApplyQueued = true;
             _ = DownloadAndStageAsync(autoApply: true);
+        }
     }
 
     private static async Task DownloadAndStageAsync(bool autoApply)
     {
         if (_downloading || string.IsNullOrEmpty(DownloadUrl) || string.IsNullOrEmpty(AvailableVersion)) return;
         _downloading = true;
+        if (autoApply) _autoApplyQueued = true;
         Progress = 0;
         string ver = AvailableVersion;
         string url = DownloadUrl;
         string verDir = Path.Combine(UpdatesDir, "v" + ver);
         string zipPath = Path.Combine(verDir, AssetName ?? $"FluxCord-{ver}-win-x64.zip");
         string partPath = zipPath + ".part";
-        string stageDir = Path.Combine(verDir, "stage");
+        string stageRoot = Path.Combine(verDir, "stage");
 
         StatusText = $"Скачивание v{ver}...";
         App.WakeUi();
@@ -308,7 +335,6 @@ public static class Updater
                 }
             }
 
-            // Optional SHA-256 verification when provided by GitHub Release API
             if (!string.IsNullOrEmpty(ExpectedSha256))
             {
                 StatusText = $"Проверка SHA-256 v{ver}...";
@@ -325,18 +351,12 @@ public static class Updater
             Progress = 0.95;
             App.WakeUi();
 
-            if (Directory.Exists(stageDir)) Directory.Delete(stageDir, true);
-            Directory.CreateDirectory(stageDir);
-            ZipFile.ExtractToDirectory(zipPath, stageDir, overwriteFiles: true);
+            if (Directory.Exists(stageRoot)) Directory.Delete(stageRoot, true);
+            Directory.CreateDirectory(stageRoot);
+            ZipFile.ExtractToDirectory(zipPath, stageRoot, overwriteFiles: true);
 
-            // Handle single top-level subfolder inside ZIP if present
-            string exeDirect = Path.Combine(stageDir, "FluxCord.exe");
-            if (!File.Exists(exeDirect))
-            {
-                var sub = Directory.GetDirectories(stageDir).FirstOrDefault(d => File.Exists(Path.Combine(d, "FluxCord.exe")));
-                if (sub != null) stageDir = sub;
-            }
-            if (!File.Exists(Path.Combine(stageDir, "FluxCord.exe")))
+            string? stageDir = FindStagedExeDir(stageRoot);
+            if (stageDir == null)
                 throw new InvalidOperationException("В архиве обновления не найден FluxCord.exe");
 
             StagedDir = stageDir;
@@ -346,9 +366,10 @@ public static class Updater
             SettingsStore.Log($"Updater: staged v{ver} at {stageDir}");
             App.WakeUi();
 
-            if (autoApply)
+            if (_autoApplyQueued)
             {
-                ApplyStagedUpdateAndRestart();
+                _autoApplyQueued = false;
+                App.InvokeOnUiThread(ApplyStagedUpdateAndRestart);
             }
             else
             {
@@ -358,6 +379,7 @@ public static class Updater
         catch (Exception ex)
         {
             _downloading = false;
+            _autoApplyQueued = false;
             Progress = 0;
             try { if (File.Exists(partPath)) File.Delete(partPath); } catch { }
             SettingsStore.Log("Updater download error: " + ex);
@@ -368,7 +390,8 @@ public static class Updater
     }
 
     /// <summary>
-    /// Captures exact voice/stream/channel state, spawns a hidden atomic swapper (<1s downtime), and exits cleanly!
+    /// Captures exact voice/stream/channel state, spawns a Unicode-safe hidden PowerShell swapper
+    /// (Wait-Process + full backup/rollback + <1s swap), and cleanly exits FluxCord!
     /// </summary>
     public static void ApplyStagedUpdateAndRestart()
     {
@@ -380,63 +403,86 @@ public static class Updater
 
         try
         {
-            // 1. Capture live Discord session state (Voice Channel, Mute/Deafen, Watched Streams, Go Live!)
             var snap = Shell.CaptureResumeSession(targetVer);
             Directory.CreateDirectory(SettingsStore.DataDir);
             File.WriteAllText(ResumePath, JsonSerializer.Serialize(snap, FluxJsonContext.Default.ResumeSession));
             SettingsStore.Log($"Updater: saved resume_session.json (voice={snap.VoiceChannelId}, watches={snap.WatchedStreams.Count}, streaming={snap.WasStreaming})");
 
-            // 2. Write atomic zero-window Windows swap script with rollback safety
             int pid = Environment.ProcessId;
             string appDir = AppContext.BaseDirectory.TrimEnd('\\', '/');
             string stageDir = StagedDir.TrimEnd('\\', '/');
             string backupDir = Path.Combine(UpdatesDir, "backup_prev");
-            string swapCmd = Path.Combine(UpdatesDir, "apply_update.cmd");
+            string swapPs1 = Path.Combine(UpdatesDir, "apply_update.ps1");
             string newExe = Path.Combine(appDir, "FluxCord.exe");
 
-            string script = $@"@echo off
-setlocal
-set PID={pid}
-set SRC={stageDir}
-set DST={appDir}
-set BAK={backupDir}
+            static string PsQuote(string s) => "'" + s.Replace("'", "''") + "'";
+            string script = $@"
+$ErrorActionPreference = 'SilentlyContinue'
+$pidTarget = {pid}
+$src = {PsQuote(stageDir)}
+$dst = {PsQuote(appDir)}
+$bak = {PsQuote(backupDir)}
+$exe = {PsQuote(newExe)}
 
-rem Wait up to 8s for old FluxCord PID to exit cleanly (typically ~150ms)
-for /L %%i in (1,1,80) do (
-  tasklist /FI ""PID eq %PID%"" 2>nul | find ""%PID%"" >nul
-  if errorlevel 1 goto :ready
-  ping -n 1 -w 100 127.0.0.1 >nul
-)
-taskkill /F /PID %PID% >nul 2>&1
-ping -n 1 -w 200 127.0.0.1 >nul
+# Wait cleanly up to 8 seconds for FluxCord to flush SQLite/GPU/Discord Disconnect
+try {{
+    $p = Get-Process -Id $pidTarget -ErrorAction Stop
+    if (-not $p.WaitForExit(8000)) {{
+        Stop-Process -Id $pidTarget -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+    }}
+}} catch {{}}
+Start-Sleep -Milliseconds 120
 
-:ready
-if exist ""%BAK%"" rmdir /S /Q ""%BAK%"" >nul 2>&1
-mkdir ""%BAK%"" >nul 2>&1
-if exist ""%DST%\FluxCord.exe"" copy /Y ""%DST%\FluxCord.exe"" ""%BAK%\FluxCord.exe"" >nul 2>&1
-if exist ""%DST%\FluxCord.Media.dll"" copy /Y ""%DST%\FluxCord.Media.dll"" ""%BAK%\FluxCord.Media.dll"" >nul 2>&1
+# Full backup of existing app files for atomic rollback safety
+if (Test-Path $bak) {{ Remove-Item $bak -Recurse -Force }}
+New-Item -ItemType Directory -Force -Path $bak | Out-Null
+Get-ChildItem -Path $src -Recurse -File | ForEach-Object {{
+    $rel = $_.FullName.Substring($src.Length).TrimStart('\','/')
+    $dstFile = Join-Path $dst $rel
+    if (Test-Path $dstFile) {{
+        $bakFile = Join-Path $bak $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $bakFile) | Out-Null
+        Copy-Item $dstFile $bakFile -Force
+    }}
+}}
 
-xcopy ""%SRC%\*"" ""%DST%\"" /E /Y /Q >nul
-if errorlevel 1 (
-  rem Rollback on unexpected copy failure
-  if exist ""%BAK%\FluxCord.exe"" copy /Y ""%BAK%\FluxCord.exe"" ""%DST%\FluxCord.exe"" >nul 2>&1
-  if exist ""%BAK%\FluxCord.Media.dll"" copy /Y ""%BAK%\FluxCord.Media.dll"" ""%DST%\FluxCord.Media.dll"" >nul 2>&1
-)
+# Copy staged release files with retry + automatic rollback on any failure
+$ok = $true
+for ($try = 0; $try -lt 5; $try++) {{
+    $ok = $true
+    Get-ChildItem -Path $src -Recurse -File | ForEach-Object {{
+        $rel = $_.FullName.Substring($src.Length).TrimStart('\','/')
+        $dstFile = Join-Path $dst $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dstFile) | Out-Null
+        try {{ Copy-Item $_.FullName $dstFile -Force -ErrorAction Stop }} catch {{ $ok = $false }}
+    }}
+    if ($ok) {{ break }}
+    Start-Sleep -Milliseconds 250
+}}
 
-start """" ""{newExe}"" --resumed-update
-del ""%~f0"" >nul 2>&1
+if (-not $ok) {{
+    Get-ChildItem -Path $bak -Recurse -File | ForEach-Object {{
+        $rel = $_.FullName.Substring($bak.Length).TrimStart('\','/')
+        $dstFile = Join-Path $dst $rel
+        Copy-Item $_.FullName $dstFile -Force
+    }}
+}}
+
+Start-Process -FilePath $exe -ArgumentList '--resumed-update' -WorkingDirectory $dst
+Remove-Item $MyInvocation.MyCommand.Path -Force
 ";
             Directory.CreateDirectory(UpdatesDir);
-            File.WriteAllText(swapCmd, script, Encoding.ASCII);
+            // UTF-8 with BOM ensures Windows PowerShell 5.1 parses Cyrillic/Unicode paths 100% faithfully!
+            File.WriteAllText(swapPs1, script, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
 
-            Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"\"{swapCmd}\"\"")
+            Process.Start(new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{swapPs1}\"")
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             });
 
-            // 3. Cleanly close current window (leaves voice/GPU gracefully so swapper runs in ~150ms!)
             W.PostMessageW(App.Hwnd, W.WM_CLOSE, 0, 0);
         }
         catch (Exception ex)
@@ -463,6 +509,14 @@ del ""%~f0"" >nul 2>&1
         if (dash >= 0) v = v[..dash];
         var parts = v.Split('.');
         return parts.Length == 1 ? v + ".0" : v;
+    }
+
+    private static string TruncateSafe(string s, int maxChars)
+    {
+        if (s.Length <= maxChars) return s;
+        int len = maxChars;
+        if (char.IsHighSurrogate(s[len - 1])) len--;
+        return s[..len] + "…";
     }
 
     private static string FormatSize(long b)

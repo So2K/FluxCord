@@ -40,12 +40,14 @@ public:
 
 private:
     struct RemoteStream;
+    void stopLocked();
     void captureLoop();
     void renderLoop();
 
     VoiceTransport* transport_;
     NoiseSuppressor suppressor_;
 
+    std::mutex lifecycle_mtx_;
     std::string cap_id_;
     std::string ren_id_;
 
@@ -64,6 +66,7 @@ private:
     std::map<uint32_t, std::unique_ptr<RemoteStream>> streams_;
     std::map<uint32_t, float> user_volumes_;
     std::vector<float> loopback_fifo_;
+    int64_t last_evict_ms_ = 0;
 };
 
 } // namespace fc

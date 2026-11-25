@@ -10,7 +10,8 @@ namespace fc {
 
 /// Production-grade RFC 6184 H.264 RTP Reorder Buffer & Access-Unit Depacketizer.
 /// Handles out-of-order UDP bursts, 0-byte Discord BWE padding probe packets,
-/// Single NALU / STAP-A / FU-A, packet-loss detection, and IDR/SPS keyframe gating.
+/// SFU temporal-layer frame skipping, Single NALU / STAP-A / FU-A, packet-loss detection,
+/// and strict IDR/SPS keyframe gating.
 class VideoDepacketizer {
 public:
     struct FrameOut {
@@ -35,7 +36,7 @@ public:
         int64_t ext = unwrapSeq(seq);
         if (last_emitted_max_seq_ >= 0 && ext <= last_emitted_max_seq_) return;
         empty_probe_seqs_.insert(ext);
-        while (empty_probe_seqs_.size() > 64) empty_probe_seqs_.erase(empty_probe_seqs_.begin());
+        while (empty_probe_seqs_.size() > 256) empty_probe_seqs_.erase(empty_probe_seqs_.begin());
     }
 
     bool pushPacket(uint16_t seq, uint32_t rtp_ts, bool marker, const uint8_t* payload, int len,
@@ -60,8 +61,13 @@ public:
             fb.marker_ms = now_ms;
         }
 
+        // Evict oldest frame by minimum extended sequence (safe across 32-bit RTP timestamp wraparound!)
         while (frames_.size() > 16) {
-            frames_.erase(frames_.begin());
+            auto oldIt = findOldestFrame();
+            if (!oldIt->second.packets.empty()) {
+                advanceLastEmitted(oldIt->second.packets.rbegin()->first);
+            }
+            frames_.erase(oldIt);
             frames_dropped_++;
             need_keyframe_ = true;
             want_pli = true;
@@ -79,16 +85,12 @@ public:
                 last_emitted_max_seq_++;
             }
 
-            auto bestIt = frames_.begin();
-            int64_t bestMinSeq = bestIt->second.packets.begin()->first;
-            for (auto it = frames_.begin(); it != frames_.end(); ++it) {
-                if (!it->second.packets.empty() && it->second.packets.begin()->first < bestMinSeq) {
-                    bestMinSeq = it->second.packets.begin()->first;
-                    bestIt = it;
-                }
-            }
-
+            auto bestIt = findOldestFrame();
             auto& fb = bestIt->second;
+            if (fb.packets.empty()) {
+                frames_.erase(bestIt);
+                continue;
+            }
             int64_t minSeq = fb.packets.begin()->first;
             int64_t maxSeq = fb.packets.rbegin()->first;
 
@@ -101,9 +103,18 @@ public:
                 }
             }
 
-            // Check contiguity with previous emitted frame (allowing BWE probes in between)
-            bool contiguousWithPrev = (last_emitted_max_seq_ < 0) || (minSeq == last_emitted_max_seq_ + 1);
-            if (!contiguousWithPrev && minSeq > last_emitted_max_seq_ + 1 && (minSeq - last_emitted_max_seq_) <= 32) {
+            // Check that the first packet is NOT a mid-FU-A continuation (guards out-of-order initial IDR!)
+            bool startsClean = true;
+            {
+                const auto& fp = fb.packets.begin()->second;
+                if (fp.size() >= 2 && (fp[0] & 0x1F) == 28 && (fp[1] & 0x80) == 0) {
+                    startsClean = false;
+                }
+            }
+
+            // Check contiguity with previous emitted frame (allowing up to 256 BWE probes in between)
+            bool contiguousWithPrev = (last_emitted_max_seq_ < 0) ? startsClean : (minSeq == last_emitted_max_seq_ + 1);
+            if (!contiguousWithPrev && last_emitted_max_seq_ >= 0 && minSeq > last_emitted_max_seq_ + 1 && (minSeq - last_emitted_max_seq_) <= 256) {
                 bool allProbes = true;
                 for (int64_t s = last_emitted_max_seq_ + 1; s < minSeq; ++s) {
                     if (!empty_probe_seqs_.count(s)) { allProbes = false; break; }
@@ -111,14 +122,15 @@ public:
                 contiguousWithPrev = allProbes;
             }
 
-            // Fast-path: if a complete internally-contiguous frame arrived and we're waiting for a keyframe,
-            // emit it immediately if it's an IDR/SPS keyframe even if earlier P-frame packets were lost!
-            if (fb.has_marker && (maxSeq == fb.marker_seq) && contiguousInternal && (contiguousWithPrev || need_keyframe_)) {
+            bool frameComplete = fb.has_marker && (maxSeq == fb.marker_seq) && contiguousInternal && startsClean;
+
+            // Fast-path: complete frame that is either contiguous with previous OR we're waiting for a keyframe
+            if (frameComplete && (contiguousWithPrev || need_keyframe_)) {
                 bool assembled = assembleAnnexB(fb, out.annexb);
                 out.timestamp = bestIt->first;
                 out.is_keyframe = hasIdrOrSps(out.annexb.data(), out.annexb.size());
                 if (contiguousWithPrev || out.is_keyframe) {
-                    last_emitted_max_seq_ = maxSeq;
+                    advanceLastEmitted(maxSeq);
                     frames_.erase(bestIt);
                     if (assembled && !out.annexb.empty()) {
                         frames_ok_++;
@@ -126,22 +138,39 @@ public:
                     }
                     continue;
                 }
+                // Waiting for keyframe, and this complete frame is NOT a keyframe: discard immediately so it NEVER head-of-line blocks an IDR behind it!
+                if (need_keyframe_) {
+                    advanceLastEmitted(maxSeq);
+                    frames_.erase(bestIt);
+                    continue;
+                }
             }
 
-            // Generous timeouts so large WebRTC-paced 1080p/1440p IDR keyframes (40-80 packets paced over 80-160ms!)
-            // NEVER get dropped mid-flight before their marker packet arrives!
-            bool timedOut = (fb.has_marker && (now_ms - fb.marker_ms >= 80)) || (now_ms - fb.first_ms >= 250);
+            // Timeouts: wait 40ms after marker for out-of-order frames, or 250ms total for WebRTC-paced 1080p/1440p IDR keyframes!
+            bool timedOut = (fb.has_marker && (now_ms - fb.marker_ms >= 40)) || (now_ms - fb.first_ms >= 250);
             if (!timedOut) break;
 
-            if (fb.has_marker && contiguousInternal) {
+            if (frameComplete) {
                 bool assembled = assembleAnnexB(fb, out.annexb);
                 out.timestamp = bestIt->first;
                 out.is_keyframe = hasIdrOrSps(out.annexb.data(), out.annexb.size());
-                last_emitted_max_seq_ = maxSeq;
+                int64_t gap = (last_emitted_max_seq_ >= 0) ? (minSeq - last_emitted_max_seq_ - 1) : 0;
+                advanceLastEmitted(maxSeq);
                 frames_.erase(bestIt);
-                if (assembled && out.is_keyframe) {
-                    frames_ok_++;
-                    return true;
+
+                if (assembled && !out.annexb.empty()) {
+                    if (out.is_keyframe) {
+                        frames_ok_++;
+                        return true;
+                    }
+                    // Discord SFU frequently drops disposable temporal-layer P-frames between clean frame boundaries
+                    // (small sequence gap <= 24 packets while the arriving frame is 100% internally intact!).
+                    // Emit it smoothly instead of locking the entire stream at 1fps waiting for an IDR!
+                    if (!need_keyframe_ && gap > 0 && gap <= 24) {
+                        frames_ok_++;
+                        want_pli = true; // gently ask for a refresh without stalling playback
+                        return true;
+                    }
                 }
                 frames_dropped_++;
                 need_keyframe_ = true;
@@ -149,7 +178,8 @@ public:
                 continue;
             }
 
-            last_emitted_max_seq_ = std::max(last_emitted_max_seq_, maxSeq);
+            // Incomplete / corrupt frame: drop and strictly demand an IDR keyframe
+            advanceLastEmitted(maxSeq);
             frames_.erase(bestIt);
             frames_dropped_++;
             need_keyframe_ = true;
@@ -158,12 +188,28 @@ public:
         return false;
     }
 
-    static bool hasIdrOrSps(const uint8_t* data, size_t len) {
-        for (size_t i = 0; i + 4 < len; ++i) {
+    static bool hasIdr(const uint8_t* data, size_t len) {
+        for (size_t i = 0; i + 3 < len; ++i) {
             if (data[i] == 0 && data[i + 1] == 0) {
                 size_t sc = 0;
                 if (data[i + 2] == 1) sc = 3;
-                else if (data[i + 2] == 0 && data[i + 3] == 1) sc = 4;
+                else if (i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1) sc = 4;
+                if (sc > 0 && i + sc < len) {
+                    uint8_t nt = data[i + sc] & 0x1F;
+                    if (nt == 5) return true;
+                    i += sc;
+                }
+            }
+        }
+        return false;
+    }
+
+    static bool hasIdrOrSps(const uint8_t* data, size_t len) {
+        for (size_t i = 0; i + 3 < len; ++i) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                size_t sc = 0;
+                if (data[i + 2] == 1) sc = 3;
+                else if (i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1) sc = 4;
                 if (sc > 0 && i + sc < len) {
                     uint8_t nt = data[i + sc] & 0x1F;
                     if (nt == 5 || nt == 7) return true;
@@ -187,6 +233,25 @@ private:
         int64_t first_ms = 0;
         int64_t marker_ms = 0;
     };
+
+    std::map<uint32_t, FrameBuf>::iterator findOldestFrame() {
+        auto bestIt = frames_.begin();
+        int64_t bestMinSeq = bestIt->second.packets.empty() ? INT64_MAX : bestIt->second.packets.begin()->first;
+        for (auto it = frames_.begin(); it != frames_.end(); ++it) {
+            if (!it->second.packets.empty() && it->second.packets.begin()->first < bestMinSeq) {
+                bestMinSeq = it->second.packets.begin()->first;
+                bestIt = it;
+            }
+        }
+        return bestIt;
+    }
+
+    void advanceLastEmitted(int64_t maxSeq) {
+        if (maxSeq > last_emitted_max_seq_) last_emitted_max_seq_ = maxSeq;
+        while (!empty_probe_seqs_.empty() && *empty_probe_seqs_.begin() <= last_emitted_max_seq_) {
+            empty_probe_seqs_.erase(empty_probe_seqs_.begin());
+        }
+    }
 
     int64_t unwrapSeq(uint16_t s) {
         if (!has_seq_) {
@@ -217,16 +282,16 @@ private:
             uint8_t naluType = pay[0] & 0x1F;
 
             if (naluType >= 1 && naluType <= 23) {
-                if (inFu) { inFu = false; fu.clear(); }
+                if (inFu) return false; // truncated preceding FU-A
                 appendStartCode(out);
                 out.insert(out.end(), pay, pay + payLen);
             } else if (naluType == 24) {
-                if (inFu) { inFu = false; fu.clear(); }
+                if (inFu) return false;
                 int off = 1;
                 while (off + 2 <= payLen) {
                     uint16_t sz = uint16_t((uint16_t(pay[off]) << 8) | pay[off + 1]);
                     off += 2;
-                    if (off + sz > payLen) return false;
+                    if (sz == 0 || off + sz > payLen) return false;
                     appendStartCode(out);
                     out.insert(out.end(), pay + off, pay + off + sz);
                     off += sz;
@@ -237,6 +302,7 @@ private:
                 bool startBit = (fuHdr & 0x80) != 0;
                 bool endBit = (fuHdr & 0x40) != 0;
                 if (startBit) {
+                    if (inFu) return false; // nested FU-A start without endBit -> lost tail
                     fu.clear();
                     fu.push_back((pay[0] & 0xE0) | (fuHdr & 0x1F));
                     fu.insert(fu.end(), pay + 2, pay + payLen);

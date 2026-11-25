@@ -20,7 +20,7 @@ public readonly record struct R(float X, float Y, float W, float H)
 }
 
 /// <summary>
-/// Direct2D 1.1 on a DXGI FlipDiscard swap chain (same ultra-fast zero-framework architecture as FluxTube.Native).
+/// Direct2D 1.1 on a DXGI FlipDiscard swap chain.
 /// Renders only when dirty or animating; steady idle = 0.0% CPU/GPU.
 /// </summary>
 public static unsafe class Gfx
@@ -43,7 +43,8 @@ public static unsafe class Gfx
     public static R Clip { get; private set; }
     public static double LastFlushMs { get; private set; }
 
-    private static readonly Dictionary<(float Size, int Weight, int Align), IDWriteTextFormat> _formats = new();
+    private static readonly Stack<R> _clipStack = new();
+    private static readonly Dictionary<(float Size, int Weight, int Align, bool Wrap), IDWriteTextFormat> _formats = new();
     private static readonly Dictionary<(string Text, float Size, int Weight, float MaxW), (IDWriteTextLayout Layout, float W, float H)> _layouts = new();
     private static IDWriteFontCollection? _lucideFonts;
     private static readonly Dictionary<float, IDWriteTextFormat> _iconFormats = new();
@@ -109,12 +110,18 @@ public static unsafe class Gfx
         CreateTarget();
     }
 
+    public static void RefreshDpi()
+    {
+        if (_swap == null || DC == null) return;
+        CreateTarget();
+    }
+
     private static void CreateTarget()
     {
         _target?.Dispose();
         var dpi = FluxCord.W.GetDpiForWindow(_hwnd);
         if (dpi == 0) dpi = 96;
-        Scale = (dpi / 96f) * SettingsStore.Current.UiScale;
+        Scale = (dpi / 96f) * Math.Clamp(SettingsStore.Current.UiScale, 0.8f, 1.5f);
         using var surface = _swap.GetBuffer<IDXGISurface>(0);
         var props = new BitmapProperties1(
             new PixelFormat(Format.B8G8R8A8_UNorm, D2DAlpha.Premultiplied),
@@ -139,6 +146,7 @@ public static unsafe class Gfx
 
     public static void BeginDraw(uint clearArgb)
     {
+        _clipStack.Clear();
         DC.BeginDraw();
         DC.Clear(ToColor4(clearArgb));
         Clip = new R(0, 0, W, H);
@@ -151,9 +159,14 @@ public static unsafe class Gfx
         LastFlushMs = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         if (hr.Success)
         {
-            _swap.Present(1, PresentFlags.None);
+            var phr = _swap.Present(1, PresentFlags.None);
+            if (phr.Code == unchecked((int)0x887A0005) || phr.Code == unchecked((int)0x887A0007)) // DXGI_ERROR_DEVICE_REMOVED / RESET
+            {
+                DisposeDevice();
+                CreateDevice();
+            }
         }
-        else if (hr.Code == unchecked((int)0x8899000C)) // D2DERR_RECREATE_TARGET
+        else if (hr.Code == unchecked((int)0x8899000C) || hr.Code == unchecked((int)0x887A0005)) // D2DERR_RECREATE_TARGET
         {
             DisposeDevice();
             CreateDevice();
@@ -167,6 +180,7 @@ public static unsafe class Gfx
 
     public static void PushClip(R r)
     {
+        _clipStack.Push(Clip);
         DC.PushAxisAlignedClip(new Rect(r.X, r.Y, r.W, r.H), AntialiasMode.Aliased);
         Clip = r;
     }
@@ -174,7 +188,7 @@ public static unsafe class Gfx
     public static void PopClip()
     {
         DC.PopAxisAlignedClip();
-        Clip = new R(0, 0, W, H);
+        Clip = _clipStack.Count > 0 ? _clipStack.Pop() : new R(0, 0, W, H);
     }
 
     private static Color4 ToColor4(uint argb)
@@ -219,9 +233,9 @@ public static unsafe class Gfx
         DC.DrawEllipse(new Ellipse(new Vector2(cx, cy), rad, rad), _brush, stroke);
     }
 
-    private static IDWriteTextFormat GetFormat(float size, int weight, int align)
+    private static IDWriteTextFormat GetFormat(float size, int weight, int align, bool wrap)
     {
-        var key = (size, weight, align);
+        var key = (size, weight, align, wrap);
         if (_formats.TryGetValue(key, out var f)) return f;
         var fw = weight >= 700 ? FontWeight.Bold : (weight >= 600 ? FontWeight.SemiBold : FontWeight.Normal);
         f = _dw.CreateTextFormat("Segoe UI", null, fw, FontStyle.Normal, FontStretch.Normal, size, "ru-RU");
@@ -232,6 +246,7 @@ public static unsafe class Gfx
             _ => TextAlignment.Leading
         };
         f.ParagraphAlignment = ParagraphAlignment.Near;
+        f.WordWrapping = wrap ? WordWrapping.Wrap : WordWrapping.NoWrap;
         _formats[key] = f;
         return f;
     }
@@ -243,7 +258,7 @@ public static unsafe class Gfx
         var key = (text, size, weight, qW);
         if (_layouts.TryGetValue(key, out var cached)) return (cached.W, cached.H);
 
-        var fmt = GetFormat(size, weight, 0);
+        var fmt = GetFormat(size, weight, 0, wrap: true);
         var layout = _dw.CreateTextLayout(text, fmt, MathF.Max(16f, qW), 4096f);
         var m = layout.Metrics;
         _layouts[key] = (layout, m.Width, m.Height);
@@ -256,8 +271,7 @@ public static unsafe class Gfx
         _brush.Color = ToColor4(argb);
         if (!wrap && align == 0)
         {
-            var fmt = GetFormat(size, weight, align);
-            fmt.WordWrapping = WordWrapping.NoWrap;
+            var fmt = GetFormat(size, weight, 0, wrap: false);
             DC.DrawText(text, fmt, new Rect(r.X, r.Y, r.W, r.H), _brush, DrawTextOptions.Clip | DrawTextOptions.EnableColorFont);
             return;
         }
@@ -267,19 +281,20 @@ public static unsafe class Gfx
             var key = (text, size, weight, qW);
             if (!_layouts.TryGetValue(key, out var cached))
             {
-                var fmt = GetFormat(size, weight, 0);
-                fmt.WordWrapping = WordWrapping.Wrap;
+                var fmt = GetFormat(size, weight, 0, wrap: true);
                 var layout = _dw.CreateTextLayout(text, fmt, MathF.Max(16f, qW), 4096f);
                 var m = layout.Metrics;
                 cached = (layout, m.Width, m.Height);
                 _layouts[key] = cached;
             }
+            bool needClip = cached.H > r.H + 1f;
+            if (needClip) PushClip(r);
             DC.DrawTextLayout(new Vector2(r.X, r.Y), cached.Layout, _brush, DrawTextOptions.Clip | DrawTextOptions.EnableColorFont);
+            if (needClip) PopClip();
             return;
         }
 
-        var f2 = GetFormat(size, weight, align);
-        f2.WordWrapping = wrap ? WordWrapping.Wrap : WordWrapping.NoWrap;
+        var f2 = GetFormat(size, weight, align, wrap);
         DC.DrawText(text, f2, new Rect(r.X, r.Y, r.W, r.H), _brush, DrawTextOptions.Clip | DrawTextOptions.EnableColorFont);
     }
 

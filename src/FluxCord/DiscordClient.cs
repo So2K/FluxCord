@@ -26,12 +26,16 @@ public sealed class WatchSession
     internal bool GwStarted;
     internal int Seq = -1;
     internal ushort DaveVer;
+    internal uint LocalSsrc;
     internal uint VideoSsrc;
+    internal readonly Dictionary<int, ushort> DaveTransitions = new();
     internal long ConnectedTick;
     internal long LastKickTick;
     internal long LastDecodedFrames;
     internal long LastDecodedTick;
     internal long LastDiagLogTick;
+    internal int LastRxPkts;
+    internal int LastKfDrops;
 }
 
 /// <summary>
@@ -51,6 +55,8 @@ public sealed class DiscordClient
     private string _token = "";
     private int? _lastSeq;
     private string _sessionId = "";
+    private string _resumeGatewayUrl = "";
+    private volatile bool _hbAcked = true;
 
     // Voice handshake state
     private string _voiceGuildId = "";
@@ -62,6 +68,7 @@ public sealed class DiscordClient
     private bool _voiceGwStarted;
     private int _voiceSeq = -1;
     private ushort _davePendingVersion;
+    private readonly Dictionary<int, ushort> _voiceDaveTransitions = new();
     private bool _lastSentVoiceSpeaking;
     private long _lastVoiceHbSent;
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<ClientWebSocket, SemaphoreSlim> _wsSendLocks = new();
@@ -139,7 +146,10 @@ public sealed class DiscordClient
     private int _pubSeq = -1;
     private ushort _pubDaveVer;
     private uint _pubMySsrc;
+    private uint _pubVideoSsrc;
+    private readonly Dictionary<int, ushort> _pubDaveTransitions = new();
     private int _pubWidth = 1920, _pubHeight = 1080, _pubFps = 60;
+    private bool _pubIsDualScreen;
     public bool IsPublishingStream { get; private set; }
     public string PublishStatus { get; private set; } = "";
 
@@ -157,6 +167,22 @@ public sealed class DiscordClient
         lock (_watchLock) return [.. _watches.Values];
     }
 
+    private static int ParseStatToken(string text, string key)
+    {
+        int idx = text.IndexOf(key, StringComparison.Ordinal);
+        if (idx < 0) return -1;
+        idx += key.Length;
+        int val = 0;
+        bool any = false;
+        while (idx < text.Length && text[idx] >= '0' && text[idx] <= '9')
+        {
+            val = val * 10 + (text[idx] - '0');
+            idx++;
+            any = true;
+        }
+        return any ? val : -1;
+    }
+
     public unsafe void PollWatchStats()
     {
         List<WatchSession> snap;
@@ -167,35 +193,50 @@ public sealed class DiscordClient
             FcScreenStats st;
             MediaNative.fc_watch_get_stats_slot(ws.Slot, &st);
             ws.Stats = st;
+            string encName = st.GetEncoderName();
+            int rxPkts = ParseStatToken(encName, "rx=");
+            int kfDrops = ParseStatToken(encName, "kf=");
+
             if (st.FramesEncoded != ws.LastDecodedFrames)
             {
                 ws.LastDecodedFrames = st.FramesEncoded;
                 ws.LastDecodedTick = now;
+                if (rxPkts >= 0) ws.LastRxPkts = rxPkts;
+                if (kfDrops >= 0) ws.LastKfDrops = kfDrops;
             }
-            if (now - ws.LastDiagLogTick >= 4000)
+            if (now - ws.LastDiagLogTick >= 15000)
             {
                 ws.LastDiagLogTick = now;
-                SettingsStore.Log($"WatchSlot[{ws.Slot}:{ws.StreamerName}] {st.Width}x{st.Height} @{st.Fps:F1}fps dec={st.DecodeMs:F1}ms kbps={st.BitrateKbps:F0} {st.GetEncoderName()}");
+                SettingsStore.Log($"WatchSlot[{ws.Slot}:{ws.StreamerName}] {st.Width}x{st.Height} @{st.Fps:F1}fps dec={st.DecodeMs:F1}ms kbps={st.BitrateKbps:F0} {encName}");
             }
-            // SFU Keyframe Bounce: trigger BOTH on initial 0-frame stall (>1.8s) AND on any mid-stream freeze (>2.2s after packet loss!)
+            // SFU Keyframe Bounce: trigger on initial 0-frame stall (>1.8s), OR mid-stream freeze (>2.5s) ONLY if packets are actively arriving / kf dropping (never spam on static desktop!)
             long refTick = ws.LastDecodedTick > 0 ? ws.LastDecodedTick : ws.ConnectedTick;
-            bool stalled = refTick > 0 && (now - refTick >= (st.FramesEncoded == 0 ? 1800 : 2200));
-            if (stalled && now - ws.LastKickTick >= 3200 && ws.Gw?.State == WebSocketState.Open)
+            bool initialStall = st.FramesEncoded == 0 && refTick > 0 && (now - refTick >= 1800);
+            bool activeFreeze = st.FramesEncoded > 0 && refTick > 0 && (now - refTick >= 2500) &&
+                                ((rxPkts >= 0 && rxPkts - ws.LastRxPkts > 25) || (kfDrops >= 0 && kfDrops > ws.LastKfDrops));
+            if ((initialStall || activeFreeze) && now - ws.LastKickTick >= 3500 && ws.Gw?.State == WebSocketState.Open)
             {
                 ws.LastKickTick = now;
+                if (rxPkts >= 0) ws.LastRxPkts = rxPkts;
+                if (kfDrops >= 0) ws.LastKfDrops = kfDrops;
                 _ = KickStreamKeyframeAsync(ws);
             }
         }
 
-        if (IsPublishingStream && now - _lastPubDiagTick >= 3500)
+        if (IsPublishingStream && now - _lastPubStatsTick >= 2000)
         {
-            _lastPubDiagTick = now;
+            _lastPubStatsTick = now;
             int vp = 0, ap = 0, plis = 0, daveAct = 0;
             MediaNative.fc_pub_get_stats_ex(&vp, &ap, &plis, &daveAct);
             PubVideoTxPkts = vp; PubAudioTxPkts = ap; PubDaveActive = daveAct != 0;
-            SettingsStore.Log($"PubTx v={vp} a={ap} pli_rx={plis} dave_enc={daveAct} host={PubEndpointHost}");
+            if (now - _lastPubDiagTick >= 15000)
+            {
+                _lastPubDiagTick = now;
+                SettingsStore.Log($"PubTx v={vp} a={ap} pli_rx={plis} dave_enc={daveAct} host={PubEndpointHost}");
+            }
         }
     }
+    private long _lastPubStatsTick;
     private long _lastPubDiagTick;
 
     private static async Task KickStreamKeyframeAsync(WatchSession session)
@@ -284,6 +325,7 @@ public sealed class DiscordClient
     private readonly ConcurrentDictionary<string, uint> _userToSsrc = new();
     private readonly ConcurrentDictionary<string, float> _userVolumes = new();
     private readonly ConcurrentDictionary<string, byte> _loadingOlder = new();
+    private readonly ConcurrentDictionary<string, byte> _reachedChannelStart = new();
 
     public string ActiveGuildId { get; set; } = "@me";
     public string ActiveChannelId { get; set; } = "";
@@ -386,6 +428,35 @@ public sealed class DiscordClient
         ReadyCompleted?.Invoke();
     }
 
+    private async Task<HttpResponseMessage?> SendRestAsync(Func<HttpRequestMessage> buildReq, string tag)
+    {
+        if (string.IsNullOrEmpty(_token)) return null;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            using var req = buildReq();
+            req.Headers.TryAddWithoutValidation("Authorization", _token);
+            var resp = await _http.SendAsync(req);
+            if ((int)resp.StatusCode == 429 && attempt == 0)
+            {
+                int delayMs = 1000;
+                if (resp.Headers.TryGetValues("Retry-After", out var vals))
+                {
+                    string? raw = vals.FirstOrDefault();
+                    if (double.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture, out var sec))
+                        delayMs = Math.Clamp((int)Math.Ceiling(sec * 1000.0) + 50, 250, 5000);
+                }
+                SettingsStore.Log($"{tag} HTTP 429 -> retry in {delayMs}ms");
+                resp.Dispose();
+                await Task.Delay(delayMs);
+                continue;
+            }
+            if (!resp.IsSuccessStatusCode)
+                SettingsStore.Log($"{tag} HTTP {(int)resp.StatusCode}");
+            return resp;
+        }
+        return null;
+    }
+
     public async Task ConnectAsync(string token)
     {
         Disconnect();
@@ -398,6 +469,9 @@ public sealed class DiscordClient
         }
 
         IsDemoMode = false;
+        _sessionId = "";
+        _lastSeq = null;
+        _resumeGatewayUrl = "";
         StatusText = "Подключение к Discord Gateway...";
         Notify();
 
@@ -406,44 +480,96 @@ public sealed class DiscordClient
 
         _ = Task.Run(async () =>
         {
-            try
-            {
-                _gw = new ClientWebSocket();
-                _gw.Options.SetRequestHeader("Origin", "https://discord.com");
-                _gw.Options.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                await _gw.ConnectAsync(new Uri("wss://gateway.discord.gg/?v=10&encoding=json"), ct);
+            int backoffMs = 1000;
+            var buf = new byte[65536];
+            using var ms = new MemoryStream();
 
-                var buf = new byte[65536];
-                using var ms = new MemoryStream();
-                while (!ct.IsCancellationRequested && _gw.State == WebSocketState.Open)
+            while (!ct.IsCancellationRequested)
+            {
+                using var gw = new ClientWebSocket();
+                using var connCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                _gw = gw;
+                _hbAcked = true;
+                bool fatalClose = false;
+
+                try
                 {
-                    ms.SetLength(0);
-                    WebSocketReceiveResult res;
-                    do
+                    gw.Options.SetRequestHeader("Origin", "https://discord.com");
+                    gw.Options.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+
+                    string targetUrl = !string.IsNullOrEmpty(_sessionId) && _lastSeq.HasValue && !string.IsNullOrEmpty(_resumeGatewayUrl)
+                        ? (_resumeGatewayUrl.Contains('?') ? _resumeGatewayUrl : _resumeGatewayUrl.TrimEnd('/') + "/?v=10&encoding=json")
+                        : "wss://gateway.discord.gg/?v=10&encoding=json";
+
+                    await gw.ConnectAsync(new Uri(targetUrl), connCts.Token);
+
+                    while (!connCts.IsCancellationRequested && gw.State == WebSocketState.Open)
                     {
-                        res = await _gw.ReceiveAsync(buf, ct);
-                        if (res.MessageType == WebSocketMessageType.Close)
+                        ms.SetLength(0);
+                        WebSocketReceiveResult res;
+                        do
                         {
-                            StatusText = $"Отключено ({res.CloseStatusDescription ?? res.CloseStatus?.ToString()})";
-                            IsConnected = false;
-                            Notify();
-                            return;
-                        }
-                        ms.Write(buf, 0, res.Count);
-                    } while (!res.EndOfMessage);
+                            res = await gw.ReceiveAsync(buf, connCts.Token);
+                            if (res.MessageType == WebSocketMessageType.Close)
+                            {
+                                int code = (int?)res.CloseStatus ?? 0;
+                                SettingsStore.Log($"GW closed: {code} {res.CloseStatusDescription}");
+                                IsConnected = false;
+                                if (code is 4004 or 4010 or 4011 or 4012 or 4013 or 4014)
+                                {
+                                    StatusText = code == 4004 ? "Неверный токен Discord (4004)" : $"Отключено ({code})";
+                                    fatalClose = true;
+                                }
+                                else if (code is 4007 or 4009)
+                                {
+                                    _sessionId = "";
+                                    _lastSeq = null;
+                                    _resumeGatewayUrl = "";
+                                    StatusText = "Переподключение к Discord...";
+                                }
+                                else
+                                {
+                                    StatusText = "Восстановление связи с Discord...";
+                                }
+                                Notify();
+                                break;
+                            }
+                            ms.Write(buf, 0, res.Count);
+                        } while (!res.EndOfMessage);
 
-                    HandleGatewayPayload(ms.GetBuffer(), (int)ms.Length, ct);
+                        if (res.MessageType == WebSocketMessageType.Close) break;
+                        HandleGatewayPayload(gw, ms.GetBuffer(), (int)ms.Length, connCts, ref backoffMs);
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                if (!ct.IsCancellationRequested)
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    StatusText = "Ошибка подключения: " + ex.Message;
-                    IsConnected = false;
-                    SettingsStore.Log("GW error: " + ex);
-                    Notify();
+                    break;
                 }
+                catch (OperationCanceledException)
+                {
+                    // OP 7 RECONNECT / OP 9 INVALID_SESSION / Heartbeat timeout -> reconnect cleanly
+                }
+                catch (Exception ex)
+                {
+                    if (!ct.IsCancellationRequested)
+                    {
+                        IsConnected = false;
+                        StatusText = "Переподключение: " + ex.Message;
+                        SettingsStore.Log("GW error: " + ex.Message);
+                        Notify();
+                    }
+                }
+                finally
+                {
+                    try { connCts.Cancel(); } catch { }
+                    if (ReferenceEquals(_gw, gw)) _gw = null;
+                }
+
+                if (fatalClose || ct.IsCancellationRequested) break;
+
+                try { await Task.Delay(backoffMs, ct); }
+                catch { break; }
+                backoffMs = Math.Min(backoffMs * 2, 20000);
             }
         }, ct);
     }
@@ -452,13 +578,18 @@ public sealed class DiscordClient
     {
         LeaveVoice();
         try { _gwCts?.Cancel(); } catch { }
+        try { _gwCts?.Dispose(); } catch { }
+        _gwCts = null;
         try { _gw?.Dispose(); } catch { }
         _gw = null;
+        _sessionId = "";
+        _lastSeq = null;
+        _resumeGatewayUrl = "";
         IsConnected = false;
         IsDemoMode = false;
     }
 
-    private void HandleGatewayPayload(byte[] data, int len, CancellationToken ct)
+    private void HandleGatewayPayload(ClientWebSocket gw, byte[] data, int len, CancellationTokenSource connCts, ref int backoffMs)
     {
         using var doc = JsonDocument.Parse(data.AsMemory(0, len));
         var root = doc.RootElement;
@@ -468,20 +599,63 @@ public sealed class DiscordClient
 
         switch (op)
         {
+            case 1: // Server requests immediate heartbeat
+            {
+                string seqStr = _lastSeq.HasValue ? _lastSeq.Value.ToString() : "null";
+                _ = SendWsTextAsync(gw, $"{{\"op\":1,\"d\":{seqStr}}}", connCts.Token);
+                break;
+            }
+            case 7: // RECONNECT
+                SettingsStore.Log("GW OP 7 RECONNECT -> resuming");
+                IsConnected = false;
+                StatusText = "Переподключение к Discord...";
+                Notify();
+                connCts.Cancel();
+                break;
+            case 9: // INVALID_SESSION
+            {
+                bool resumable = root.TryGetProperty("d", out var d9) && d9.ValueKind == JsonValueKind.True;
+                SettingsStore.Log($"GW OP 9 INVALID_SESSION resumable={resumable}");
+                if (!resumable)
+                {
+                    _sessionId = "";
+                    _lastSeq = null;
+                    _resumeGatewayUrl = "";
+                }
+                IsConnected = false;
+                StatusText = "Обновление сессии Discord...";
+                Notify();
+                connCts.Cancel();
+                break;
+            }
             case 10: // HELLO
             {
                 int hbMs = root.GetProperty("d").GetProperty("heartbeat_interval").GetInt32();
-                _ = HeartbeatLoopAsync(hbMs, ct);
-                _ = SendIdentifyAsync(ct);
+                _ = HeartbeatLoopAsync(gw, hbMs, connCts.Token);
+                if (!string.IsNullOrEmpty(_sessionId) && _lastSeq.HasValue)
+                    _ = SendResumeAsync(gw, connCts.Token);
+                else
+                    _ = SendIdentifyAsync(gw, connCts.Token);
                 break;
             }
             case 11: // HEARTBEAT ACK
+                _hbAcked = true;
                 GatewayPingMs = Math.Clamp((int)(Environment.TickCount64 - _lastHbSent), 1, 999);
                 Notify();
                 break;
             case 0: // DISPATCH
             {
                 string t = root.GetProperty("t").GetString() ?? "";
+                if (t is "READY" or "RESUMED") backoffMs = 1000;
+                if (t == "RESUMED")
+                {
+                    IsConnected = true;
+                    int gCnt; lock (Guilds) gCnt = Guilds.Count;
+                    StatusText = $"Подключён: {Me.DisplayName} ({gCnt} серверов)";
+                    SettingsStore.Log("GW RESUMED cleanly");
+                    Notify();
+                    break;
+                }
                 var d = root.GetProperty("d");
                 HandleDispatch(t, d);
                 break;
@@ -491,25 +665,31 @@ public sealed class DiscordClient
 
     private long _lastHbSent;
 
-    private async Task HeartbeatLoopAsync(int intervalMs, CancellationToken ct)
+    private async Task HeartbeatLoopAsync(ClientWebSocket gw, int intervalMs, CancellationToken ct)
     {
         try
         {
             await Task.Delay(Math.Min(intervalMs / 2, 5000), ct);
-            while (!ct.IsCancellationRequested && _gw?.State == WebSocketState.Open)
+            while (!ct.IsCancellationRequested && gw.State == WebSocketState.Open)
             {
+                if (!_hbAcked)
+                {
+                    SettingsStore.Log("GW heartbeat ACK missed -> aborting zombie socket");
+                    gw.Abort();
+                    return;
+                }
+                _hbAcked = false;
                 _lastHbSent = Environment.TickCount64;
                 string seqStr = _lastSeq.HasValue ? _lastSeq.Value.ToString() : "null";
-                await SendWsTextAsync(_gw, $"{{\"op\":1,\"d\":{seqStr}}}", ct);
+                await SendWsTextAsync(gw, $"{{\"op\":1,\"d\":{seqStr}}}", ct);
                 await Task.Delay(intervalMs, ct);
             }
         }
         catch { }
     }
 
-    private async Task SendIdentifyAsync(CancellationToken ct)
+    private async Task SendIdentifyAsync(ClientWebSocket gw, CancellationToken ct)
     {
-        if (_gw == null) return;
         using var ms = new MemoryStream();
         using (var w = new Utf8JsonWriter(ms))
         {
@@ -526,7 +706,25 @@ public sealed class DiscordClient
             w.WriteEndObject();
             w.WriteEndObject();
         }
-        await _gw.SendAsync(ms.ToArray(), WebSocketMessageType.Text, true, ct);
+        await SendWsTextAsync(gw, Encoding.UTF8.GetString(ms.ToArray()), ct);
+    }
+
+    private async Task SendResumeAsync(ClientWebSocket gw, CancellationToken ct)
+    {
+        using var ms = new MemoryStream();
+        using (var w = new Utf8JsonWriter(ms))
+        {
+            w.WriteStartObject();
+            w.WriteNumber("op", 6);
+            w.WriteStartObject("d");
+            w.WriteString("token", _token);
+            w.WriteString("session_id", _sessionId);
+            w.WriteNumber("seq", _lastSeq ?? 0);
+            w.WriteEndObject();
+            w.WriteEndObject();
+        }
+        SettingsStore.Log($"GW sending OP 6 RESUME seq={_lastSeq}");
+        await SendWsTextAsync(gw, Encoding.UTF8.GetString(ms.ToArray()), ct);
     }
 
     private void HandleDispatch(string type, JsonElement d)
@@ -539,18 +737,22 @@ public sealed class DiscordClient
             case "MESSAGE_UPDATE": ParseMessageUpdate(d); break;
             case "MESSAGE_DELETE": ParseMessageDelete(d); break;
             case "MESSAGE_REACTION_ADD": ParseReactionAdd(d); break;
+            case "MESSAGE_REACTION_REMOVE": ParseReactionRemove(d); break;
             case "PRESENCE_UPDATE": ParsePresenceUpdate(d); break;
             case "TYPING_START": ParseTypingStart(d); break;
             case "VOICE_STATE_UPDATE": ParseVoiceStateUpdate(d); break;
             case "VOICE_SERVER_UPDATE": ParseVoiceServerUpdate(d); break;
             case "STREAM_CREATE": ParseStreamCreate(d); break;
             case "STREAM_SERVER_UPDATE": ParseStreamServerUpdate(d); break;
+            case "STREAM_DELETE": ParseStreamDelete(d); break;
         }
     }
 
     private void ParseReady(JsonElement d)
     {
         _sessionId = d.TryGetProperty("session_id", out var sid) ? sid.GetString() ?? "" : "";
+        _resumeGatewayUrl = d.TryGetProperty("resume_gateway_url", out var rgu) && rgu.ValueKind == JsonValueKind.String
+            ? rgu.GetString() ?? "" : "";
         if (d.TryGetProperty("user", out var u))
         {
             Me = new DiscordUser
@@ -581,7 +783,7 @@ public sealed class DiscordClient
             }
         }
 
-        Guilds.Clear();
+        var parsedGuilds = new List<DiscordGuild>();
         if (d.TryGetProperty("guilds", out var gs) && gs.ValueKind == JsonValueKind.Array)
         {
             int gIdx = 0;
@@ -646,13 +848,14 @@ public sealed class DiscordClient
                 }
                 if (gEl.TryGetProperty("voice_states", out var vss) && vss.ValueKind == JsonValueKind.Array)
                 {
-                    foreach (var vs in vss.EnumerateArray()) UpsertVoiceState(g, vs);
+                    foreach (var vs in vss.EnumerateArray()) UpsertVoiceState(g, vs, emitSounds: false, allowFetch: false);
                 }
-                Guilds.Add(g);
+                parsedGuilds.Add(g);
             }
         }
+        lock (Guilds) { Guilds.Clear(); Guilds.AddRange(parsedGuilds); }
 
-        DmChannels.Clear();
+        var parsedDms = new List<DiscordChannel>();
         if (d.TryGetProperty("private_channels", out var pcs) && pcs.ValueKind == JsonValueKind.Array)
         {
             foreach (var cEl in pcs.EnumerateArray())
@@ -674,7 +877,7 @@ public sealed class DiscordClient
                     name = r0.TryGetProperty("global_name", out var rgn) && rgn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(rgn.GetString())
                         ? rgn.GetString()! : (r0.TryGetProperty("username", out var rn) ? rn.GetString() ?? "DM" : "DM");
                 }
-                DmChannels.Add(new DiscordChannel
+                parsedDms.Add(new DiscordChannel
                 {
                     Id = cEl.GetProperty("id").GetString() ?? "",
                     GuildId = "@me",
@@ -685,13 +888,14 @@ public sealed class DiscordClient
                     Type = cEl.TryGetProperty("type", out var ct) ? ct.GetInt32() : 1
                 });
             }
-            DmChannels.Sort((a, b) =>
+            parsedDms.Sort((a, b) =>
             {
                 ulong la = ulong.TryParse(a.LastMessageId, out var x) ? x : 0;
                 ulong lb = ulong.TryParse(b.LastMessageId, out var y) ? y : 0;
                 return lb.CompareTo(la);
             });
         }
+        lock (DmChannels) { DmChannels.Clear(); DmChannels.AddRange(parsedDms); }
 
         // Parse Friends (relationships) + initial presences
         var initStatus = new Dictionary<string, string>();
@@ -708,7 +912,7 @@ public sealed class DiscordClient
                 }
             }
         }
-        Friends.Clear();
+        var parsedFriends = new List<DiscordFriend>();
         if (d.TryGetProperty("relationships", out var rels) && rels.ValueKind == JsonValueKind.Array)
         {
             foreach (var rel in rels.EnumerateArray())
@@ -730,28 +934,58 @@ public sealed class DiscordClient
                 }
                 if (string.IsNullOrEmpty(dname)) dname = uname;
                 string fst = initStatus.GetValueOrDefault(fuid, "offline");
-                Friends.Add(new DiscordFriend { UserId = fuid, Username = uname, DisplayName = dname, Avatar = fav, Status = fst, Type = rtype });
+                parsedFriends.Add(new DiscordFriend { UserId = fuid, Username = uname, DisplayName = dname, Avatar = fav, Status = fst, Type = rtype });
             }
-            Friends.Sort((a, b) =>
+            parsedFriends.Sort((a, b) =>
             {
                 int oa = a.Status == "offline" ? 1 : 0, ob = b.Status == "offline" ? 1 : 0;
                 int c = oa.CompareTo(ob);
                 return c != 0 ? c : string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase);
             });
         }
+        lock (Friends) { Friends.Clear(); Friends.AddRange(parsedFriends); }
 
         IsConnected = true;
-        StatusText = $"Подключён: {Me.DisplayName} ({Guilds.Count} серверов)";
-        if (Guilds.Count > 0)
+        StatusText = $"Подключён: {Me.DisplayName} ({parsedGuilds.Count} серверов)";
+
+        // Restore last visited server & channel if valid, else fall back to first guild text channel
+        bool restored = false;
+        string savedGid = SettingsStore.Current.LastGuildId;
+        string savedCid = SettingsStore.Current.LastChannelId;
+        if (savedGid == "@me" && !string.IsNullOrEmpty(savedCid) && parsedDms.Any(c => c.Id == savedCid))
         {
-            ActiveGuildId = Guilds[0].Id;
-            var firstText = Guilds[0].Channels.FirstOrDefault(c => c.Type == 0);
+            ActiveGuildId = "@me";
+            ActiveChannelId = savedCid;
+            _ = LoadMessagesAsync(savedCid);
+            restored = true;
+        }
+        else if (!string.IsNullOrEmpty(savedGid))
+        {
+            var sg = parsedGuilds.FirstOrDefault(x => x.Id == savedGid);
+            if (sg != null)
+            {
+                ActiveGuildId = sg.Id;
+                var sc = sg.Channels.FirstOrDefault(c => c.Id == savedCid && !c.IsCategory && !c.IsVoice)
+                         ?? sg.Channels.FirstOrDefault(c => c.Type == 0 || c.Type == 5);
+                if (sc != null)
+                {
+                    ActiveChannelId = sc.Id;
+                    _ = LoadMessagesAsync(sc.Id);
+                }
+                restored = true;
+            }
+        }
+        if (!restored && parsedGuilds.Count > 0)
+        {
+            ActiveGuildId = parsedGuilds[0].Id;
+            var firstText = parsedGuilds[0].Channels.FirstOrDefault(c => c.Type == 0 || c.Type == 5);
             if (firstText != null)
             {
                 ActiveChannelId = firstText.Id;
                 _ = LoadMessagesAsync(firstText.Id);
             }
         }
+
         Me.Status = SettingsStore.Current.PresenceStatus;
         SettingsStore.SetToken(_token);
         _ = BenchmarkRegionsAsync();
@@ -808,6 +1042,7 @@ public sealed class DiscordClient
     {
         string cid = d.TryGetProperty("channel_id", out var c) ? c.GetString() ?? "" : "";
         string mid = d.TryGetProperty("message_id", out var m) ? m.GetString() ?? "" : "";
+        string uid = d.TryGetProperty("user_id", out var u) ? u.GetString() ?? "" : "";
         string emo = d.TryGetProperty("emoji", out var em) && em.TryGetProperty("name", out var en) ? en.GetString() ?? "" : "";
         if (string.IsNullOrEmpty(cid) || string.IsNullOrEmpty(mid) || string.IsNullOrEmpty(emo)) return;
         if (Messages.TryGetValue(cid, out var list))
@@ -825,6 +1060,36 @@ public sealed class DiscordClient
                         msg.Reactions[idx] = $"{emo} {cnt}";
                     }
                     else msg.Reactions.Add($"{emo} 1");
+                    if (uid == Me.Id) msg.MyReactions.Add(emo);
+                }
+            }
+            Notify();
+        }
+    }
+
+    private void ParseReactionRemove(JsonElement d)
+    {
+        string cid = d.TryGetProperty("channel_id", out var c) ? c.GetString() ?? "" : "";
+        string mid = d.TryGetProperty("message_id", out var m) ? m.GetString() ?? "" : "";
+        string uid = d.TryGetProperty("user_id", out var u) ? u.GetString() ?? "" : "";
+        string emo = d.TryGetProperty("emoji", out var em) && em.TryGetProperty("name", out var en) ? en.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(cid) || string.IsNullOrEmpty(mid) || string.IsNullOrEmpty(emo)) return;
+        if (Messages.TryGetValue(cid, out var list))
+        {
+            lock (list)
+            {
+                var msg = list.FirstOrDefault(x => x.Id == mid);
+                if (msg != null)
+                {
+                    int idx = msg.Reactions.FindIndex(r => r.StartsWith(emo + " ", StringComparison.Ordinal));
+                    if (idx >= 0)
+                    {
+                        var parts = msg.Reactions[idx].Split(' ');
+                        int cnt = parts.Length > 1 && int.TryParse(parts[^1], out var n) ? n - 1 : 0;
+                        if (cnt <= 0) msg.Reactions.RemoveAt(idx);
+                        else msg.Reactions[idx] = $"{emo} {cnt}";
+                    }
+                    if (uid == Me.Id) msg.MyReactions.Remove(emo);
                 }
             }
             Notify();
@@ -835,14 +1100,35 @@ public sealed class DiscordClient
     {
         string cid = d.TryGetProperty("channel_id", out var c) ? c.GetString() ?? "" : "";
         string mid = d.TryGetProperty("id", out var i) ? i.GetString() ?? "" : "";
-        if (!d.TryGetProperty("content", out var cnt) || cnt.ValueKind != JsonValueKind.String) return;
+        if (string.IsNullOrEmpty(cid) || string.IsNullOrEmpty(mid)) return;
+
+        bool hasContent = d.TryGetProperty("content", out var cnt) && cnt.ValueKind == JsonValueKind.String;
+        bool hasEdited = d.TryGetProperty("edited_timestamp", out var et) && et.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(et.GetString());
+        bool hasEmbeds = d.TryGetProperty("embeds", out var embs) && embs.ValueKind == JsonValueKind.Array;
+        if (!hasContent && !hasEmbeds && !hasEdited) return;
+
+        string? newContent = null;
         if (Messages.TryGetValue(cid, out var list))
         {
             lock (list)
             {
                 var existing = list.FirstOrDefault(m => m.Id == mid);
-                if (existing != null) existing.Content = cnt.GetString()! + " (ред.)";
+                if (existing != null)
+                {
+                    if (hasContent)
+                    {
+                        newContent = ResolveMentions(cnt.GetString()!);
+                        existing.Content = newContent;
+                    }
+                    if (hasEdited) existing.IsEdited = true;
+                    if (hasEmbeds)
+                    {
+                        existing.Embeds.Clear();
+                        ParseEmbeds(embs, existing.Embeds);
+                    }
+                }
             }
+            if (newContent != null) LocalCache.UpdateMessage(mid, newContent);
             Notify();
         }
     }
@@ -851,11 +1137,13 @@ public sealed class DiscordClient
     {
         string cid = d.TryGetProperty("channel_id", out var c) ? c.GetString() ?? "" : "";
         string mid = d.TryGetProperty("id", out var i) ? i.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(cid) || string.IsNullOrEmpty(mid)) return;
         if (Messages.TryGetValue(cid, out var list))
         {
             lock (list) list.RemoveAll(m => m.Id == mid);
             Notify();
         }
+        LocalCache.DeleteMessage(mid);
     }
 
     private void ParseTypingStart(JsonElement d)
@@ -868,6 +1156,65 @@ public sealed class DiscordClient
         Notify();
     }
 
+    private static void ParseEmbeds(JsonElement embs, List<DiscordEmbed> target)
+    {
+        foreach (var e in embs.EnumerateArray())
+        {
+            string imgU = "";
+            if (e.TryGetProperty("image", out var im) && im.ValueKind == JsonValueKind.Object && im.TryGetProperty("url", out var iu) && iu.ValueKind == JsonValueKind.String)
+                imgU = iu.GetString()!;
+            else if (e.TryGetProperty("thumbnail", out var th) && th.ValueKind == JsonValueKind.Object && th.TryGetProperty("url", out var tu) && tu.ValueKind == JsonValueKind.String)
+                imgU = tu.GetString()!;
+            var emb = new DiscordEmbed
+            {
+                Title = e.TryGetProperty("title", out var et) && et.ValueKind == JsonValueKind.String ? et.GetString()! : "",
+                Description = e.TryGetProperty("description", out var ed) && ed.ValueKind == JsonValueKind.String ? ed.GetString()! : "",
+                Url = e.TryGetProperty("url", out var eu) && eu.ValueKind == JsonValueKind.String ? eu.GetString()! : "",
+                Author = e.TryGetProperty("author", out var ea) && ea.ValueKind == JsonValueKind.Object && ea.TryGetProperty("name", out var ean) ? ean.GetString() ?? "" : "",
+                Footer = e.TryGetProperty("footer", out var ef) && ef.ValueKind == JsonValueKind.Object && ef.TryGetProperty("text", out var eft) ? eft.GetString() ?? "" : "",
+                ImageUrl = imgU,
+                Color = e.TryGetProperty("color", out var ec) && ec.ValueKind == JsonValueKind.Number ? (0xFF000000u | (uint)ec.GetInt32()) : 0xFF5865F2u
+            };
+            if (!string.IsNullOrEmpty(emb.Title) || !string.IsNullOrEmpty(emb.Description) || !string.IsNullOrEmpty(emb.ImageUrl))
+                target.Add(emb);
+        }
+    }
+
+    private static string ResolveMentions(string s)
+    {
+        if (string.IsNullOrEmpty(s) || !s.Contains("<@", StringComparison.Ordinal)) return s;
+        var sb = new StringBuilder(s.Length + 16);
+        int pos = 0;
+        while (pos < s.Length)
+        {
+            int open = s.IndexOf("<@", pos, StringComparison.Ordinal);
+            if (open < 0) { sb.Append(s, pos, s.Length - pos); break; }
+            sb.Append(s, pos, open - pos);
+            int idStart = open + 2;
+            if (idStart < s.Length && s[idStart] == '!') idStart++;
+            int close = s.IndexOf('>', idStart);
+            if (close > idStart && close - idStart <= 24)
+            {
+                bool allDigits = true;
+                for (int k = idStart; k < close; k++)
+                    if (s[k] < '0' || s[k] > '9') { allDigits = false; break; }
+                if (allDigits)
+                {
+                    string uid = s[idStart..close];
+                    if (Instance.Users.TryGetValue(uid, out var uo) && !string.IsNullOrEmpty(uo.DisplayName))
+                    {
+                        sb.Append('@').Append(uo.DisplayName);
+                        pos = close + 1;
+                        continue;
+                    }
+                }
+            }
+            sb.Append("<@");
+            pos = open + 2;
+        }
+        return sb.ToString();
+    }
+
     private static DiscordMessage ParseMessage(JsonElement d)
     {
         var msg = new DiscordMessage
@@ -875,6 +1222,7 @@ public sealed class DiscordClient
             Id = d.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
             ChannelId = d.TryGetProperty("channel_id", out var cid) ? cid.GetString() ?? "" : "",
             Content = d.TryGetProperty("content", out var cnt) ? cnt.GetString() ?? "" : "",
+            IsEdited = d.TryGetProperty("edited_timestamp", out var et) && et.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(et.GetString()),
         };
         if (d.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String)
         {
@@ -909,35 +1257,19 @@ public sealed class DiscordClient
             }
         }
         if (d.TryGetProperty("embeds", out var embs) && embs.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var e in embs.EnumerateArray())
-            {
-                string imgU = "";
-                if (e.TryGetProperty("image", out var im) && im.ValueKind == JsonValueKind.Object && im.TryGetProperty("url", out var iu) && iu.ValueKind == JsonValueKind.String)
-                    imgU = iu.GetString()!;
-                else if (e.TryGetProperty("thumbnail", out var th) && th.ValueKind == JsonValueKind.Object && th.TryGetProperty("url", out var tu) && tu.ValueKind == JsonValueKind.String)
-                    imgU = tu.GetString()!;
-                var emb = new DiscordEmbed
-                {
-                    Title = e.TryGetProperty("title", out var et) && et.ValueKind == JsonValueKind.String ? et.GetString()! : "",
-                    Description = e.TryGetProperty("description", out var ed) && ed.ValueKind == JsonValueKind.String ? ed.GetString()! : "",
-                    Url = e.TryGetProperty("url", out var eu) && eu.ValueKind == JsonValueKind.String ? eu.GetString()! : "",
-                    Author = e.TryGetProperty("author", out var ea) && ea.ValueKind == JsonValueKind.Object && ea.TryGetProperty("name", out var ean) ? ean.GetString() ?? "" : "",
-                    Footer = e.TryGetProperty("footer", out var ef) && ef.ValueKind == JsonValueKind.Object && ef.TryGetProperty("text", out var eft) ? eft.GetString() ?? "" : "",
-                    ImageUrl = imgU,
-                    Color = e.TryGetProperty("color", out var ec) && ec.ValueKind == JsonValueKind.Number ? (0xFF000000u | (uint)ec.GetInt32()) : 0xFF5865F2u
-                };
-                if (!string.IsNullOrEmpty(emb.Title) || !string.IsNullOrEmpty(emb.Description) || !string.IsNullOrEmpty(emb.ImageUrl))
-                    msg.Embeds.Add(emb);
-            }
-        }
+            ParseEmbeds(embs, msg.Embeds);
         if (d.TryGetProperty("reactions", out var reacts) && reacts.ValueKind == JsonValueKind.Array)
         {
             foreach (var r in reacts.EnumerateArray())
             {
                 int rCount = r.TryGetProperty("count", out var rc) ? rc.GetInt32() : 1;
                 string emo = r.TryGetProperty("emoji", out var em) && em.TryGetProperty("name", out var en) ? en.GetString() ?? "" : "";
-                if (!string.IsNullOrEmpty(emo)) msg.Reactions.Add($"{emo} {rCount}");
+                if (!string.IsNullOrEmpty(emo))
+                {
+                    msg.Reactions.Add($"{emo} {rCount}");
+                    if (r.TryGetProperty("me", out var meEl) && meEl.ValueKind == JsonValueKind.True)
+                        msg.MyReactions.Add(emo);
+                }
             }
         }
         if (d.TryGetProperty("referenced_message", out var refm) && refm.ValueKind == JsonValueKind.Object)
@@ -947,41 +1279,42 @@ public sealed class DiscordClient
             if (rc.Length > 70) rc = rc[..70] + "…";
             if (!string.IsNullOrEmpty(ra)) msg.ReplyPreview = $"↩ @{ra}: {rc}";
         }
-        if (msg.Content.Contains("<@"))
-        {
-            foreach (var kv in Instance.Users)
-            {
-                if (msg.Content.Contains(kv.Key))
-                {
-                    msg.Content = msg.Content.Replace($"<@{kv.Key}>", $"@{kv.Value.DisplayName}")
-                                             .Replace($"<@!{kv.Key}>", $"@{kv.Value.DisplayName}");
-                }
-            }
-        }
+        msg.Content = ResolveMentions(msg.Content);
         return msg;
     }
 
     public async Task LoadOlderMessagesAsync(string channelId)
     {
         if (IsDemoMode || string.IsNullOrEmpty(_token) || string.IsNullOrEmpty(channelId)) return;
-        if (!Messages.TryGetValue(channelId, out var list) || list.Count == 0) return;
+        if (_reachedChannelStart.ContainsKey(channelId)) return;
+        if (!Messages.TryGetValue(channelId, out var list)) return;
         string oldestId;
-        lock (list) oldestId = list[0].Id;
+        lock (list)
+        {
+            if (list.Count == 0) return;
+            oldestId = list[0].Id;
+        }
         if (string.IsNullOrEmpty(oldestId) || !_loadingOlder.TryAdd(channelId, 1)) return;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/channels/{channelId}/messages?before={oldestId}&limit=50");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            using var resp = await _http.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return;
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/channels/{channelId}/messages?before={oldestId}&limit=50"),
+                "LoadOlder");
+            if (resp == null || !resp.IsSuccessStatusCode) return;
             var bytes = await resp.Content.ReadAsByteArrayAsync();
             using var doc = JsonDocument.Parse(bytes);
             var parsed = new List<DiscordMessage>();
             foreach (var el in doc.RootElement.EnumerateArray()) parsed.Add(ParseMessage(el));
+            if (parsed.Count < 50) _reachedChannelStart[channelId] = 1;
             if (parsed.Count > 0)
             {
                 parsed.Reverse();
-                lock (list) list.InsertRange(0, parsed);
+                lock (list)
+                {
+                    var existingIds = new HashSet<string>(list.Select(x => x.Id));
+                    var fresh = parsed.Where(x => !existingIds.Contains(x.Id)).ToList();
+                    if (fresh.Count > 0) list.InsertRange(0, fresh);
+                }
                 Notify();
             }
         }
@@ -1001,16 +1334,26 @@ public sealed class DiscordClient
         if (IsDemoMode || string.IsNullOrEmpty(_token)) return;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/channels/{channelId}/messages?limit=50");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            using var resp = await _http.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return;
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/channels/{channelId}/messages?limit=50"),
+                "LoadMessages");
+            if (resp == null || !resp.IsSuccessStatusCode) return;
             var bytes = await resp.Content.ReadAsByteArrayAsync();
             using var doc = JsonDocument.Parse(bytes);
             var parsed = new List<DiscordMessage>();
             foreach (var el in doc.RootElement.EnumerateArray()) parsed.Add(ParseMessage(el));
+            if (parsed.Count < 50) _reachedChannelStart[channelId] = 1;
             parsed.Reverse();
-            Messages[channelId] = parsed;
+            var list = Messages.GetOrAdd(channelId, _ => []);
+            lock (list)
+            {
+                var byId = new Dictionary<string, DiscordMessage>(parsed.Count + list.Count);
+                foreach (var old in list) byId[old.Id] = old;
+                foreach (var m in parsed) byId[m.Id] = m;
+                list.Clear();
+                list.AddRange(byId.Values.OrderBy(m => ulong.TryParse(m.Id, out var u) ? u : 0UL));
+                if (list.Count > 300) list.RemoveRange(0, list.Count - 300);
+            }
             LocalCache.SaveMessages(channelId, parsed);
             Notify();
         }
@@ -1051,11 +1394,14 @@ public sealed class DiscordClient
                 }
                 w.WriteEndObject();
             }
-            using var req = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/messages");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            req.Content = new ByteArrayContent(ms.ToArray());
-            req.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-            await _http.SendAsync(req);
+            var bodyBytes = ms.ToArray();
+            using var resp = await SendRestAsync(() =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/messages");
+                r.Content = new ByteArrayContent(bodyBytes);
+                r.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                return r;
+            }, "SendMessage");
         }
         catch (Exception ex) { SettingsStore.Log("SendMessage error: " + ex.Message); }
     }
@@ -1074,9 +1420,9 @@ public sealed class DiscordClient
         if (string.IsNullOrEmpty(_token)) return;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Delete, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            await _http.SendAsync(req);
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Delete, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}"),
+                "DeleteMessage");
         }
         catch { }
     }
@@ -1092,7 +1438,7 @@ public sealed class DiscordClient
                 lock (list)
                 {
                     var m = list.FirstOrDefault(x => x.Id == messageId);
-                    if (m != null) m.Content = newContent + " (ред.)";
+                    if (m != null) { m.Content = newContent; m.IsEdited = true; }
                 }
                 Notify();
             }
@@ -1108,13 +1454,30 @@ public sealed class DiscordClient
                 w.WriteString("content", newContent);
                 w.WriteEndObject();
             }
-            using var req = new HttpRequestMessage(HttpMethod.Patch, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            req.Content = new ByteArrayContent(ms.ToArray());
-            req.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-            await _http.SendAsync(req);
+            var bodyBytes = ms.ToArray();
+            using var resp = await SendRestAsync(() =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Patch, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}");
+                r.Content = new ByteArrayContent(bodyBytes);
+                r.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                return r;
+            }, "EditMessage");
         }
         catch (Exception ex) { SettingsStore.Log("EditMessage error: " + ex.Message); }
+    }
+
+    public Task ToggleReactionAsync(string channelId, string messageId, string emoji)
+    {
+        bool mine = false;
+        if (Messages.TryGetValue(channelId, out var list))
+        {
+            lock (list)
+            {
+                var msg = list.FirstOrDefault(x => x.Id == messageId);
+                if (msg != null) mine = msg.MyReactions.Contains(emoji);
+            }
+        }
+        return mine ? RemoveReactionAsync(channelId, messageId, emoji) : AddReactionAsync(channelId, messageId, emoji);
     }
 
     public async Task AddReactionAsync(string channelId, string messageId, string emoji)
@@ -1127,10 +1490,15 @@ public sealed class DiscordClient
                 lock (list)
                 {
                     var msg = list.FirstOrDefault(x => x.Id == messageId);
-                    if (msg != null)
+                    if (msg != null && msg.MyReactions.Add(emoji))
                     {
                         int idx = msg.Reactions.FindIndex(r => r.StartsWith(emoji + " ", StringComparison.Ordinal));
-                        if (idx >= 0) msg.Reactions[idx] = $"{emoji} 2";
+                        if (idx >= 0)
+                        {
+                            var parts = msg.Reactions[idx].Split(' ');
+                            int cnt = parts.Length > 1 && int.TryParse(parts[^1], out var n) ? n + 1 : 2;
+                            msg.Reactions[idx] = $"{emoji} {cnt}";
+                        }
                         else msg.Reactions.Add($"{emoji} 1");
                     }
                 }
@@ -1142,9 +1510,46 @@ public sealed class DiscordClient
         try
         {
             string enc = Uri.EscapeDataString(emoji);
-            using var req = new HttpRequestMessage(HttpMethod.Put, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}/reactions/{enc}/@me");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            await _http.SendAsync(req);
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Put, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}/reactions/{enc}/@me"),
+                "AddReaction");
+        }
+        catch { }
+    }
+
+    public async Task RemoveReactionAsync(string channelId, string messageId, string emoji)
+    {
+        if (string.IsNullOrEmpty(channelId) || string.IsNullOrEmpty(messageId) || string.IsNullOrEmpty(emoji)) return;
+        if (IsDemoMode)
+        {
+            if (Messages.TryGetValue(channelId, out var list))
+            {
+                lock (list)
+                {
+                    var msg = list.FirstOrDefault(x => x.Id == messageId);
+                    if (msg != null && msg.MyReactions.Remove(emoji))
+                    {
+                        int idx = msg.Reactions.FindIndex(r => r.StartsWith(emoji + " ", StringComparison.Ordinal));
+                        if (idx >= 0)
+                        {
+                            var parts = msg.Reactions[idx].Split(' ');
+                            int cnt = parts.Length > 1 && int.TryParse(parts[^1], out var n) ? n - 1 : 0;
+                            if (cnt <= 0) msg.Reactions.RemoveAt(idx);
+                            else msg.Reactions[idx] = $"{emoji} {cnt}";
+                        }
+                    }
+                }
+                Notify();
+            }
+            return;
+        }
+        if (string.IsNullOrEmpty(_token)) return;
+        try
+        {
+            string enc = Uri.EscapeDataString(emoji);
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Delete, $"https://discord.com/api/v10/channels/{channelId}/messages/{messageId}/reactions/{enc}/@me"),
+                "RemoveReaction");
         }
         catch { }
     }
@@ -1164,10 +1569,10 @@ public sealed class DiscordClient
         if (string.IsNullOrEmpty(_token)) return;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/channels/{channelId}/pins");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            using var resp = await _http.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return;
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/channels/{channelId}/pins"),
+                "LoadPins");
+            if (resp == null || !resp.IsSuccessStatusCode) return;
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsByteArrayAsync());
             var pins = new List<DiscordMessage>();
             foreach (var el in doc.RootElement.EnumerateArray()) pins.Add(ParseMessage(el));
@@ -1204,9 +1609,9 @@ public sealed class DiscordClient
         _lastTypingSentTick = now;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/typing");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            await _http.SendAsync(req);
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/typing"),
+                "Typing");
         }
         catch { }
     }
@@ -1214,7 +1619,8 @@ public sealed class DiscordClient
     public async Task<string?> OpenOrCreateDmAsync(string userId)
     {
         if (string.IsNullOrEmpty(userId)) return null;
-        var existing = DmChannels.FirstOrDefault(c => c.RecipientId == userId);
+        DiscordChannel? existing;
+        lock (DmChannels) existing = DmChannels.FirstOrDefault(c => c.RecipientId == userId);
         if (existing != null)
         {
             ActiveGuildId = "@me"; ActiveChannelId = existing.Id;
@@ -1224,9 +1630,10 @@ public sealed class DiscordClient
         }
         if (IsDemoMode)
         {
-            string name = Users.TryGetValue(userId, out var uo) ? uo.DisplayName : (Friends.FirstOrDefault(f => f.UserId == userId)?.DisplayName ?? "Друг");
+            string name = Users.TryGetValue(userId, out var uo) ? uo.DisplayName : "";
+            if (string.IsNullOrEmpty(name)) lock (Friends) name = Friends.FirstOrDefault(f => f.UserId == userId)?.DisplayName ?? "Друг";
             var dm = new DiscordChannel { Id = "dm_" + userId, GuildId = "@me", Name = name, RecipientId = userId, Type = 1 };
-            DmChannels.Insert(0, dm);
+            lock (DmChannels) DmChannels.Insert(0, dm);
             ActiveGuildId = "@me"; ActiveChannelId = dm.Id;
             Notify();
             return dm.Id;
@@ -1234,19 +1641,30 @@ public sealed class DiscordClient
         if (string.IsNullOrEmpty(_token)) return null;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Post, "https://discord.com/api/v10/users/@me/channels");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            req.Content = new StringContent($"{{\"recipient_id\":\"{userId}\"}}", Encoding.UTF8, "application/json");
-            using var resp = await _http.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return null;
+            using var resp = await SendRestAsync(() =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Post, "https://discord.com/api/v10/users/@me/channels");
+                r.Content = new StringContent($"{{\"recipient_id\":\"{userId}\"}}", Encoding.UTF8, "application/json");
+                return r;
+            }, "OpenDM");
+            if (resp == null || !resp.IsSuccessStatusCode) return null;
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsByteArrayAsync());
             var cEl = doc.RootElement;
             string cid = cEl.GetProperty("id").GetString() ?? "";
             if (string.IsNullOrEmpty(cid)) return null;
-            string name = Users.TryGetValue(userId, out var u2) ? u2.DisplayName : (Friends.FirstOrDefault(f => f.UserId == userId)?.DisplayName ?? "DM");
-            string av = Users.TryGetValue(userId, out var u3) ? u3.Avatar : (Friends.FirstOrDefault(f => f.UserId == userId)?.Avatar ?? "");
+            string name = Users.TryGetValue(userId, out var u2) ? u2.DisplayName : "";
+            string av = Users.TryGetValue(userId, out var u3) ? u3.Avatar : "";
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(av))
+            {
+                lock (Friends)
+                {
+                    var fr = Friends.FirstOrDefault(f => f.UserId == userId);
+                    if (string.IsNullOrEmpty(name)) name = fr?.DisplayName ?? "DM";
+                    if (string.IsNullOrEmpty(av)) av = fr?.Avatar ?? "";
+                }
+            }
             var ch = new DiscordChannel { Id = cid, GuildId = "@me", Name = name, RecipientId = userId, RecipientAvatar = av, Type = 1 };
-            DmChannels.Insert(0, ch);
+            lock (DmChannels) DmChannels.Insert(0, ch);
             ActiveGuildId = "@me"; ActiveChannelId = cid;
             _ = LoadMessagesAsync(cid);
             Notify();
@@ -1262,11 +1680,13 @@ public sealed class DiscordClient
         if (string.IsNullOrEmpty(_token)) return null;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/invites");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            req.Content = new StringContent("{\"max_age\":86400,\"max_uses\":0,\"temporary\":false}", Encoding.UTF8, "application/json");
-            using var resp = await _http.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return null;
+            using var resp = await SendRestAsync(() =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/invites");
+                r.Content = new StringContent("{\"max_age\":86400,\"max_uses\":0,\"temporary\":false}", Encoding.UTF8, "application/json");
+                return r;
+            }, "CreateInvite");
+            if (resp == null || !resp.IsSuccessStatusCode) return null;
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsByteArrayAsync());
             string code = doc.RootElement.TryGetProperty("code", out var ce) ? ce.GetString() ?? "" : "";
             return string.IsNullOrEmpty(code) ? null : $"https://discord.gg/{code}";
@@ -1279,7 +1699,21 @@ public sealed class DiscordClient
         Disconnect();
         SettingsStore.SetToken("");
         _token = "";
+        lock (Guilds) Guilds.Clear();
+        lock (DmChannels) DmChannels.Clear();
+        lock (Friends) Friends.Clear();
+        Messages.Clear();
+        PinnedMessages.Clear();
+        Users.Clear();
+        GuildNicks.Clear();
+        GuildMemberIds.Clear();
+        UnreadChannels.Clear();
+        _reachedChannelStart.Clear();
+        _fetchingMembers.Clear();
+        ActiveGuildId = "@me";
+        ActiveChannelId = "";
         StatusText = "Вышли из аккаунта";
+        App.InvokeOnUiThread(App.ClearTokenInput);
         RemoteAuthQr.Instance.Start();
         Notify();
     }
@@ -1503,15 +1937,34 @@ public sealed class DiscordClient
         if (IsDemoMode || string.IsNullOrEmpty(_token) || !File.Exists(filePath)) return;
         try
         {
-            using var form = new MultipartFormDataContent();
-            if (!string.IsNullOrWhiteSpace(caption))
-                form.Add(new StringContent($"{{\"content\":\"{caption.Replace("\"", "\\\"")}\"}}", Encoding.UTF8, "application/json"), "payload_json");
             var bytes = await File.ReadAllBytesAsync(filePath);
-            form.Add(new ByteArrayContent(bytes), "files[0]", Path.GetFileName(filePath));
-            using var req = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/messages");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            req.Content = form;
-            await _http.SendAsync(req);
+            string fileName = Path.GetFileName(filePath);
+            byte[]? payloadBytes = null;
+            if (!string.IsNullOrWhiteSpace(caption))
+            {
+                using var ms = new MemoryStream();
+                using (var w = new Utf8JsonWriter(ms))
+                {
+                    w.WriteStartObject();
+                    w.WriteString("content", caption);
+                    w.WriteEndObject();
+                }
+                payloadBytes = ms.ToArray();
+            }
+            using var resp = await SendRestAsync(() =>
+            {
+                var form = new MultipartFormDataContent();
+                if (payloadBytes != null)
+                {
+                    var jc = new ByteArrayContent(payloadBytes);
+                    jc.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                    form.Add(jc, "payload_json");
+                }
+                form.Add(new ByteArrayContent(bytes), "files[0]", fileName);
+                var req = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v10/channels/{channelId}/messages");
+                req.Content = form;
+                return req;
+            }, "UploadFile");
         }
         catch (Exception ex) { SettingsStore.Log("UploadFile error: " + ex.Message); }
     }
@@ -1529,17 +1982,86 @@ public sealed class DiscordClient
 
     // ---------------- Voice Gateway v8 + Native WASAPI / UDP Transport ----------------
 
+    public async Task UpdateVoiceSelfStateAsync(bool selfMute, bool selfDeaf)
+    {
+        bool effMute = selfMute || selfDeaf;
+        if (!string.IsNullOrEmpty(_voiceGuildId))
+        {
+            DiscordGuild? g;
+            lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
+            if (g != null)
+            {
+                lock (g.VoiceStates)
+                {
+                    if (g.VoiceStates.TryGetValue(Me.Id, out var vm))
+                    {
+                        vm.SelfMute = effMute;
+                        vm.SelfDeaf = selfDeaf;
+                    }
+                }
+            }
+        }
+        if (IsDemoMode || _gw?.State != WebSocketState.Open || string.IsNullOrEmpty(_voiceGuildId) || string.IsNullOrEmpty(_voiceChannelId))
+            return;
+        try
+        {
+            string sm = effMute ? "true" : "false";
+            string sd = selfDeaf ? "true" : "false";
+            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{_voiceGuildId}\",\"channel_id\":\"{_voiceChannelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}";
+            await SendWsTextAsync(_gw, json, CancellationToken.None);
+        }
+        catch { }
+    }
+
+    private void TearDownVoiceLocalOnly()
+    {
+        StopAllWatchedStreams();
+        StopPublishingGoLive();
+        try { _voiceCts?.Cancel(); } catch { }
+        try { _voiceCts?.Dispose(); } catch { }
+        _voiceCts = null;
+        try { _voiceGw?.Dispose(); } catch { }
+        _voiceGw = null;
+        MediaNative.fc_transport_disconnect();
+        MediaNative.fc_voice_stop();
+        _voiceSessionId = "";
+        _voiceToken = "";
+        _voiceEndpoint = "";
+        _voiceGwStarted = false;
+        _voiceSeq = -1;
+        _voiceDaveTransitions.Clear();
+        _userToSsrc.Clear();
+        VoiceConnected = false;
+        VoiceStatus = "";
+        VoiceEndpointHost = "";
+        VoicePingMs = 0;
+        VoicePingAvgMs = 0;
+        lock (VoicePingHistory) VoicePingHistory.Clear();
+        LocalSpeaking = false;
+        LocalVoiceLevel = 0f;
+        _lastSentVoiceSpeaking = false;
+        FocusedStreamUserId = null;
+    }
+
     public async Task JoinVoiceAsync(string guildId, string channelId, bool selfMute = false, bool selfDeaf = false)
     {
-        LeaveVoice();
+        // When moving directly between voice channels in the SAME guild, do NOT send OP 4 channel_id:null first
+        // (that creates a race where Discord echoes null back and tears down the new channel!).
+        bool sameGuildSwitch = !string.IsNullOrEmpty(_voiceGuildId) && _voiceGuildId == guildId && !string.IsNullOrEmpty(_voiceChannelId);
+        if (sameGuildSwitch)
+            TearDownVoiceLocalOnly();
+        else
+            LeaveVoice();
+
         _voiceGuildId = guildId;
         _voiceChannelId = channelId;
 
         var s = SettingsStore.Current;
+        bool effMute = selfMute || selfDeaf || s.PushToTalk;
         MediaNative.fc_voice_set_noise_config(s.NoiseMode, s.NoiseStrength, s.HpfEnabled ? 1 : 0, s.AgcEnabled ? 1 : 0, s.GateDb);
         MediaNative.fc_voice_set_input_gain(s.InputGain);
         MediaNative.fc_voice_set_output_volume(s.OutputVolume);
-        MediaNative.fc_voice_set_muted(selfMute ? 1 : 0);
+        MediaNative.fc_voice_set_muted(effMute ? 1 : 0);
         MediaNative.fc_voice_set_deafened(selfDeaf ? 1 : 0);
         MediaNative.fc_voice_start(s.CaptureDeviceId, s.RenderDeviceId);
 
@@ -1558,7 +2080,7 @@ public sealed class DiscordClient
         Notify();
         if (_gw?.State == WebSocketState.Open)
         {
-            string sm = selfMute ? "true" : "false";
+            string sm = (selfMute || selfDeaf) ? "true" : "false";
             string sd = selfDeaf ? "true" : "false";
             string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{guildId}\",\"channel_id\":\"{channelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}";
             await SendWsTextAsync(_gw, json, CancellationToken.None);
@@ -1568,37 +2090,17 @@ public sealed class DiscordClient
     public void LeaveVoice()
     {
         bool wasConnected = VoiceConnected || !string.IsNullOrEmpty(_voiceChannelId);
-        StopAllWatchedStreams();
-        StopPublishingGoLive();
+        string prevGuild = _voiceGuildId;
         if (wasConnected) SoundFx.Play(UiSound.VoiceLeave);
 
-        if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(_voiceGuildId))
+        if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(prevGuild))
         {
-            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{_voiceGuildId}\",\"channel_id\":null,\"self_mute\":false,\"self_deaf\":false}}}}";
+            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{prevGuild}\",\"channel_id\":null,\"self_mute\":false,\"self_deaf\":false}}}}";
             _ = SendWsTextAsync(_gw, json, CancellationToken.None);
         }
-        try { _voiceCts?.Cancel(); } catch { }
-        try { _voiceGw?.Dispose(); } catch { }
-        _voiceGw = null;
-        MediaNative.fc_transport_disconnect();
-        MediaNative.fc_voice_stop();
+        TearDownVoiceLocalOnly();
         _voiceGuildId = "";
         _voiceChannelId = "";
-        _voiceSessionId = "";
-        _voiceToken = "";
-        _voiceEndpoint = "";
-        _voiceGwStarted = false;
-        _voiceSeq = -1;
-        VoiceConnected = false;
-        VoiceStatus = "";
-        VoiceEndpointHost = "";
-        VoicePingMs = 0;
-        VoicePingAvgMs = 0;
-        lock (VoicePingHistory) VoicePingHistory.Clear();
-        LocalSpeaking = false;
-        LocalVoiceLevel = 0f;
-        _lastSentVoiceSpeaking = false;
-        FocusedStreamUserId = null;
         Notify();
     }
 
@@ -1609,16 +2111,17 @@ public sealed class DiscordClient
             foreach (var gEl in gs.EnumerateArray())
             {
                 string gid = gEl.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? "" : "";
-                var g = Guilds.FirstOrDefault(x => x.Id == gid);
+                DiscordGuild? g;
+                lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == gid);
                 if (g == null) continue;
                 if (gEl.TryGetProperty("voice_states", out var vss) && vss.ValueKind == JsonValueKind.Array)
-                    foreach (var vs in vss.EnumerateArray()) UpsertVoiceState(g, vs);
+                    foreach (var vs in vss.EnumerateArray()) UpsertVoiceState(g, vs, emitSounds: false, allowFetch: false);
             }
             Notify();
         }
     }
 
-    private void UpsertVoiceState(DiscordGuild g, JsonElement vs, bool emitSounds = false)
+    private void UpsertVoiceState(DiscordGuild g, JsonElement vs, bool emitSounds = false, bool allowFetch = true)
     {
         string vuid = vs.TryGetProperty("user_id", out var vu) ? vu.GetString() ?? "" : "";
         if (string.IsNullOrEmpty(vuid)) return;
@@ -1655,11 +2158,13 @@ public sealed class DiscordClient
             }
             if (mem.TryGetProperty("user", out var mu) && mu.ValueKind == JsonValueKind.Object)
             {
-                string un = mu.TryGetProperty("global_name", out var gn) && gn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gn.GetString())
-                    ? gn.GetString()! : (mu.TryGetProperty("username", out var u2) ? u2.GetString() ?? "" : "");
-                if (string.IsNullOrEmpty(uname)) uname = un;
+                string rawUn = mu.TryGetProperty("username", out var u2) ? u2.GetString() ?? "" : "";
+                string globalUn = mu.TryGetProperty("global_name", out var gn) && gn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gn.GetString())
+                    ? gn.GetString()! : rawUn;
+                if (string.IsNullOrEmpty(uname)) uname = globalUn;
                 if (mu.TryGetProperty("avatar", out var av) && av.ValueKind == JsonValueKind.String) uav = av.GetString()!;
-                Users[vuid] = new DiscordUser { Id = vuid, Username = un, DisplayName = uname, Avatar = uav };
+                string prevStatus = Users.TryGetValue(vuid, out var prevU) ? prevU.Status : "offline";
+                Users[vuid] = new DiscordUser { Id = vuid, Username = rawUn, DisplayName = globalUn, Avatar = uav, Status = prevStatus };
             }
         }
         if (string.IsNullOrEmpty(uname) && GuildNicks.TryGetValue(g.Id + ":" + vuid, out var gn2))
@@ -1669,12 +2174,13 @@ public sealed class DiscordClient
             if (string.IsNullOrEmpty(uname)) uname = cached.DisplayName;
             if (string.IsNullOrEmpty(uav)) uav = cached.Avatar;
         }
-        if (string.IsNullOrEmpty(uname))
+        bool missingName = string.IsNullOrEmpty(uname);
+        if (missingName)
         {
             uname = vuid == Me.Id ? Me.DisplayName : ("User " + (vuid.Length >= 4 ? vuid[^4..] : vuid));
             if (vuid == Me.Id && string.IsNullOrEmpty(uav)) uav = Me.Avatar;
         }
-        if (vuid != Me.Id && !GuildNicks.ContainsKey(g.Id + ":" + vuid))
+        if (allowFetch && vuid != Me.Id && (missingName || g.Id == _voiceGuildId || g.Id == ActiveGuildId) && !GuildNicks.ContainsKey(g.Id + ":" + vuid))
             _ = FetchGuildMemberAsync(g.Id, vuid);
 
         bool selfStream = vs.TryGetProperty("self_stream", out var ss) && ss.ValueKind == JsonValueKind.True;
@@ -1706,27 +2212,36 @@ public sealed class DiscordClient
         if (IsDemoMode || string.IsNullOrEmpty(_token) || !_fetchingMembers.TryAdd(key, 1)) return;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/guilds/{guildId}/members/{userId}");
-            req.Headers.TryAddWithoutValidation("Authorization", _token);
-            using var resp = await _http.SendAsync(req);
-            if (!resp.IsSuccessStatusCode) return;
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Get, $"https://discord.com/api/v10/guilds/{guildId}/members/{userId}"),
+                "FetchMember");
+            if (resp == null || !resp.IsSuccessStatusCode) return;
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsByteArrayAsync());
             var m = doc.RootElement;
             string nick = m.TryGetProperty("nick", out var nk) && nk.ValueKind == JsonValueKind.String ? nk.GetString() ?? "" : "";
-            string uname = "";
-            string av = "";
+            string rawUn = "", globalUn = "", av = "";
             if (m.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.Object)
             {
-                uname = u.TryGetProperty("global_name", out var gn) && gn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gn.GetString())
-                    ? gn.GetString()! : (u.TryGetProperty("username", out var un) ? un.GetString() ?? "" : "");
+                rawUn = u.TryGetProperty("username", out var un) ? un.GetString() ?? "" : "";
+                globalUn = u.TryGetProperty("global_name", out var gn) && gn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gn.GetString())
+                    ? gn.GetString()! : rawUn;
                 av = u.TryGetProperty("avatar", out var ave) && ave.ValueKind == JsonValueKind.String ? ave.GetString() ?? "" : "";
             }
-            string bestName = !string.IsNullOrEmpty(nick) ? nick : uname;
+            string bestName = !string.IsNullOrEmpty(nick) ? nick : globalUn;
             if (string.IsNullOrEmpty(bestName)) return;
 
             GuildNicks[key] = bestName;
-            Users[userId] = new DiscordUser { Id = userId, Username = uname, DisplayName = bestName, Avatar = av };
-            var g = Guilds.FirstOrDefault(x => x.Id == guildId);
+            string prevStatus = Users.TryGetValue(userId, out var prevU) ? prevU.Status : "offline";
+            Users[userId] = new DiscordUser
+            {
+                Id = userId,
+                Username = string.IsNullOrEmpty(rawUn) ? (prevU?.Username ?? "") : rawUn,
+                DisplayName = string.IsNullOrEmpty(globalUn) ? (prevU?.DisplayName ?? bestName) : globalUn,
+                Avatar = string.IsNullOrEmpty(av) ? (prevU?.Avatar ?? "") : av,
+                Status = prevStatus
+            };
+            DiscordGuild? g;
+            lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == guildId);
             if (g != null)
             {
                 lock (g.VoiceStates)
@@ -1753,7 +2268,8 @@ public sealed class DiscordClient
         string vcid = d.TryGetProperty("channel_id", out var cEl) && cEl.ValueKind == JsonValueKind.String ? cEl.GetString() ?? "" : "";
         if (!string.IsNullOrEmpty(gid))
         {
-            var g = Guilds.FirstOrDefault(x => x.Id == gid);
+            DiscordGuild? g;
+            lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == gid);
             if (g != null) { UpsertVoiceState(g, d, emitSounds: true); Notify(); }
         }
         string uid = d.TryGetProperty("user_id", out var u) ? u.GetString() ?? "" : "";
@@ -1761,13 +2277,11 @@ public sealed class DiscordClient
         {
             if (string.IsNullOrEmpty(vcid))
             {
-                // Disconnected from voice (by us, moderator, or another session) -> clean stop, ZERO 4006 reconnect loops!
-                try { _voiceCts?.Cancel(); } catch { }
-                try { _voiceGw?.Dispose(); } catch { }
-                _voiceGw = null;
-                MediaNative.fc_transport_disconnect();
-                _voiceSessionId = ""; _voiceToken = ""; _voiceEndpoint = ""; _voiceChannelId = "";
-                _voiceGwStarted = false; VoiceConnected = false; VoiceStatus = ""; VoiceEndpointHost = "";
+                // Disconnected from voice (by us, moderator, or another session) -> full clean stop!
+                TearDownVoiceLocalOnly();
+                _voiceChannelId = "";
+                _voiceGuildId = "";
+                App.InvokeOnUiThread(Shell.StopStream);
                 Notify();
                 return;
             }
@@ -1803,7 +2317,9 @@ public sealed class DiscordClient
         if (_voiceGwStarted || string.IsNullOrEmpty(_voiceSessionId) || string.IsNullOrEmpty(_voiceToken) || string.IsNullOrEmpty(_voiceEndpoint)) return;
         _voiceGwStarted = true;
         _voiceSeq = -1;
-        _voiceCts?.Cancel();
+        _voiceDaveTransitions.Clear();
+        try { _voiceCts?.Cancel(); } catch { }
+        try { _voiceCts?.Dispose(); } catch { }
         _voiceCts = new CancellationTokenSource();
         var ct = _voiceCts.Token;
 
@@ -1828,12 +2344,18 @@ public sealed class DiscordClient
                         res = await _voiceGw.ReceiveAsync(buf, ct);
                         if (res.MessageType == WebSocketMessageType.Close)
                         {
-                            SettingsStore.Log($"VoiceGW closed: {res.CloseStatus} {res.CloseStatusDescription}");
-                            VoiceStatus = $"Голос отключён ({res.CloseStatus})";
+                            int code = (int?)res.CloseStatus ?? 0;
+                            SettingsStore.Log($"VoiceGW closed: {code} {res.CloseStatusDescription}");
+                            VoiceStatus = $"Голос отключён ({code})";
                             VoiceConnected = false;
                             _voiceGwStarted = false;
-                            if ((int?)res.CloseStatus is 4006 or 4014) { _voiceToken = ""; _voiceSessionId = ""; }
+                            if (code is 4006 or 4014) { _voiceToken = ""; _voiceSessionId = ""; }
                             Notify();
+                            if (!ct.IsCancellationRequested && code is 1006 or 4015 && !string.IsNullOrEmpty(_voiceChannelId) && !string.IsNullOrEmpty(_voiceToken))
+                            {
+                                await Task.Delay(1500, ct);
+                                TryStartVoiceGateway();
+                            }
                             return;
                         }
                         ms.Write(buf, 0, res.Count);
@@ -1854,14 +2376,15 @@ public sealed class DiscordClient
                     if (op == 8)
                     {
                         int hb = Math.Clamp((int)data.GetProperty("heartbeat_interval").GetDouble(), 2000, 5000);
+                        var hbGw = _voiceGw;
                         _ = Task.Run(async () =>
                         {
                             try
                             {
-                                while (!ct.IsCancellationRequested && _voiceGw?.State == WebSocketState.Open)
+                                while (!ct.IsCancellationRequested && hbGw?.State == WebSocketState.Open)
                                 {
                                     _lastVoiceHbSent = Environment.TickCount64;
-                                    await SendWsTextAsync(_voiceGw, $"{{\"op\":3,\"d\":{{\"t\":{_lastVoiceHbSent},\"seq_ack\":{_voiceSeq}}}}}", ct);
+                                    await SendWsTextAsync(hbGw, $"{{\"op\":3,\"d\":{{\"t\":{_lastVoiceHbSent},\"seq_ack\":{_voiceSeq}}}}}", ct);
                                     await Task.Delay(hb, ct);
                                 }
                             }
@@ -1897,6 +2420,12 @@ public sealed class DiscordClient
                             string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"{chosenMode}\"}}}}}}";
                             await SendWsTextAsync(_voiceGw, sel, ct);
                         }
+                        else
+                        {
+                            SettingsStore.Log($"Voice UDP discovery FAILED for {ip}:{port} ssrc={_voiceSsrc}");
+                            VoiceStatus = "Ошибка UDP-обнаружения (проверьте сеть/VPN)";
+                            Notify();
+                        }
                     }
                     else if (op == 4)
                     {
@@ -1913,7 +2442,8 @@ public sealed class DiscordClient
                         ulong chIdU64 = ulong.TryParse(_voiceChannelId, out var c64) ? c64 : 0;
                         MediaNative.fc_dave_init(daveVer, chIdU64, Me.Id, _voiceSsrc);
 
-                        var g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
+                        DiscordGuild? g;
+                        lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
                         if (g != null)
                         {
                             lock (g.VoiceStates)
@@ -1929,8 +2459,7 @@ public sealed class DiscordClient
                             if (kp.Length > 0) await SendWsBinaryAsync(_voiceGw, 26, kp, ct);
                         }
 
-                        await SendWsTextAsync(_voiceGw, $"{{\"op\":5,\"d\":{{\"speaking\":1,\"delay\":0,\"ssrc\":{_voiceSsrc}}}}}", ct);
-                        _lastSentVoiceSpeaking = true;
+                        _lastSentVoiceSpeaking = false;
                         MediaNative.fc_transport_send_silence();
 
                         bool wasVoice = VoiceConnected;
@@ -1958,7 +2487,8 @@ public sealed class DiscordClient
                                 MediaNative.fc_dave_map_ssrc(rSsrc, uid);
                                 if (_userVolumes.TryGetValue(uid, out var uv))
                                     MediaNative.fc_voice_set_user_volume(rSsrc, uv);
-                                var g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
+                                DiscordGuild? g;
+                                lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
                                 if (g != null)
                                 {
                                     lock (g.VoiceStates)
@@ -1981,15 +2511,28 @@ public sealed class DiscordClient
                     }
                     else if (op == 13 && data.TryGetProperty("user_id", out var du) && du.ValueKind == JsonValueKind.String)
                     {
-                        MediaNative.fc_dave_remove_user(du.GetString()!);
+                        string remUid = du.GetString()!;
+                        _userToSsrc.TryRemove(remUid, out _);
+                        MediaNative.fc_dave_remove_user(remUid);
                     }
                     else if (op == 21)
                     {
-                        _davePendingVersion = data.TryGetProperty("protocol_version", out var pv) ? (ushort)pv.GetInt32() : (ushort)1;
+                        ushort pv = data.TryGetProperty("protocol_version", out var pvEl) ? (ushort)pvEl.GetInt32() : (ushort)1;
                         int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
-                        if (tid != 0) await SendWsTextAsync(_voiceGw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                        _davePendingVersion = pv;
+                        if (tid == 0) MediaNative.fc_dave_execute_transition(pv);
+                        else
+                        {
+                            _voiceDaveTransitions[tid] = pv;
+                            await SendWsTextAsync(_voiceGw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                        }
                     }
-                    else if (op == 22) MediaNative.fc_dave_execute_transition(_davePendingVersion);
+                    else if (op == 22)
+                    {
+                        int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
+                        ushort ver = _voiceDaveTransitions.Remove(tid, out var v) ? v : _davePendingVersion;
+                        MediaNative.fc_dave_execute_transition(ver);
+                    }
                     else if (op == 24)
                     {
                         ushort pv = data.TryGetProperty("protocol_version", out var pve) ? (ushort)pve.GetInt32() : (ushort)1;
@@ -2009,9 +2552,10 @@ public sealed class DiscordClient
             {
                 if (!ct.IsCancellationRequested)
                 {
+                    VoiceConnected = false;
                     VoiceStatus = "Ошибка голоса: " + ex.Message;
                     _voiceGwStarted = false;
-                    SettingsStore.Log("VoiceGW error: " + ex);
+                    SettingsStore.Log("VoiceGW error: " + ex.Message);
                     Notify();
                 }
             }
@@ -2076,12 +2620,13 @@ public sealed class DiscordClient
 
     // ---------------- 4-Slot Multi-Stream Watching (OP 20 STREAM_WATCH -> Stream Voice GW v8 -> NVDEC) ----------------
 
-    public async Task WatchStreamAsync(string guildId, string channelId, string streamerUserId, string streamerName, bool focusImmediately = true)
+    public async Task WatchStreamAsync(string guildId, string channelId, string streamerUserId, string streamerName, bool focusImmediately = true, bool selfMute = false, bool selfDeaf = false)
     {
         if (!VoiceConnected || _voiceChannelId != channelId)
         {
-            await JoinVoiceAsync(guildId, channelId);
-            await Task.Delay(500);
+            await JoinVoiceAsync(guildId, channelId, selfMute, selfDeaf);
+            for (int wait = 0; wait < 40 && string.IsNullOrEmpty(_voiceSessionId); wait++)
+                await Task.Delay(100);
         }
 
         WatchSession? existing;
@@ -2163,6 +2708,8 @@ public sealed class DiscordClient
         if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(ws.StreamKey))
             _ = SendWsTextAsync(_gw, $"{{\"op\":19,\"d\":{{\"stream_key\":\"{ws.StreamKey}\"}}}}", CancellationToken.None);
         try { ws.Cts?.Cancel(); } catch { }
+        try { ws.Cts?.Dispose(); } catch { }
+        ws.Cts = null;
         try { ws.Gw?.Dispose(); } catch { }
         ws.Gw = null;
         MediaNative.fc_watch_stop_slot(ws.Slot);
@@ -2170,21 +2717,21 @@ public sealed class DiscordClient
 
     // ---------------- Outbound Go Live Publisher (OP 18 STREAM_CREATE -> Stream GW v8 + DAVE -> NVENC TX) ----------------
 
-    public async Task StartPublishingGoLiveAsync(int width, int height, int fps)
+    public async Task StartPublishingGoLiveAsync(int width, int height, int fps, bool isDualScreen = false)
     {
         StopPublishingGoLive();
+        _pubWidth = width; _pubHeight = height; _pubFps = fps; _pubIsDualScreen = isDualScreen;
         if (IsDemoMode || !VoiceConnected || string.IsNullOrEmpty(_voiceGuildId) || string.IsNullOrEmpty(_voiceChannelId))
         {
             IsPublishingStream = true;
-            PublishStatus = "Локальный 4K Zero-Copy";
+            PublishStatus = isDualScreen ? $"Локально: 2 Экрана {width}×{height}" : "Локальный 4K Zero-Copy";
             Notify();
             return;
         }
 
-        _pubWidth = width; _pubHeight = height; _pubFps = fps;
         _pubStreamKey = $"guild:{_voiceGuildId}:{_voiceChannelId}:{Me.Id}";
         IsPublishingStream = true;
-        PublishStatus = "Запуск Go Live...";
+        PublishStatus = isDualScreen ? "Запуск Go Live (2 Экрана)..." : "Запуск Go Live...";
         Notify();
 
         if (_gw?.State == WebSocketState.Open)
@@ -2195,7 +2742,7 @@ public sealed class DiscordClient
             string prefJson = string.IsNullOrEmpty(pref) ? "null" : $"\"{pref}\"";
             await SendWsTextAsync(_gw, $"{{\"op\":18,\"d\":{{\"type\":\"guild\",\"guild_id\":\"{_voiceGuildId}\",\"channel_id\":\"{_voiceChannelId}\",\"preferred_region\":{prefJson}}}}}", CancellationToken.None);
             await SendWsTextAsync(_gw, $"{{\"op\":22,\"d\":{{\"stream_key\":\"{_pubStreamKey}\",\"paused\":false}}}}", CancellationToken.None);
-            SettingsStore.Log($"Sent OP 18 STREAM_CREATE (region={prefJson}) + OP 22 unpaused: {_pubStreamKey} ({width}x{height}@{fps})");
+            SettingsStore.Log($"Sent OP 18 STREAM_CREATE (region={prefJson}) + OP 22 unpaused: {_pubStreamKey} ({width}x{height}@{fps} dual={isDualScreen})");
         }
     }
 
@@ -2204,6 +2751,8 @@ public sealed class DiscordClient
         if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(_pubStreamKey))
             _ = SendWsTextAsync(_gw, $"{{\"op\":19,\"d\":{{\"stream_key\":\"{_pubStreamKey}\"}}}}", CancellationToken.None);
         try { _pubCts?.Cancel(); } catch { }
+        try { _pubCts?.Dispose(); } catch { }
+        _pubCts = null;
         try { _pubGw?.Dispose(); } catch { }
         _pubGw = null;
         MediaNative.fc_pub_disconnect();
@@ -2213,10 +2762,29 @@ public sealed class DiscordClient
         _pubToken = "";
         _pubEndpoint = "";
         _pubGwStarted = false;
+        _pubDaveTransitions.Clear();
+        _pubIsDualScreen = false;
         IsPublishingStream = false;
         PublishStatus = "";
         if (FocusedStreamUserId == "self") FocusedStreamUserId = null;
         Notify();
+    }
+
+    private void ParseStreamDelete(JsonElement d)
+    {
+        string sk = d.TryGetProperty("stream_key", out var ske) ? ske.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(sk)) return;
+        string? uidToStop = null;
+        lock (_watchLock)
+        {
+            var ws = _watches.Values.FirstOrDefault(w => w.StreamKey == sk);
+            if (ws != null) uidToStop = ws.StreamerUserId;
+        }
+        if (uidToStop != null)
+        {
+            SettingsStore.Log($"STREAM_DELETE received for {sk} -> stopping watch");
+            StopWatchingStream(uidToStop);
+        }
     }
 
     private void ParseStreamCreate(JsonElement d)
@@ -2273,7 +2841,9 @@ public sealed class DiscordClient
             string.IsNullOrEmpty(ws.Endpoint) || string.IsNullOrEmpty(_voiceSessionId)) return;
         ws.GwStarted = true;
         ws.Seq = -1;
-        ws.Cts?.Cancel();
+        ws.DaveTransitions.Clear();
+        try { ws.Cts?.Cancel(); } catch { }
+        try { ws.Cts?.Dispose(); } catch { }
         ws.Cts = new CancellationTokenSource();
         var ct = ws.Cts.Token;
 
@@ -2319,14 +2889,15 @@ public sealed class DiscordClient
 
                     if (op == 8)
                     {
-                        int hb = (int)data.GetProperty("heartbeat_interval").GetDouble();
+                        int hb = Math.Clamp((int)data.GetProperty("heartbeat_interval").GetDouble(), 2000, 15000);
+                        var hbGw = ws.Gw;
                         _ = Task.Run(async () =>
                         {
                             try
                             {
-                                while (!ct.IsCancellationRequested && ws.Gw?.State == WebSocketState.Open)
+                                while (!ct.IsCancellationRequested && hbGw?.State == WebSocketState.Open)
                                 {
-                                    await SendWsTextAsync(ws.Gw, $"{{\"op\":3,\"d\":{{\"t\":{Environment.TickCount64},\"seq_ack\":{ws.Seq}}}}}", ct);
+                                    await SendWsTextAsync(hbGw, $"{{\"op\":3,\"d\":{{\"t\":{Environment.TickCount64},\"seq_ack\":{ws.Seq}}}}}", ct);
                                     await Task.Delay(hb, ct);
                                 }
                             }
@@ -2336,12 +2907,19 @@ public sealed class DiscordClient
                     else if (op == 2)
                     {
                         mySsrc = data.GetProperty("ssrc").GetUInt32();
+                        ws.LocalSsrc = mySsrc;
                         string ip = data.GetProperty("ip").GetString() ?? "";
                         ushort port = (ushort)data.GetProperty("port").GetInt32();
                         if (DiscoverWatchEndpoint(ws.Slot, ip, port, mySsrc, App.StreamHwnds[ws.Slot], out string extIp, out ushort extPort))
                         {
                             string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"aead_xchacha20_poly1305_rtpsize\"}},\"codecs\":[{{\"name\":\"opus\",\"type\":\"audio\",\"priority\":1000,\"payload_type\":120}},{{\"name\":\"H264\",\"type\":\"video\",\"priority\":1000,\"payload_type\":101,\"rtx_payload_type\":102}}]}}}}";
                             await SendWsTextAsync(ws.Gw, sel, ct);
+                        }
+                        else
+                        {
+                            SettingsStore.Log($"WatchGW[{ws.Slot}] UDP discovery FAILED for {ip}:{port}");
+                            ws.Status = "Ошибка UDP стрима";
+                            Notify();
                         }
                     }
                     else if (op == 4)
@@ -2381,6 +2959,10 @@ public sealed class DiscordClient
                     }
                     else if (op == 12)
                     {
+                        string suid = data.TryGetProperty("user_id", out var ue) && ue.ValueKind == JsonValueKind.String
+                            ? ue.GetString() ?? ws.StreamerUserId : ws.StreamerUserId;
+                        if (!string.IsNullOrEmpty(suid) && suid != ws.StreamerUserId) continue;
+
                         uint vssrc = data.TryGetProperty("video_ssrc", out var vsEl) ? vsEl.GetUInt32() : 0;
                         uint assrc = data.TryGetProperty("audio_ssrc", out var asr) ? asr.GetUInt32() : 0;
                         if (data.TryGetProperty("streams", out var strs) && strs.ValueKind == JsonValueKind.Array)
@@ -2396,7 +2978,6 @@ public sealed class DiscordClient
                             }
                             if (bestSsrc != 0) vssrc = bestSsrc;
                         }
-                        string suid = data.TryGetProperty("user_id", out var ue) ? ue.GetString() ?? ws.StreamerUserId : ws.StreamerUserId;
                         if (vssrc != 0 || assrc != 0)
                         {
                             if (vssrc != 0) ws.VideoSsrc = vssrc;
@@ -2425,13 +3006,26 @@ public sealed class DiscordClient
                     }
                     else if (op == 21)
                     {
-                        ws.DaveVer = data.TryGetProperty("protocol_version", out var pv) ? (ushort)pv.GetInt32() : (ushort)1;
+                        ushort pv = data.TryGetProperty("protocol_version", out var pvEl) ? (ushort)pvEl.GetInt32() : (ushort)1;
                         int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
-                        if (tid != 0) await SendWsTextAsync(ws.Gw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                        ws.DaveVer = pv;
+                        if (tid == 0)
+                        {
+                            MediaNative.fc_watch_dave_execute_transition_slot(ws.Slot, pv);
+                            string onMsg = ws.VideoSsrc != 0 ? $"{{\"op\":15,\"d\":{{\"{ws.VideoSsrc}\":100,\"any\":100}}}}" : "{\"op\":15,\"d\":{\"any\":100}}";
+                            await SendWsTextAsync(ws.Gw, onMsg, ct);
+                        }
+                        else
+                        {
+                            ws.DaveTransitions[tid] = pv;
+                            await SendWsTextAsync(ws.Gw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                        }
                     }
                     else if (op == 22)
                     {
-                        MediaNative.fc_watch_dave_execute_transition_slot(ws.Slot, ws.DaveVer);
+                        int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
+                        ushort ver = ws.DaveTransitions.Remove(tid, out var v) ? v : ws.DaveVer;
+                        MediaNative.fc_watch_dave_execute_transition_slot(ws.Slot, ver);
                         // Request full quality right AFTER DAVE key ratchet is active so the SFU's fresh IDR keyframe decrypts cleanly!
                         string onMsg = ws.VideoSsrc != 0 ? $"{{\"op\":15,\"d\":{{\"{ws.VideoSsrc}\":100,\"any\":100}}}}" : "{\"op\":15,\"d\":{\"any\":100}}";
                         await SendWsTextAsync(ws.Gw, onMsg, ct);
@@ -2443,7 +3037,7 @@ public sealed class DiscordClient
                 if (!ct.IsCancellationRequested)
                 {
                     ws.Status = "Ошибка стрима: " + ex.Message;
-                    SettingsStore.Log($"WatchGW[{ws.Slot}] error: " + ex);
+                    SettingsStore.Log($"WatchGW[{ws.Slot}] error: " + ex.Message);
                     Notify();
                 }
             }
@@ -2479,7 +3073,7 @@ public sealed class DiscordClient
                     SettingsStore.Log($"WatchGW[{ws.Slot}] DAVE Commit failed tid={tid} -> OP31 recovery");
                     await SendWsTextAsync(ws.Gw, $"{{\"op\":31,\"d\":{{\"transition_id\":{tid}}}}}", ct);
                     ulong ch64 = ulong.TryParse(ws.RtcChannelId, out var c64) ? c64 : (ulong.TryParse(_voiceChannelId, out var c2) ? c2 : 0);
-                    MediaNative.fc_watch_dave_init_slot(ws.Slot, 1, ch64, Me.Id, 0);
+                    MediaNative.fc_watch_dave_init_slot(ws.Slot, 1, ch64, Me.Id, ws.LocalSsrc);
                     MediaNative.fc_watch_dave_add_user_slot(ws.Slot, ws.StreamerUserId);
                     var kp = GetWatchDaveKeyPackage(ws.Slot);
                     if (kp.Length > 0) await SendWsBinaryAsync(ws.Gw, 26, kp, ct);
@@ -2510,7 +3104,7 @@ public sealed class DiscordClient
                     SettingsStore.Log($"WatchGW[{ws.Slot}] DAVE Welcome failed tid={tid} -> OP31 recovery");
                     await SendWsTextAsync(ws.Gw, $"{{\"op\":31,\"d\":{{\"transition_id\":{tid}}}}}", ct);
                     ulong ch64 = ulong.TryParse(ws.RtcChannelId, out var c64) ? c64 : (ulong.TryParse(_voiceChannelId, out var c2) ? c2 : 0);
-                    MediaNative.fc_watch_dave_init_slot(ws.Slot, 1, ch64, Me.Id, 0);
+                    MediaNative.fc_watch_dave_init_slot(ws.Slot, 1, ch64, Me.Id, ws.LocalSsrc);
                     MediaNative.fc_watch_dave_add_user_slot(ws.Slot, ws.StreamerUserId);
                     var kp = GetWatchDaveKeyPackage(ws.Slot);
                     if (kp.Length > 0) await SendWsBinaryAsync(ws.Gw, 26, kp, ct);
@@ -2526,7 +3120,9 @@ public sealed class DiscordClient
             string.IsNullOrEmpty(_pubEndpoint) || string.IsNullOrEmpty(_voiceSessionId)) return;
         _pubGwStarted = true;
         _pubSeq = -1;
-        _pubCts?.Cancel();
+        _pubDaveTransitions.Clear();
+        try { _pubCts?.Cancel(); } catch { }
+        try { _pubCts?.Dispose(); } catch { }
         _pubCts = new CancellationTokenSource();
         var ct = _pubCts.Token;
 
@@ -2568,14 +3164,15 @@ public sealed class DiscordClient
 
                     if (op == 8)
                     {
-                        int hb = (int)data.GetProperty("heartbeat_interval").GetDouble();
+                        int hb = Math.Clamp((int)data.GetProperty("heartbeat_interval").GetDouble(), 2000, 15000);
+                        var hbGw = _pubGw;
                         _ = Task.Run(async () =>
                         {
                             try
                             {
-                                while (!ct.IsCancellationRequested && _pubGw?.State == WebSocketState.Open)
+                                while (!ct.IsCancellationRequested && hbGw?.State == WebSocketState.Open)
                                 {
-                                    await SendWsTextAsync(_pubGw, $"{{\"op\":3,\"d\":{{\"t\":{Environment.TickCount64},\"seq_ack\":{_pubSeq}}}}}", ct);
+                                    await SendWsTextAsync(hbGw, $"{{\"op\":3,\"d\":{{\"t\":{Environment.TickCount64},\"seq_ack\":{_pubSeq}}}}}", ct);
                                     await Task.Delay(hb, ct);
                                 }
                             }
@@ -2587,6 +3184,7 @@ public sealed class DiscordClient
                         mySsrc = data.GetProperty("ssrc").GetUInt32();
                         _pubMySsrc = mySsrc;
                         videoSsrc = mySsrc + 1;
+                        _pubVideoSsrc = videoSsrc;
                         rtxSsrc = mySsrc + 2;
                         string ip = data.GetProperty("ip").GetString() ?? "";
                         ushort port = (ushort)data.GetProperty("port").GetInt32();
@@ -2595,6 +3193,12 @@ public sealed class DiscordClient
                             MediaNative.fc_pub_set_video_ssrc(videoSsrc);
                             string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"aead_xchacha20_poly1305_rtpsize\"}},\"codecs\":[{{\"name\":\"opus\",\"type\":\"audio\",\"priority\":1000,\"payload_type\":120}},{{\"name\":\"H264\",\"type\":\"video\",\"priority\":1000,\"payload_type\":101,\"rtx_payload_type\":102,\"encode\":true,\"decode\":true}}]}}}}";
                             await SendWsTextAsync(_pubGw, sel, ct);
+                        }
+                        else
+                        {
+                            SettingsStore.Log($"PubGW UDP discovery FAILED for {ip}:{port}");
+                            PublishStatus = "Ошибка UDP Go Live";
+                            Notify();
                         }
                     }
                     else if (op == 4)
@@ -2621,14 +3225,18 @@ public sealed class DiscordClient
                         await SendWsTextAsync(_pubGw, $"{{\"op\":5,\"d\":{{\"speaking\":1,\"delay\":0,\"ssrc\":{mySsrc}}}}}", ct);
 
                         // Announce our H.264 stream SSRC + resolution/fps via OP 12 VIDEO (type="video" per Discord RTC spec!)
-                        int maxBr = _pubHeight >= 2160 ? 12000000 : _pubHeight >= 1440 ? 9500000 : 7500000;
+                        int cfgBr = Math.Clamp(SettingsStore.Current.StreamBitrateKbps * 1000, 2000000, 25000000);
+                        int minBr = _pubIsDualScreen ? 12000000 : (_pubHeight >= 2160 ? 12000000 : _pubHeight >= 1440 ? 9500000 : 7500000);
+                        int maxBr = Math.Max(cfgBr, minBr);
                         string op12 = $"{{\"op\":12,\"d\":{{\"audio_ssrc\":{mySsrc},\"video_ssrc\":{videoSsrc},\"rtx_ssrc\":{rtxSsrc},\"streams\":[{{\"type\":\"video\",\"rid\":\"100\",\"ssrc\":{videoSsrc},\"active\":true,\"quality\":100,\"rtx_ssrc\":{rtxSsrc},\"max_bitrate\":{maxBr},\"max_framerate\":{_pubFps},\"max_resolution\":{{\"type\":\"fixed\",\"width\":{_pubWidth},\"height\":{_pubHeight}}}}}]}}}}";
                         await SendWsTextAsync(_pubGw, op12, ct);
                         MediaNative.fc_pub_request_keyframe();
 
                         PubEndpointHost = _pubEndpoint.Split(':')[0].Replace(".discord.media", "");
-                        PublishStatus = $"В эфире {_pubHeight}p {_pubFps}fps";
-                        SettingsStore.Log($"PubGW LIVE! host={PubEndpointHost} audio_ssrc={mySsrc} video_ssrc={videoSsrc} dave_ver={dv} max_br={maxBr}");
+                        PublishStatus = _pubIsDualScreen
+                            ? $"2 Экрана {_pubWidth}×{_pubHeight} {_pubFps}fps"
+                            : $"В эфире {_pubHeight}p {_pubFps}fps";
+                        SettingsStore.Log($"PubGW LIVE! host={PubEndpointHost} audio_ssrc={mySsrc} video_ssrc={videoSsrc} dave_ver={dv} max_br={maxBr} dual={_pubIsDualScreen}");
                         Notify();
                     }
                     else if (op == 11 && data.TryGetProperty("user_ids", out var uids) && uids.ValueKind == JsonValueKind.Array)
@@ -2643,16 +3251,29 @@ public sealed class DiscordClient
                         MediaNative.fc_pub_dave_remove_user(du.GetString()!);
                     else if (op == 21)
                     {
-                        _pubDaveVer = data.TryGetProperty("protocol_version", out var pv) ? (ushort)pv.GetInt32() : (ushort)1;
+                        ushort pv = data.TryGetProperty("protocol_version", out var pvEl) ? (ushort)pvEl.GetInt32() : (ushort)1;
                         int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
-                        if (tid != 0) await SendWsTextAsync(_pubGw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                        _pubDaveVer = pv;
+                        if (tid == 0)
+                        {
+                            MediaNative.fc_pub_dave_execute_transition(pv);
+                            if (mySsrc != 0) await SendWsTextAsync(_pubGw, $"{{\"op\":5,\"d\":{{\"speaking\":1,\"delay\":0,\"ssrc\":{mySsrc}}}}}", ct);
+                            MediaNative.fc_pub_request_keyframe();
+                        }
+                        else
+                        {
+                            _pubDaveTransitions[tid] = pv;
+                            await SendWsTextAsync(_pubGw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                        }
                     }
                     else if (op == 22)
                     {
-                        MediaNative.fc_pub_dave_execute_transition(_pubDaveVer);
+                        int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
+                        ushort ver = _pubDaveTransitions.Remove(tid, out var v) ? v : _pubDaveVer;
+                        MediaNative.fc_pub_dave_execute_transition(ver);
                         if (mySsrc != 0) await SendWsTextAsync(_pubGw, $"{{\"op\":5,\"d\":{{\"speaking\":1,\"delay\":0,\"ssrc\":{mySsrc}}}}}", ct);
                         MediaNative.fc_pub_request_keyframe();
-                        SettingsStore.Log($"PubGW DAVE ExecuteTransition ver={_pubDaveVer} -> OP5 audio + forced IDR keyframe");
+                        SettingsStore.Log($"PubGW DAVE ExecuteTransition ver={ver} -> OP5 audio + forced IDR keyframe");
                     }
                     else if (op == 24)
                     {
@@ -2674,7 +3295,7 @@ public sealed class DiscordClient
                 if (!ct.IsCancellationRequested)
                 {
                     PublishStatus = "Ошибка Go Live: " + ex.Message;
-                    SettingsStore.Log("PubGW error: " + ex);
+                    SettingsStore.Log("PubGW error: " + ex.Message);
                     Notify();
                 }
             }
@@ -2714,7 +3335,12 @@ public sealed class DiscordClient
                 }
                 else if (_pubGw != null)
                 {
+                    SettingsStore.Log($"PubGW DAVE Commit failed tid={tid} -> OP31 recovery");
                     await SendWsTextAsync(_pubGw, $"{{\"op\":31,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                    ulong ch64 = ulong.TryParse(_pubRtcChannelId, out var c64) ? c64 : (ulong.TryParse(_voiceChannelId, out var c2) ? c2 : 0);
+                    MediaNative.fc_pub_dave_init(1, ch64, Me.Id, _pubMySsrc, _pubVideoSsrc);
+                    var kp = GetPubDaveKeyPackage();
+                    if (kp.Length > 0) await SendWsBinaryAsync(_pubGw, 26, kp, ct);
                 }
                 break;
             }
@@ -2736,7 +3362,12 @@ public sealed class DiscordClient
                 }
                 else if (_pubGw != null)
                 {
+                    SettingsStore.Log($"PubGW DAVE Welcome failed tid={tid} -> OP31 recovery");
                     await SendWsTextAsync(_pubGw, $"{{\"op\":31,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                    ulong ch64 = ulong.TryParse(_pubRtcChannelId, out var c64) ? c64 : (ulong.TryParse(_voiceChannelId, out var c2) ? c2 : 0);
+                    MediaNative.fc_pub_dave_init(1, ch64, Me.Id, _pubMySsrc, _pubVideoSsrc);
+                    var kp = GetPubDaveKeyPackage();
+                    if (kp.Length > 0) await SendWsBinaryAsync(_pubGw, 26, kp, ct);
                 }
                 break;
             }
@@ -2784,7 +3415,7 @@ public sealed class DiscordClient
     private static unsafe void SetTransportKey(byte[] k, bool x) { fixed (byte* p = k) MediaNative.fc_transport_set_key(p, x ? 1 : 0); }
     private static unsafe byte[] GetDaveKeyPackage() { var t = new byte[4096]; int n; fixed (byte* p = t) n = MediaNative.fc_dave_get_key_package(p, t.Length); return n > 0 ? t[..n] : []; }
     private static unsafe void SetDaveExternalSender(byte[] b, int o, int l) { fixed (byte* p = b) MediaNative.fc_dave_set_external_sender(p + o, l); }
-    private static unsafe byte[] ProcessDaveProposals(byte[] b, int o, int l) { var t = new byte[16384]; int n; fixed (byte* pi = b) fixed (byte* po = t) n = MediaNative.fc_dave_process_proposals(pi + o, l, po, t.Length); return n > 0 ? t[..n] : []; }
+    private static unsafe byte[] ProcessDaveProposals(byte[] b, int o, int l) { var t = new byte[65536]; int n; fixed (byte* pi = b) fixed (byte* po = t) n = MediaNative.fc_dave_process_proposals(pi + o, l, po, t.Length); return n > 0 ? t[..n] : []; }
     private static unsafe bool ProcessDaveCommit(byte[] b, int o, int l) { fixed (byte* p = b) return MediaNative.fc_dave_process_commit(p + o, l) != 0; }
     private static unsafe bool ProcessDaveWelcome(byte[] b, int o, int l) { fixed (byte* p = b) return MediaNative.fc_dave_process_welcome(p + o, l) != 0; }
 
@@ -2798,7 +3429,7 @@ public sealed class DiscordClient
     private static unsafe void SetWatchKey(int slot, byte[] k, bool x) { fixed (byte* p = k) MediaNative.fc_watch_set_key_slot(slot, p, x ? 1 : 0); }
     private static unsafe byte[] GetWatchDaveKeyPackage(int slot) { var b = new byte[4096]; int n; fixed (byte* p = b) n = MediaNative.fc_watch_dave_get_key_package_slot(slot, p, b.Length); return n > 0 ? b[..n] : []; }
     private static unsafe void SetWatchDaveExtSender(int slot, byte[] b, int o, int l) { fixed (byte* p = b) MediaNative.fc_watch_dave_set_external_sender_slot(slot, p + o, l); }
-    private static unsafe byte[] ProcessWatchDaveProposals(int slot, byte[] b, int o, int l) { var t = new byte[16384]; int n; fixed (byte* pi = b) fixed (byte* po = t) n = MediaNative.fc_watch_dave_process_proposals_slot(slot, pi + o, l, po, t.Length); return n > 0 ? t[..n] : []; }
+    private static unsafe byte[] ProcessWatchDaveProposals(int slot, byte[] b, int o, int l) { var t = new byte[65536]; int n; fixed (byte* pi = b) fixed (byte* po = t) n = MediaNative.fc_watch_dave_process_proposals_slot(slot, pi + o, l, po, t.Length); return n > 0 ? t[..n] : []; }
     private static unsafe bool ProcessWatchDaveCommit(int slot, byte[] b, int o, int l) { fixed (byte* p = b) return MediaNative.fc_watch_dave_process_commit_slot(slot, p + o, l) != 0; }
     private static unsafe bool ProcessWatchDaveWelcome(int slot, byte[] b, int o, int l) { fixed (byte* p = b) return MediaNative.fc_watch_dave_process_welcome_slot(slot, p + o, l) != 0; }
 
@@ -2812,7 +3443,7 @@ public sealed class DiscordClient
     private static unsafe void SetPubKey(byte[] k, bool x) { fixed (byte* p = k) MediaNative.fc_pub_set_key(p, x ? 1 : 0); }
     private static unsafe byte[] GetPubDaveKeyPackage() { var b = new byte[4096]; int n; fixed (byte* p = b) n = MediaNative.fc_pub_dave_get_key_package(p, b.Length); return n > 0 ? b[..n] : []; }
     private static unsafe void SetPubDaveExtSender(byte[] b, int o, int l) { fixed (byte* p = b) MediaNative.fc_pub_dave_set_external_sender(p + o, l); }
-    private static unsafe byte[] ProcessPubDaveProposals(byte[] b, int o, int l) { var t = new byte[16384]; int n; fixed (byte* pi = b) fixed (byte* po = t) n = MediaNative.fc_pub_dave_process_proposals(pi + o, l, po, t.Length); return n > 0 ? t[..n] : []; }
+    private static unsafe byte[] ProcessPubDaveProposals(byte[] b, int o, int l) { var t = new byte[65536]; int n; fixed (byte* pi = b) fixed (byte* po = t) n = MediaNative.fc_pub_dave_process_proposals(pi + o, l, po, t.Length); return n > 0 ? t[..n] : []; }
     private static unsafe bool ProcessPubDaveCommit(byte[] b, int o, int l) { fixed (byte* p = b) return MediaNative.fc_pub_dave_process_commit(p + o, l) != 0; }
     private static unsafe bool ProcessPubDaveWelcome(byte[] b, int o, int l) { fixed (byte* p = b) return MediaNative.fc_pub_dave_process_welcome(p + o, l) != 0; }
 }

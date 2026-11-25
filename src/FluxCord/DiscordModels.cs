@@ -119,6 +119,8 @@ public sealed class DiscordMessage
     public List<DiscordAttachment> Attachments = [];
     public List<DiscordEmbed> Embeds = [];
     public List<string> Reactions = [];
+    public HashSet<string> MyReactions = [];
+    public bool IsEdited;
     public bool Pending;
 
     public string? AvatarUrl => string.IsNullOrEmpty(AuthorAvatar)

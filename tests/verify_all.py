@@ -102,6 +102,17 @@ enc_name = st.encoder_name.decode("utf-8", "ignore")
 check(ok_scr == 1 and st.zero_copy == 1 and "NVIDIA" in enc_name,
       f"Zero-Copy NVENC + System Audio Loopback: {st.width}x{st.height} zero_copy={st.zero_copy} enc='{enc_name}' enc_ms={st.encode_ms:.2f}ms kbps={st.bitrate_kbps:.0f}")
 
+# 3b. Zero-Copy 32:9 Dual-Screen Composite (Monitor 1 + Monitor 2 simultaneously in VRAM -> NVENC 3840x1080!)
+if nm >= 2:
+    ok_dual = dll.fc_screen_start_ex(-2, ctypes.c_uint64(0), 3840, 1080, 60, 14000, 0, 0, None, 0, b"")
+    time.sleep(1.2)
+    dst = FcScreenStats()
+    dll.fc_screen_get_stats(ctypes.byref(dst))
+    dll.fc_screen_stop()
+    denc = dst.encoder_name.decode("utf-8", "ignore")
+    check(ok_dual == 1 and dst.zero_copy == 1 and dst.width == 3840 and dst.height == 1080 and dst.frames_encoded >= 1,
+          f"Zero-Copy Dual-Screen Composite (-2): {dst.width}x{dst.height} frames={dst.frames_encoded} enc='{denc}' enc_ms={dst.encode_ms:.2f}ms kbps={dst.bitrate_kbps:.0f}")
+
 # 4. ALL 6 Noise Suppressor Modes on live WASAPI Pro Audio
 dll.fc_voice_start(b"", b"")
 for mode_id, label in [(0, "Off"), (1, "StudioDSP"), (2, "RNNoise"), (3, "DeepFilterNet3"), (4, "NvidiaBroadcast"), (5, "AutoBest")]:

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using Vortice.DCommon;
@@ -12,12 +13,16 @@ namespace FluxCord;
 public enum ImgMask { None = 0, Circle = 1, Squircle = 2 }
 
 /// <summary>
-/// Fast native WIC image decoder + disk cache + Direct2D VRAM bitmap cache (FluxTube-style).
-/// Downloads Discord server icons, user avatars, and chat images asynchronously without blocking UI.
-/// Bakes anti-aliased circular / squircle alpha masks once on decode so rendering is a single GPU blit.
+/// Fast native WIC image decoder + bounded disk/VRAM bitmap cache (FluxTube-style).
+/// Fixes inflight leak on GPU device reset / transient network failures & bounds VRAM via LRU eviction.
 /// </summary>
-public static class ImageCache
+public static partial class ImageCache
 {
+    private const int MaxGpuBitmaps = 256;
+
+    [LibraryImport("ole32.dll")]
+    private static partial int CoInitializeEx(nint pvReserved, uint dwCoInit);
+
     private sealed class DecodedImg
     {
         public byte[] Pixels = [];
@@ -34,8 +39,10 @@ public static class ImageCache
     { Timeout = TimeSpan.FromSeconds(12) };
 
     private static readonly ConcurrentDictionary<string, ID2D1Bitmap1> _gpu = new();
+    private static readonly ConcurrentDictionary<string, long> _gpuLastUsed = new();
     private static readonly ConcurrentDictionary<string, DecodedImg> _ready = new();
     private static readonly ConcurrentDictionary<string, byte> _inflight = new();
+    private static readonly ConcurrentDictionary<string, long> _failCooldownUntil = new();
     private static readonly ConcurrentDictionary<string, uint> _dominant = new();
     private static readonly SemaphoreSlim _sem = new(6);
 
@@ -55,13 +62,18 @@ public static class ImageCache
 
     public static unsafe ID2D1Bitmap1? Get(string? url, int maxDim = 96, ImgMask mask = ImgMask.None)
     {
-        if (string.IsNullOrEmpty(url)) return null;
+        if (string.IsNullOrEmpty(url) || Gfx.DC == null) return null;
         string key = $"{url}|{maxDim}|{(int)mask}";
 
-        if (_gpu.TryGetValue(key, out var bmp)) return bmp;
+        if (_gpu.TryGetValue(key, out var bmp))
+        {
+            _gpuLastUsed[key] = Environment.TickCount64;
+            return bmp;
+        }
 
         if (_ready.TryRemove(key, out var dec))
         {
+            EvictGpuIfNeeded();
             fixed (byte* p = dec.Pixels)
             {
                 var created = Gfx.DC.CreateBitmap(
@@ -70,9 +82,13 @@ public static class ImageCache
                     (uint)(dec.W * 4),
                     new BitmapProperties1(new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, D2DAlpha.Premultiplied), 96, 96, BitmapOptions.None));
                 _gpu[key] = created;
+                _gpuLastUsed[key] = Environment.TickCount64;
                 return created;
             }
         }
+
+        if (_failCooldownUntil.TryGetValue(key, out var until) && Environment.TickCount64 < until)
+            return null;
 
         if (_inflight.TryAdd(key, 1))
         {
@@ -88,7 +104,11 @@ public static class ImageCache
     {
         if (string.IsNullOrEmpty(filePath) || Gfx.DC == null) return null;
         string key = $"local:{filePath}|{maxDim}|{(int)mask}";
-        if (_gpu.TryGetValue(key, out var bmp)) return bmp;
+        if (_gpu.TryGetValue(key, out var bmp))
+        {
+            _gpuLastUsed[key] = Environment.TickCount64;
+            return bmp;
+        }
         if (!File.Exists(filePath)) return null;
         try
         {
@@ -103,15 +123,35 @@ public static class ImageCache
                     (uint)(dec.W * 4),
                     new BitmapProperties1(new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, D2DAlpha.Premultiplied), 96, 96, BitmapOptions.None));
                 _gpu[key] = created;
+                _gpuLastUsed[key] = Environment.TickCount64;
                 return created;
             }
         }
         catch { return null; }
     }
 
+    private static void EvictGpuIfNeeded()
+    {
+        if (_gpu.Count < MaxGpuBitmaps) return;
+        // Evict oldest 48 non-local GPU bitmaps on UI thread to keep VRAM bounded (<40 MB)
+        var victims = _gpuLastUsed
+            .Where(kv => !kv.Key.StartsWith("local:", StringComparison.Ordinal))
+            .OrderBy(kv => kv.Value)
+            .Take(48)
+            .Select(kv => kv.Key)
+            .ToList();
+        foreach (var k in victims)
+        {
+            _gpuLastUsed.TryRemove(k, out _);
+            if (_gpu.TryRemove(k, out var b))
+                try { b.Dispose(); } catch { }
+        }
+    }
+
     private static async Task FetchAndDecodeAsync(string url, string key, int maxDim, ImgMask mask)
     {
         await _sem.WaitAsync();
+        bool ok = false;
         try
         {
             string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(url)))[..24];
@@ -137,20 +177,49 @@ public static class ImageCache
             if (dec != null)
             {
                 _ready[key] = dec;
+                _failCooldownUntil.TryRemove(key, out _);
+                ok = true;
                 App.WakeUi();
             }
         }
         catch { }
         finally
         {
+            if (!ok) _failCooldownUntil[key] = Environment.TickCount64 + 30_000; // retry after 30s on network glitch
+            _inflight.TryRemove(key, out _);
             _sem.Release();
         }
+    }
+
+    /// <summary>Encodes raw 32bpp/24bpp BMP bytes into a compact PNG file (used by Ctrl+V screenshot paste!).</summary>
+    public static byte[]? ConvertImageToPng(byte[] raw)
+    {
+        try
+        {
+            CoInitializeEx(0, 0); // COINIT_MULTITHREADED (harmless if already initialized)
+            using var fac = new IWICImagingFactory();
+            using var inStream = fac.CreateStream(raw);
+            using var decoder = fac.CreateDecoderFromStream(inStream, DecodeOptions.CacheOnLoad);
+            using var frame = decoder.GetFrame(0);
+            using var ms = new MemoryStream();
+            using var outStream = fac.CreateStream(ms);
+            using var encoder = fac.CreateEncoder(ContainerFormat.Png);
+            encoder.Initialize(outStream, BitmapEncoderCacheOption.NoCache);
+            using var outFrame = encoder.CreateNewFrame(out _);
+            outFrame.Initialize();
+            outFrame.WriteSource(frame);
+            outFrame.Commit();
+            encoder.Commit();
+            return ms.ToArray();
+        }
+        catch { return null; }
     }
 
     private static DecodedImg? DecodeWic(byte[] raw, int maxDim, ImgMask mask, string url)
     {
         try
         {
+            CoInitializeEx(0, 0); // Ensure COM initialized on arbitrary ThreadPool worker under NativeAOT
             using var fac = new IWICImagingFactory();
             using var stream = fac.CreateStream(raw);
             using var decoder = fac.CreateDecoderFromStream(stream, DecodeOptions.CacheOnLoad);
@@ -184,7 +253,6 @@ public static class ImageCache
             conv.CopyPixels((uint)(dstW * 4), pixels);
             scaler?.Dispose();
 
-            // Sample soft Discord-style card tint from avatar pixels before circular masking
             if (mask == ImgMask.Circle && !_dominant.ContainsKey(url))
             {
                 long sr = 0, sg = 0, sb = 0, cnt = 0;
@@ -197,7 +265,6 @@ public static class ImageCache
                 }
                 if (cnt > 0)
                 {
-                    // Rich muted tone (dark avatars stay crisp dark #111216, warm/pastel avatars get soft GoofCord card tint!)
                     int r = (int)Math.Clamp((sr / cnt) * 0.58 + 10, 14, 158);
                     int g = (int)Math.Clamp((sg / cnt) * 0.58 + 10, 14, 148);
                     int b = (int)Math.Clamp((sb / cnt) * 0.58 + 12, 16, 158);
@@ -257,7 +324,12 @@ public static class ImageCache
 
     public static void ClearGpu()
     {
-        foreach (var b in _gpu.Values) b.Dispose();
+        foreach (var b in _gpu.Values)
+            try { b.Dispose(); } catch { }
         _gpu.Clear();
+        _gpuLastUsed.Clear();
+        _ready.Clear();
+        _inflight.Clear();
+        _failCooldownUntil.Clear();
     }
 }

@@ -42,8 +42,14 @@ public:
     bool daveProcessWelcome(const uint8_t* data, int32_t len);
     void daveExecuteTransition(uint16_t protocol_version);
 
-    void setAudioRxCallback(AudioRxCallback cb) { rx_cb_ = std::move(cb); }
-    void setPliCallback(std::function<void()> cb) { pli_cb_ = std::move(cb); }
+    void setAudioRxCallback(AudioRxCallback cb) {
+        std::lock_guard lk(cb_mtx_);
+        rx_cb_ = std::move(cb);
+    }
+    void setPliCallback(std::function<void()> cb) {
+        std::lock_guard lk(cb_mtx_);
+        pli_cb_ = std::move(cb);
+    }
     int32_t txPackets() const { return tx_pkts_.load(); }
     int32_t audioTxPackets() const { return audio_tx_pkts_.load(); }
     int32_t videoTxPackets() const { return video_tx_pkts_.load(); }
@@ -55,19 +61,24 @@ public:
 
 private:
     void rxLoop();
+    void disconnectLocked();
     void daveDestroyLocked();
     void daveRefreshRatchetsLocked(uint16_t protocol_version);
-    bool sendEncryptedRtp(uint8_t payload_type, uint16_t seq, uint32_t ts, uint32_t ssrc, bool marker, const uint8_t* payload, int len);
+    bool sendEncryptedRtpLocked(uint8_t payload_type, uint16_t seq, uint32_t ts, uint32_t ssrc, bool marker, const uint8_t* payload, int len);
 
+    bool wsa_ok_ = false;
+    std::mutex lifecycle_mtx_;
     SOCKET sock_ = INVALID_SOCKET;
+    ULONG qos_flow_id_ = 0;
     sockaddr_in remote_{};
-    uint32_t ssrc_ = 0;
+    std::atomic<uint32_t> ssrc_{0};
     uint16_t audio_seq_ = 0;
     uint16_t video_seq_ = 0;
     uint32_t nonce_counter_ = 1;
     uint32_t last_audio_ts_ = 0;
 
     std::mutex tx_mtx_;
+    std::mutex key_mtx_;
     uint8_t key_[32]{};
     bool use_xchacha_ = true;
     std::atomic<bool> connected_{false};
@@ -89,9 +100,14 @@ private:
     uint16_t dave_proto_ver_ = 0;
     std::map<uint32_t, std::string> ssrc_to_user_;
     std::map<std::string, DAVEDecryptorHandle> user_decryptors_;
-    std::vector<uint8_t> cached_sps_pps_;
+    std::map<std::string, bool> user_has_ratchet_;
+
+    std::mutex video_mtx_;
+    std::vector<uint8_t> cached_sps_;
+    std::vector<uint8_t> cached_pps_;
 
     std::thread rx_thread_;
+    std::mutex cb_mtx_;
     AudioRxCallback rx_cb_;
     std::function<void()> pli_cb_;
 };

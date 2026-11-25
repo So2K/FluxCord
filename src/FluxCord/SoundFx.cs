@@ -20,7 +20,7 @@ public enum UiSound
 /// <summary>
 /// Zero-dependency, <2ms latency Discord-style tactile UI sound engine.
 /// Pre-synthesizes smooth anti-aliased harmonic PCM chimes into permanently pinned native memory buffers
-/// and plays asynchronously via winmm.dll PlaySoundW (never blocks UI, GC-safe, works even outside voice).
+/// and plays asynchronously via winmm.dll PlaySoundW (thread-safe, zero UAF on volume rebuild).
 /// </summary>
 public static unsafe partial class SoundFx
 {
@@ -38,34 +38,35 @@ public static unsafe partial class SoundFx
     private static float _builtVolume = -1f;
     private static long _lastMsgSoundTick;
 
+    private static void EnsureBuiltLocked(float vol)
+    {
+        if (_nativeWavs.Count > 0 && MathF.Abs(vol - _builtVolume) < 0.02f) return;
+        // Stop any currently playing async sound BEFORE freeing old native buffers (inside _lock -> zero UAF!)
+        PlaySoundW(null, 0, 0);
+        foreach (var kv in _nativeWavs.Values)
+        {
+            if (kv.Ptr != 0) NativeMemory.Free((void*)kv.Ptr);
+        }
+        _nativeWavs.Clear();
+        _builtVolume = vol;
+
+        Store(UiSound.VoiceJoin,   BuildNotes([(523.25f, 0.00f, 0.085f, 0.28f), (659.25f, 0.065f, 0.130f, 0.30f)], vol));
+        Store(UiSound.VoiceLeave,  BuildNotes([(523.25f, 0.00f, 0.075f, 0.25f), (392.00f, 0.060f, 0.135f, 0.26f)], vol));
+        Store(UiSound.UserJoin,    BuildNotes([(698.46f, 0.00f, 0.070f, 0.20f), (880.00f, 0.055f, 0.095f, 0.22f)], vol));
+        Store(UiSound.UserLeave,   BuildNotes([(587.33f, 0.00f, 0.065f, 0.18f), (440.00f, 0.050f, 0.090f, 0.19f)], vol));
+        Store(UiSound.Mute,        BuildNotes([(440.00f, 0.00f, 0.050f, 0.24f), (311.13f, 0.040f, 0.070f, 0.24f)], vol));
+        Store(UiSound.Unmute,      BuildNotes([(349.23f, 0.00f, 0.050f, 0.24f), (523.25f, 0.040f, 0.075f, 0.26f)], vol));
+        Store(UiSound.Deafen,      BuildNotes([(415.30f, 0.00f, 0.055f, 0.25f), (277.18f, 0.050f, 0.090f, 0.25f)], vol));
+        Store(UiSound.Undeafen,    BuildNotes([(329.63f, 0.00f, 0.055f, 0.25f), (554.37f, 0.050f, 0.095f, 0.26f)], vol));
+        Store(UiSound.StreamStart, BuildNotes([(587.33f, 0.00f, 0.080f, 0.24f), (783.99f, 0.065f, 0.090f, 0.25f), (1046.50f, 0.130f, 0.150f, 0.24f)], vol));
+        Store(UiSound.StreamStop,  BuildNotes([(783.99f, 0.00f, 0.075f, 0.22f), (523.25f, 0.065f, 0.120f, 0.22f)], vol));
+        Store(UiSound.Message,     BuildNotes([(783.99f, 0.00f, 0.045f, 0.20f), (1046.50f, 0.040f, 0.070f, 0.18f)], vol));
+    }
+
     public static void EnsureBuilt()
     {
         float vol = Math.Clamp(SettingsStore.Current.UiSoundsVolume, 0f, 1f);
-        lock (_lock)
-        {
-            if (_nativeWavs.Count > 0 && MathF.Abs(vol - _builtVolume) < 0.02f) return;
-            // Stop any currently playing async sound before freeing old buffers!
-            PlaySoundW(null, 0, 0);
-            foreach (var kv in _nativeWavs.Values)
-            {
-                if (kv.Ptr != 0) NativeMemory.Free((void*)kv.Ptr);
-            }
-            _nativeWavs.Clear();
-            _builtVolume = vol;
-
-            // Warm, clean Discord-inspired two-tone and single-tone harmonic chimes (48kHz 16-bit mono)
-            Store(UiSound.VoiceJoin,   BuildNotes([(523.25f, 0.00f, 0.085f, 0.28f), (659.25f, 0.065f, 0.130f, 0.30f)], vol));
-            Store(UiSound.VoiceLeave,  BuildNotes([(523.25f, 0.00f, 0.075f, 0.25f), (392.00f, 0.060f, 0.135f, 0.26f)], vol));
-            Store(UiSound.UserJoin,    BuildNotes([(698.46f, 0.00f, 0.070f, 0.20f), (880.00f, 0.055f, 0.095f, 0.22f)], vol));
-            Store(UiSound.UserLeave,   BuildNotes([(587.33f, 0.00f, 0.065f, 0.18f), (440.00f, 0.050f, 0.090f, 0.19f)], vol));
-            Store(UiSound.Mute,        BuildNotes([(440.00f, 0.00f, 0.050f, 0.24f), (311.13f, 0.040f, 0.070f, 0.24f)], vol));
-            Store(UiSound.Unmute,      BuildNotes([(349.23f, 0.00f, 0.050f, 0.24f), (523.25f, 0.040f, 0.075f, 0.26f)], vol));
-            Store(UiSound.Deafen,      BuildNotes([(415.30f, 0.00f, 0.055f, 0.25f), (277.18f, 0.050f, 0.090f, 0.25f)], vol));
-            Store(UiSound.Undeafen,    BuildNotes([(329.63f, 0.00f, 0.055f, 0.25f), (554.37f, 0.050f, 0.095f, 0.26f)], vol));
-            Store(UiSound.StreamStart, BuildNotes([(587.33f, 0.00f, 0.080f, 0.24f), (783.99f, 0.065f, 0.090f, 0.25f), (1046.50f, 0.130f, 0.150f, 0.24f)], vol));
-            Store(UiSound.StreamStop,  BuildNotes([(783.99f, 0.00f, 0.075f, 0.22f), (523.25f, 0.065f, 0.120f, 0.22f)], vol));
-            Store(UiSound.Message,     BuildNotes([(783.99f, 0.00f, 0.045f, 0.20f), (1046.50f, 0.040f, 0.070f, 0.18f)], vol));
-        }
+        lock (_lock) EnsureBuiltLocked(vol);
     }
 
     private static void Store(UiSound key, byte[] wav)
@@ -83,18 +84,17 @@ public static unsafe partial class SoundFx
         {
             if (s.StreamerMode) return;
             long now = Environment.TickCount64;
-            if (now - _lastMsgSoundTick < 900) return;
-            _lastMsgSoundTick = now;
+            long prev = Volatile.Read(ref _lastMsgSoundTick);
+            if (now - prev < 900) return;
+            if (Interlocked.CompareExchange(ref _lastMsgSoundTick, now, prev) != prev) return;
         }
-        EnsureBuilt();
-        nint ptr = 0;
+        float vol = Math.Clamp(s.UiSoundsVolume, 0f, 1f);
         lock (_lock)
         {
-            if (_nativeWavs.TryGetValue(sound, out var entry) && entry.Len >= 44)
-                ptr = entry.Ptr;
+            EnsureBuiltLocked(vol);
+            if (_nativeWavs.TryGetValue(sound, out var entry) && entry.Ptr != 0 && entry.Len >= 44)
+                PlaySoundW((byte*)entry.Ptr, 0, SND_MEMORY | SND_ASYNC | SND_NODEFAULT | SND_NOWAIT);
         }
-        if (ptr != 0)
-            PlaySoundW((byte*)ptr, 0, SND_MEMORY | SND_ASYNC | SND_NODEFAULT | SND_NOWAIT);
     }
 
     private static byte[] BuildNotes((float Freq, float StartSec, float DurSec, float Amp)[] notes, float masterVol)

@@ -7,6 +7,7 @@ public static unsafe partial class Shell
     private sealed class ShareSourceItem
     {
         public bool IsMonitor;
+        public bool IsDualScreen;
         public int MonitorIndex;
         public ulong Hwnd;
         public string Title = "";
@@ -16,17 +17,35 @@ public static unsafe partial class Shell
     }
 
     private static readonly object _shareLock = new();
+    private static readonly Queue<ID2D1Bitmap1> _pendingBitmapDispose = new();
     private static List<ShareSourceItem> _shareSources = [];
+    private static int _shareGen;
     private static int _selectedShareIdx;
-    private static int _settingsTab; // 0 = Голос и видео, 1 = Стриминг 4K, 2 = Интерфейс и миграция
-    private static float _settingsScroll;
+    private static int _settingsTab; // 0 = Голос и видео, 1 = Стриминг 4K, 2 = Интерфейс и сеть, 3 = Обновления
+    private static float _settingsScroll, _settingsMaxScroll = 540f;
+    private static float _pinsScroll, _regionsScroll, _audioPopScroll;
     private static int _settingsOpenDropdown; // 0 = none, 1 = mic dropdown, 2 = speaker dropdown
+
+    internal static void DrainPendingShareBitmaps()
+    {
+        lock (_shareLock)
+        {
+            while (_pendingBitmapDispose.Count > 0)
+            {
+                try { _pendingBitmapDispose.Dequeue().Dispose(); } catch { }
+            }
+        }
+    }
 
     public static void ClearShareBitmaps()
     {
         lock (_shareLock)
         {
             foreach (var it in _shareSources) { it.Bitmap?.Dispose(); it.Bitmap = null; }
+            while (_pendingBitmapDispose.Count > 0)
+            {
+                try { _pendingBitmapDispose.Dequeue().Dispose(); } catch { }
+            }
         }
     }
 
@@ -34,23 +53,40 @@ public static unsafe partial class Shell
     private static void RefreshShareSourcesAsync()
     {
         _shareLoading = true;
+        int gen = Interlocked.Increment(ref _shareGen);
         _ = Task.Run(() =>
         {
             try
             {
                 var mons = MediaNative.ListMonitors();
                 _monitors = mons;
-                var wins = MediaNative.ListWindows(App.Hwnd).Take(Math.Max(0, 6 - mons.Count)).ToList();
+                int screenCards = mons.Count + (mons.Count >= 2 ? 1 : 0);
+                var wins = MediaNative.ListWindows(App.Hwnd).Take(Math.Max(0, 6 - screenCards)).ToList();
 
                 var items = new List<ShareSourceItem>();
                 foreach (var m in mons)
-                    items.Add(new ShareSourceItem { IsMonitor = true, MonitorIndex = m.Index, Title = $"Screen {m.Index + 1} ({m.W}x{m.H})" });
+                    items.Add(new ShareSourceItem { IsMonitor = true, MonitorIndex = m.Index, Title = $"Экран {m.Index + 1} ({m.W}x{m.H})" });
+                if (mons.Count >= 2)
+                {
+                    items.Add(new ShareSourceItem
+                    {
+                        IsMonitor = true,
+                        IsDualScreen = true,
+                        MonitorIndex = -2,
+                        Title = "⚡ 2 Экрана сразу (1 + 2)"
+                    });
+                }
                 foreach (var w in wins)
                     items.Add(new ShareSourceItem { IsMonitor = false, Hwnd = w.Hwnd, Title = w.Title });
 
+                if (Volatile.Read(ref _shareGen) != gen) return;
                 lock (_shareLock)
                 {
-                    foreach (var old in _shareSources) old.Bitmap?.Dispose();
+                    // NEVER dispose D2D bitmaps on a worker thread -> defer safely to UI thread!
+                    foreach (var old in _shareSources)
+                    {
+                        if (old.Bitmap != null) { _pendingBitmapDispose.Enqueue(old.Bitmap); old.Bitmap = null; }
+                    }
                     _shareSources = items;
                     _selectedShareIdx = 0;
                 }
@@ -60,6 +96,37 @@ public static unsafe partial class Shell
                 const int tw = 240, th = 135;
                 foreach (var item in items)
                 {
+                    if (Volatile.Read(ref _shareGen) != gen) return;
+                    if (item.IsDualScreen)
+                    {
+                        // Stitch live Monitor 0 (left 120px) + 2px neon divider + Monitor 1 (right 118px) into 240x135 BGRA!
+                        const int halfW = 119;
+                        var leftBuf = new byte[halfW * th * 4];
+                        var rightBuf = new byte[halfW * th * 4];
+                        int ok0, ok1;
+                        fixed (byte* p0 = leftBuf) ok0 = MediaNative.fc_capture_monitor_thumb(0, p0, halfW, th);
+                        fixed (byte* p1 = rightBuf) ok1 = MediaNative.fc_capture_monitor_thumb(1, p1, halfW, th);
+                        if (ok0 != 0 || ok1 != 0)
+                        {
+                            var dst = new byte[tw * th * 4];
+                            for (int row = 0; row < th; row++)
+                            {
+                                int dstOff = row * tw * 4;
+                                if (ok0 != 0) Buffer.BlockCopy(leftBuf, row * halfW * 4, dst, dstOff, halfW * 4);
+                                // 2px neon brand divider in the center
+                                for (int dx = halfW; dx < halfW + 2; dx++)
+                                {
+                                    int p = dstOff + dx * 4;
+                                    dst[p] = 0xF8; dst[p + 1] = 0xBD; dst[p + 2] = 0x38; dst[p + 3] = 0xFF; // Cyan BGRA
+                                }
+                                if (ok1 != 0) Buffer.BlockCopy(rightBuf, row * halfW * 4, dst, dstOff + (halfW + 2) * 4, halfW * 4);
+                            }
+                            item.PendingBgra = dst;
+                            App.WakeUi();
+                        }
+                        continue;
+                    }
+
                     var buf = new byte[tw * th * 4];
                     int ok;
                     fixed (byte* p = buf)
@@ -84,13 +151,13 @@ public static unsafe partial class Shell
     private static void DrawScreenShareModal(R r)
     {
         Gfx.FillRect(r, 0xCC07080B);
-        float bw = MathF.Min(640, r.W - 40), bh = MathF.Min(580, r.H - 40);
+        float bw = MathF.Min(640, r.W - 40), bh = MathF.Min(598, r.H - 36);
         var box = new R(r.X + (r.W - bw) * 0.5f, r.Y + (r.H - bh) * 0.5f, bw, bh);
         Gfx.FillRect(box, 0xFF1A1B21, 12);
         Gfx.StrokeRect(box, Th.Border, 1, 12);
 
         Gfx.DrawText("Screen Share", new R(box.X + 20, box.Y + 16, 260, 24), 18, Th.Text, 700);
-        Gfx.DrawText("Выберите экран или окно для трансляции", new R(box.X + 20, box.Y + 40, 380, 18), 12, Th.Sub);
+        Gfx.DrawText("Выберите экран, окно или ⚡ 2 Экрана сразу (Zero-Copy GPU)", new R(box.X + 20, box.Y + 40, 440, 18), 12, Th.Sub);
 
         var refBtn = new R(box.Right - 78, box.Y + 14, 30, 30);
         Gfx.FillRect(refBtn, UI.Hover(refBtn) ? Th.Hover : Th.Card, 6);
@@ -104,7 +171,7 @@ public static unsafe partial class Shell
 
         Gfx.FillRect(new R(box.X, box.Y + 64, box.W, 1), Th.Border);
 
-        // 3x2 Live Thumbnail Grid (exact f_013.jpg!)
+        // 3x2 Live Thumbnail Grid (exact f_013.jpg + Dual-Screen Hack card!)
         List<ShareSourceItem> items;
         lock (_shareLock) items = [.. _shareSources];
 
@@ -134,10 +201,20 @@ public static unsafe partial class Shell
             Gfx.FillRect(card, 0xFF0C0D12, 8);
             if (it.Bitmap != null) Gfx.DrawBitmap(it.Bitmap, card.Inset(2));
             else Gfx.DrawText("Захват...", new R(card.X, card.Y + card.H * 0.42f, card.W, 18), 11, Th.Dim, 500, 1);
-            Gfx.StrokeRect(card, sel ? Th.Brand : (UI.Hover(card) ? 0x66FFFFFF : Th.Border), sel ? 2.5f : 1f, 8);
 
-            string lbl = it.Title.Length > 26 ? it.Title[..25] + "…" : it.Title;
-            Gfx.DrawText(lbl, new R(card.X, card.Bottom + 4, card.W, 18), 11.5f, sel ? Th.Text : Th.Sub, sel ? 700 : 500, 1);
+            if (it.IsDualScreen)
+            {
+                var badgeR = new R(card.X + 6, card.Y + 6, 82, 18);
+                Gfx.FillRect(badgeR, 0xEE0F172A, 9);
+                Gfx.StrokeRect(badgeR, Th.Cyan, 1, 9);
+                Gfx.DrawText("32:9 DUAL GPU", new R(badgeR.X, badgeR.Y + 2, badgeR.W, 14), 9f, Th.Cyan, 700, 1);
+            }
+
+            uint borderCol = sel ? (it.IsDualScreen ? Th.Cyan : Th.Brand) : (it.IsDualScreen ? 0x6638BDF8 : (UI.Hover(card) ? 0x66FFFFFF : Th.Border));
+            Gfx.StrokeRect(card, borderCol, sel ? 2.5f : 1.2f, 8);
+
+            string lbl = SafeTrunc(it.Title, 26);
+            Gfx.DrawText(lbl, new R(card.X, card.Bottom + 4, card.W, 18), 11.5f, sel ? (it.IsDualScreen ? Th.Cyan : Th.Text) : (it.IsDualScreen ? Th.Cyan : Th.Sub), sel || it.IsDualScreen ? 700 : 500, 1);
 
             if (UI.Click(UI.Id("sh_src", i), new R(card.X, card.Y, card.W, card.H + 22)))
                 _selectedShareIdx = i;
@@ -146,16 +223,26 @@ public static unsafe partial class Shell
         // STREAM SETTINGS section (exact f_013.jpg!)
         var s = SettingsStore.Current;
         bool changed = false;
+        bool dualSelected = items.Count > 0 && _selectedShareIdx >= 0 && _selectedShareIdx < items.Count && items[_selectedShareIdx].IsDualScreen;
         float sy = gy + 2 * (th + 28) + 8;
         Gfx.FillRect(new R(box.X + pad, sy, box.W - pad * 2, 1), Th.Border);
-        sy += 12;
-        Gfx.DrawText("НАСТРОЙКИ СТРИМА", new R(box.X + pad, sy, 220, 16), 10.5f, Th.Dim, 700);
-        sy += 22;
+        sy += 10;
+        if (dualSelected)
+        {
+            Gfx.DrawText("⚡ DUAL-SCREEN HACK: Оба монитора склеиваются на GPU в 32:9 (3840×1080 / 2560×720) без нагрузки на CPU!",
+                new R(box.X + pad, sy, box.W - pad * 2, 16), 10.5f, Th.Cyan, 700);
+        }
+        else
+        {
+            Gfx.DrawText("НАСТРОЙКИ СТРИМА", new R(box.X + pad, sy, 220, 16), 10.5f, Th.Dim, 700);
+        }
+        sy += 20;
 
         // Row 1: Optimization (Motion / Detail) + Resolution (480p / 720p / 1080p / 1440p / Source)
         float optW = 190f;
         Gfx.DrawText("Оптимизация", new R(box.X + pad, sy, optW, 16), 11.5f, Th.Sub, 600);
-        Gfx.DrawText("Разрешение", new R(box.X + pad + optW + 16, sy, 200, 16), 11.5f, Th.Sub, 600);
+        Gfx.DrawText(dualSelected ? "Выход 32:9 (720p→2560×720, 1080p+→3840×1080)" : "Разрешение",
+            new R(box.X + pad + optW + 16, sy, 360, 16), 11.5f, dualSelected ? Th.Cyan : Th.Sub, 600);
         sy += 20;
 
         if (UI.Button(UI.Id("sh_mot"), new R(box.X + pad, sy, 92, 30), "⚡ Motion", !s.StreamOptimizeDetail ? Th.Brand : Th.Card, Th.Text, 6, 12))
@@ -176,7 +263,7 @@ public static unsafe partial class Shell
 
         // Row 2: Frame Rate (15 / 30 / 60 / 120) + Codec (H.264 / HEVC / AV1)
         Gfx.DrawText("Частота кадров", new R(box.X + pad, sy, 260, 16), 11.5f, Th.Sub, 600);
-        Gfx.DrawText("Кодек NVENC", new R(box.X + pad + 320, sy, 200, 16), 11.5f, Th.Sub, 600);
+        Gfx.DrawText("Кодек NVENC (Go Live = H.264)", new R(box.X + pad + 320, sy, 260, 16), 11.5f, Th.Sub, 600);
         sy += 20;
 
         int[] fpsList = [15, 30, 60, 120];
@@ -210,13 +297,14 @@ public static unsafe partial class Shell
         Gfx.DrawText("Транслировать звук компьютера", new R(chk.Right + 10, audRow.Y + 19, 240, 14), 10.5f, Th.Dim);
         if (UI.Click(UI.Id("sh_aud"), audRow)) { s.StreamCaptureAudio = !s.StreamCaptureAudio; changed = true; }
 
-        if (UI.Button(UI.Id("sh_go"), new R(box.Right - pad - 210, sy, 210, 38), "Начать трансляцию", Th.Brand, 0xFFFFFFFF, 8, 13.5f, 700))
+        string goLabel = dualSelected ? "⚡ Стримить 2 Экрана" : "Начать трансляцию";
+        if (UI.Button(UI.Id("sh_go"), new R(box.Right - pad - 216, sy, 216, 38), goLabel, dualSelected ? Th.Cyan : Th.Brand, dualSelected ? 0xFF0A0B0E : 0xFFFFFFFF, 8, 13.5f, 700))
         {
             SettingsStore.Save();
             if (items.Count > 0 && _selectedShareIdx < items.Count)
             {
                 var chosen = items[_selectedShareIdx];
-                if (chosen.IsMonitor) s.StreamMonitor = chosen.MonitorIndex;
+                if (chosen.IsMonitor && !chosen.IsDualScreen) s.StreamMonitor = chosen.MonitorIndex;
                 StartStream(chosen.IsMonitor ? chosen.MonitorIndex : 0, chosen.IsMonitor ? 0 : chosen.Hwnd);
             }
             else StartStream(s.StreamMonitor, 0);
@@ -235,8 +323,9 @@ public static unsafe partial class Shell
 
         if (_audioPopupMode == 2)
         {
-            // Direct Output Device Picker (from headphones ⌄ chevron)
-            float h = 38 + Math.Max(1, _renDevices.Count) * 32 + 12;
+            // Direct Output Device Picker (from headphones ⌄ chevron) — scrollable for systems with many audio devices!
+            float fullH = 38 + Math.Max(1, _renDevices.Count) * 32 + 12;
+            float h = MathF.Min(fullH, MathF.Max(160, Gfx.H - TopH - 90));
             float w = 290;
             float px = Math.Clamp(_audioPopupX, 8, Gfx.W - w - 8);
             float py = Math.Clamp(_audioPopupY - h, TopH + 8, Gfx.H - h - 8);
@@ -244,30 +333,40 @@ public static unsafe partial class Shell
             _overlayCutouts.Add(menu);
 
             if ((UI.Pressed || UI.RightClicked) && !menu.Contains(UI.MX, UI.MY))
-            { _audioPopupMode = 0; return; }
+            { _audioPopupMode = 0; _audioPopScroll = 0; return; }
 
             Gfx.FillRect(menu, 0xFA14151B, 10);
             Gfx.StrokeRect(menu, Th.Border, 1, 10);
             Gfx.DrawText("Устройство вывода", new R(menu.X + 12, menu.Y + 10, menu.W - 24, 18), 12.5f, Th.Sub, 700);
             Gfx.FillRect(new R(menu.X + 10, menu.Y + 32, menu.W - 20, 1), Th.Border);
 
-            float y = menu.Y + 38;
+            var listArea = new R(menu.X, menu.Y + 36, menu.W, menu.H - 42);
+            float maxSc = MathF.Max(0, _renDevices.Count * 32f - listArea.H);
+            if (UI.Hover(listArea) && UI.Wheel != 0) _audioPopScroll = Math.Clamp(_audioPopScroll - UI.Wheel * 36f, 0f, maxSc);
+            else _audioPopScroll = Math.Clamp(_audioPopScroll, 0f, maxSc);
+
+            Gfx.PushClip(listArea);
+            float y = listArea.Y + 2 - _audioPopScroll;
             for (int i = 0; i < _renDevices.Count; i++)
             {
                 var d = _renDevices[i];
                 bool sel = string.IsNullOrEmpty(s.RenderDeviceId) ? d.Default : d.Id == s.RenderDeviceId;
                 var rr = new R(menu.X + 6, y, menu.W - 12, 30);
-                if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 6);
-                Gfx.DrawText(d.Name, new R(rr.X + 8, rr.Y + 7, rr.W - 34, 16), 12, sel ? Th.Text : Th.Sub, sel ? 700 : 500);
-                DrawRadioDot(rr.Right - 14, rr.Y + 15, sel);
-                if (UI.Click(UI.Id("qp_ren", i), rr))
+                if (rr.Bottom >= listArea.Y && rr.Y <= listArea.Bottom)
                 {
-                    s.RenderDeviceId = d.Id; changed = true;
-                    if (DiscordClient.Instance.VoiceConnected || _loopback) MediaNative.fc_voice_start(s.CaptureDeviceId, s.RenderDeviceId);
-                    _audioPopupMode = 0;
+                    if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 6);
+                    Gfx.DrawText(d.Name, new R(rr.X + 8, rr.Y + 7, rr.W - 34, 16), 12, sel ? Th.Text : Th.Sub, sel ? 700 : 500);
+                    DrawRadioDot(rr.Right - 14, rr.Y + 15, sel);
+                    if (UI.Click(UI.Id("qp_ren", i), rr))
+                    {
+                        s.RenderDeviceId = d.Id; changed = true;
+                        if (DiscordClient.Instance.VoiceConnected || _loopback) MediaNative.fc_voice_start(s.CaptureDeviceId, s.RenderDeviceId);
+                        _audioPopupMode = 0; _audioPopScroll = 0;
+                    }
                 }
                 y += 32;
             }
+            Gfx.PopClip();
             if (changed) { ApplyAudioSettings(); SettingsStore.Save(); }
             return;
         }
@@ -283,7 +382,7 @@ public static unsafe partial class Shell
         if (_audioPopupSub is 1 or 2)
         {
             var devList = _audioPopupSub == 1 ? _capDevices : _renDevices;
-            float fw = 276, fh = 16 + Math.Max(1, devList.Count) * 32;
+            float fw = 276, fh = MathF.Min(16 + Math.Max(1, devList.Count) * 32, MathF.Max(160, Gfx.H - TopH - 90));
             float fx = (mainMenu.Right + 6 + fw < Gfx.W) ? mainMenu.Right + 6 : mainMenu.X - fw - 6;
             float fy = Math.Clamp(_audioPopupSub == 1 ? mainMenu.Y : mainMenu.Y + 46, TopH + 8, Gfx.H - fh - 8);
             flyout = new R(fx, fy, fw, fh);
@@ -291,7 +390,7 @@ public static unsafe partial class Shell
         }
 
         if ((UI.Pressed || UI.RightClicked) && !mainMenu.Contains(UI.MX, UI.MY) && (_audioPopupSub == 0 || !flyout.Contains(UI.MX, UI.MY)))
-        { _audioPopupMode = 0; _audioPopupSub = 0; return; }
+        { _audioPopupMode = 0; _audioPopupSub = 0; _audioPopScroll = 0; return; }
 
         Gfx.FillRect(mainMenu, 0xFA14151B, 10);
         Gfx.StrokeRect(mainMenu, Th.Border, 1, 10);
@@ -301,19 +400,19 @@ public static unsafe partial class Shell
 
         // Input Device row
         var inRow = new R(mainMenu.X + 6, mainMenu.Y + 8, mainMenu.W - 12, 40);
-        if (UI.Hover(inRow) || _audioPopupSub == 1) { Gfx.FillRect(inRow, Th.Hover, 6); if (UI.Hover(inRow)) _audioPopupSub = 1; }
+        if (UI.Hover(inRow) || _audioPopupSub == 1) { Gfx.FillRect(inRow, Th.Hover, 6); if (UI.Hover(inRow) && _audioPopupSub != 1) { _audioPopupSub = 1; _audioPopScroll = 0; } }
         Gfx.DrawText("Устройство ввода", new R(inRow.X + 8, inRow.Y + 4, inRow.W - 28, 16), 12.5f, Th.Text, 600);
         Gfx.DrawText(capName, new R(inRow.X + 8, inRow.Y + 21, inRow.W - 28, 14), 10.5f, Th.Sub);
         Gfx.DrawIcon(IcChevRight, ">", new R(inRow.Right - 20, inRow.Y + 12, 16, 16), 13, Th.Sub);
-        if (UI.Click(UI.Id("qp_in_row"), inRow)) _audioPopupSub = _audioPopupSub == 1 ? 0 : 1;
+        if (UI.Click(UI.Id("qp_in_row"), inRow)) { _audioPopupSub = _audioPopupSub == 1 ? 0 : 1; _audioPopScroll = 0; }
 
         // Output Device row
         var outRow = new R(mainMenu.X + 6, mainMenu.Y + 52, mainMenu.W - 12, 40);
-        if (UI.Hover(outRow) || _audioPopupSub == 2) { Gfx.FillRect(outRow, Th.Hover, 6); if (UI.Hover(outRow)) _audioPopupSub = 2; }
+        if (UI.Hover(outRow) || _audioPopupSub == 2) { Gfx.FillRect(outRow, Th.Hover, 6); if (UI.Hover(outRow) && _audioPopupSub != 2) { _audioPopupSub = 2; _audioPopScroll = 0; } }
         Gfx.DrawText("Устройство вывода", new R(outRow.X + 8, outRow.Y + 4, outRow.W - 28, 16), 12.5f, Th.Text, 600);
         Gfx.DrawText(renName, new R(outRow.X + 8, outRow.Y + 21, outRow.W - 28, 14), 10.5f, Th.Sub);
         Gfx.DrawIcon(IcChevRight, ">", new R(outRow.Right - 20, outRow.Y + 12, 16, 16), 13, Th.Sub);
-        if (UI.Click(UI.Id("qp_out_row"), outRow)) _audioPopupSub = _audioPopupSub == 2 ? 0 : 2;
+        if (UI.Click(UI.Id("qp_out_row"), outRow)) { _audioPopupSub = _audioPopupSub == 2 ? 0 : 2; _audioPopScroll = 0; }
 
         Gfx.FillRect(new R(mainMenu.X + 10, mainMenu.Y + 98, mainMenu.W - 20, 1), Th.Border);
 
@@ -350,15 +449,20 @@ public static unsafe partial class Shell
         Gfx.FillRect(dchk, _deafened ? Th.Brand : Th.Card, 4);
         Gfx.StrokeRect(dchk, Th.Border, 1, 4);
         if (_deafened) Gfx.DrawIcon(IcCheck, "✓", dchk, 11, 0xFFFFFFFF);
-        if (UI.Click(UI.Id("qp_deaf"), deafRow)) { _deafened = !_deafened; ApplyAudioSettings(); SoundFx.Play(_deafened ? UiSound.Deafen : UiSound.Undeafen); }
+        if (UI.Click(UI.Id("qp_deaf"), deafRow)) ToggleDeafen();
 
-        // Flyout Device List (exact right-hand panel in f_005.jpg!)
+        // Flyout Device List (exact right-hand panel in f_005.jpg, scrollable!)
         if (_audioPopupSub is 1 or 2)
         {
             Gfx.FillRect(flyout, 0xFA14151B, 10);
             Gfx.StrokeRect(flyout, Th.Border, 1, 10);
             var devList = _audioPopupSub == 1 ? _capDevices : _renDevices;
-            float y = flyout.Y + 8;
+            float maxFlySc = MathF.Max(0, 16 + devList.Count * 32f - flyout.H);
+            if (UI.Hover(flyout) && UI.Wheel != 0) _audioPopScroll = Math.Clamp(_audioPopScroll - UI.Wheel * 36f, 0f, maxFlySc);
+            else _audioPopScroll = Math.Clamp(_audioPopScroll, 0f, maxFlySc);
+
+            Gfx.PushClip(flyout.Inset(2));
+            float y = flyout.Y + 8 - _audioPopScroll;
             for (int i = 0; i < devList.Count; i++)
             {
                 var d = devList[i];
@@ -366,19 +470,23 @@ public static unsafe partial class Shell
                     ? (string.IsNullOrEmpty(s.CaptureDeviceId) ? d.Default : d.Id == s.CaptureDeviceId)
                     : (string.IsNullOrEmpty(s.RenderDeviceId) ? d.Default : d.Id == s.RenderDeviceId);
                 var rr = new R(flyout.X + 6, y, flyout.W - 12, 30);
-                if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 6);
-                Gfx.DrawText(d.Name, new R(rr.X + 8, rr.Y + 7, rr.W - 34, 16), 12, sel ? Th.Text : Th.Sub, sel ? 700 : 500);
-                DrawRadioDot(rr.Right - 14, rr.Y + 15, sel);
-                if (UI.Click(UI.Id("qp_dev_" + _audioPopupSub, i), rr))
+                if (rr.Bottom >= flyout.Y && rr.Y <= flyout.Bottom)
                 {
-                    if (_audioPopupSub == 1) s.CaptureDeviceId = d.Id;
-                    else s.RenderDeviceId = d.Id;
-                    changed = true;
-                    if (DiscordClient.Instance.VoiceConnected || _loopback) MediaNative.fc_voice_start(s.CaptureDeviceId, s.RenderDeviceId);
-                    _audioPopupMode = 0; _audioPopupSub = 0;
+                    if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 6);
+                    Gfx.DrawText(d.Name, new R(rr.X + 8, rr.Y + 7, rr.W - 34, 16), 12, sel ? Th.Text : Th.Sub, sel ? 700 : 500);
+                    DrawRadioDot(rr.Right - 14, rr.Y + 15, sel);
+                    if (UI.Click(UI.Id("qp_dev_" + _audioPopupSub, i), rr))
+                    {
+                        if (_audioPopupSub == 1) s.CaptureDeviceId = d.Id;
+                        else s.RenderDeviceId = d.Id;
+                        changed = true;
+                        if (DiscordClient.Instance.VoiceConnected || _loopback) MediaNative.fc_voice_start(s.CaptureDeviceId, s.RenderDeviceId);
+                        _audioPopupMode = 0; _audioPopupSub = 0; _audioPopScroll = 0;
+                    }
                 }
                 y += 32;
             }
+            Gfx.PopClip();
         }
 
         if (changed) { ApplyAudioSettings(); SettingsStore.Save(); }
@@ -525,7 +633,7 @@ public static unsafe partial class Shell
             if (UI.Button(UI.Id("ctx_watch"), new R(menu.X + 10, by, menu.W - 20, 30), "Смотреть стрим", Th.Brand, Th.Text, 6, 12.5f))
             {
                 _inVoiceStage = true;
-                _ = dc.WatchStreamAsync(_ctxGuildId, vm.ChannelId, vm.UserId, vm.Username, focusImmediately: true);
+                _ = dc.WatchStreamAsync(_ctxGuildId, vm.ChannelId, vm.UserId, vm.Username, focusImmediately: true, selfMute: _muted, selfDeaf: _deafened);
                 _ctxUser = null;
                 return;
             }
@@ -587,16 +695,18 @@ public static unsafe partial class Shell
         float px = box.X + navW + 24, pw = box.W - navW - 48;
         Gfx.DrawText(tabs[_settingsTab].Label, new R(px, box.Y + 18, pw - 50, 26), 18, Th.Text, 700);
         if (UI.Button(UI.Id("set_close"), new R(box.Right - 46, box.Y + 14, 32, 30), "✕", Th.Card, Th.Text, 6))
-        { _showSettings = false; _settingsOpenDropdown = 0; return; }
+        { CloseSettingsModal(); return; }
         Gfx.FillRect(new R(box.X + navW, box.Y + 54, box.W - navW, 1), Th.Border);
 
         var pane = new R(box.X + navW + 1, box.Y + 55, box.W - navW - 1, box.H - 56);
-        if (UI.Hover(pane) && UI.Wheel != 0) _settingsScroll = Math.Clamp(_settingsScroll - UI.Wheel * 48f, 0f, 540f);
+        if (UI.Hover(pane) && UI.Wheel != 0) _settingsScroll = Math.Clamp(_settingsScroll - UI.Wheel * 48f, 0f, _settingsMaxScroll);
+        else _settingsScroll = Math.Clamp(_settingsScroll, 0f, _settingsMaxScroll);
 
         Gfx.PushClip(pane);
         var s = SettingsStore.Current;
         bool changed = false;
-        float y = pane.Y + 18 - _settingsScroll;
+        float startY = pane.Y + 18 - _settingsScroll;
+        float y = startY;
 
         if (_settingsTab == 0) // Голос и видео (exact f_009.jpg!)
         {
@@ -667,6 +777,7 @@ public static unsafe partial class Shell
                 _loopback = !_loopback;
                 if (_loopback && !dc.VoiceConnected) MediaNative.fc_voice_start(s.CaptureDeviceId, s.RenderDeviceId);
                 ApplyAudioSettings();
+                if (!_loopback && !dc.VoiceConnected) MediaNative.fc_voice_stop();
             }
             float mx = px + 174, mw = pw - 174;
             int segs = 40;
@@ -727,6 +838,7 @@ public static unsafe partial class Shell
             { s.UiSoundsVolume = uvol / 100f; changed = true; }
             if (UI.Button(UI.Id("btn_sndtest"), new R(px + pw - 108, y + 6, 108, 28), "🔊 Тест", Th.Card, Th.Text, 6, 12))
             { SettingsStore.Save(); SoundFx.Play(UiSound.VoiceJoin); }
+            y += 46;
         }
         else if (_settingsTab == 1) // Стриминг 4K
         {
@@ -763,12 +875,15 @@ public static unsafe partial class Shell
             y += 48;
 
             float kbps = s.StreamBitrateKbps / 1000f;
-            if (UI.Slider(UI.Id("s_br"), new R(px, y, pw, 40), "Битрейт трансляции", ref kbps, 4f, 40f, " Мбит/с"))
+            if (UI.Slider(UI.Id("s_br"), new R(px, y, pw, 40), "Битрейт трансляции", ref kbps, 4f, 35f, " Мбит/с"))
             { s.StreamBitrateKbps = (int)(kbps * 1000f); changed = true; }
             y += 52;
 
             if (UI.Button(UI.Id("s_open_sh"), new R(px, y, 260, 38), "Открыть выбор экрана / окна...", Th.Brand, 0xFFFFFFFF, 8, 13, 700))
-            { _showSettings = false; OpenScreenShareModal(); }
+            { CloseSettingsModal(); OpenScreenShareModal(); }
+            if (_monitors.Count >= 2 && UI.Button(UI.Id("s_go_dual"), new R(px + 272, y, 236, 38), "⚡ Стримить 2 Экрана сразу", Th.Cyan, 0xFF0A0B0E, 8, 13, 700))
+            { CloseSettingsModal(); StartStream(-2, 0); }
+            y += 48;
         }
         else if (_settingsTab == 2) // Интерфейс, Турбо-сеть и миграция
         {
@@ -782,7 +897,7 @@ public static unsafe partial class Shell
             if (UI.Button(UI.Id("set_bench"), new R(px, y, 210, 32), dc.IsBenchmarkingRegions ? "Замер серверов..." : "⚡ Замерить и выбрать быстрейший", Th.Green, 0xFFFFFFFF, 6, 12))
                 _ = ShellAsync.AutoBestRegionAsync(forceBenchmark: true);
             if (UI.Button(UI.Id("set_vinfo"), new R(px + 220, y, 220, 32), "Открыть список серверов RTC...", Th.Card, Th.Cyan, 6, 12))
-            { _showSettings = false; _showVoiceInfo = true; _voiceInfoTab = 1; }
+            { CloseSettingsModal(); _showVoiceInfo = true; _voiceInfoTab = 1; }
             y += 44;
 
             Gfx.FillRect(new R(px, y, pw, 1), Th.Border);
@@ -799,6 +914,7 @@ public static unsafe partial class Shell
             y += 48;
             if (UI.Button(UI.Id("btn_remig"), new R(px, y, 320, 36), "Повторно импортировать из Dorion/Discord", Th.Card, Th.Text, 6, 12.5f))
             { SettingsStore.MigrateFromExistingClients(); SettingsStore.Save(); Toast(SettingsStore.MigrationSummary); }
+            y += 46;
         }
         else // Ультра-обновления (GitHub Releases + возврат в звонок и стримы!)
         {
@@ -850,8 +966,10 @@ public static unsafe partial class Shell
             if (UI.Toggle(UI.Id("tg_udl"), new R(px, y, pw, 34), "Фоновая предзагрузка (установка за <1 сек с автовозвратом в голосовой канал)", s.AutoDownloadUpdates)) { s.AutoDownloadUpdates = !s.AutoDownloadUpdates; changed = true; }
             y += 44;
             Gfx.DrawText("Во время обновления FluxCord сохраняет твой голосовой канал, статус микрофона/наушников, открытые стримы друзей и твою трансляцию экрана — и автоматически возвращает всё обратно сразу после запуска новой версии.", new R(px, y, pw, 48), 11.5f, Th.Dim, 400, 0, true);
+            y += 56;
         }
 
+        _settingsMaxScroll = MathF.Max(0f, (y - startY) - pane.H + 36f);
         Gfx.PopClip();
         if (changed) { ApplyAudioSettings(); SettingsStore.Save(); }
     }
@@ -864,7 +982,7 @@ public static unsafe partial class Shell
         var box = new R(r.X + (r.W - 560) * 0.5f, r.Y + 54, 560, MathF.Min(500, r.H - 110));
         Gfx.FillRect(box, Th.Panel, 12);
         Gfx.StrokeRect(box, Th.Brand, 1.5f, 12);
-        Gfx.DrawText("Быстрый переход (Ctrl+K) — Поиск каналов, серверов и ЛС", new R(box.X + 18, box.Y + 14, box.W - 60, 22), 14.5f, Th.Text, 700);
+        Gfx.DrawText("Быстрый переход (Ctrl+K) — ↑/↓ и Enter", new R(box.X + 18, box.Y + 14, box.W - 60, 22), 14.5f, Th.Text, 700);
         if (UI.Button(UI.Id("qs_x"), new R(box.Right - 36, box.Y + 10, 26, 26), "✕", Th.Card, Th.Text, 6)) { _showQuickSwitch = false; _searchQuery = ""; return; }
 
         _searchInputRect = new R(box.X + 16, box.Y + 44, box.W - 32, 34);
@@ -873,54 +991,39 @@ public static unsafe partial class Shell
         Gfx.StrokeRect(_searchInputRect, Th.Border, 1, 8);
 
         var dc = DiscordClient.Instance;
-        string q = _searchQuery;
-        float y = box.Y + 88;
-        int idx = 0;
+        var items = GetQuickSwitchItems(_searchQuery);
+        if (items.Count > 0) _quickSwitchIdx = Math.Clamp(_quickSwitchIdx, 0, items.Count - 1);
+        else _quickSwitchIdx = 0;
 
-        foreach (var dm in dc.DmChannels)
+        float y = box.Y + 88;
+        for (int i = 0; i < items.Count && y + 32 <= box.Bottom - 10; i++)
         {
-            if (y + 32 > box.Bottom - 10) break;
-            if (!string.IsNullOrEmpty(q) && !dm.Name.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
+            var it = items[i];
             var rr = new R(box.X + 12, y, box.W - 24, 30);
-            if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 6);
-            Gfx.DrawText($"@ {dm.Name}", new R(rr.X + 10, rr.Y + 6, 300, 18), 13, Th.Text, 600);
-            Gfx.DrawText("Личные сообщения", new R(rr.Right - 180, rr.Y + 6, 170, 18), 11.5f, Th.Dim, 400, 2);
-            if (UI.Click(UI.Id("qs", idx++), rr))
+            bool sel = i == _quickSwitchIdx;
+            if (sel) Gfx.FillRect(rr, Th.Active, 6);
+            else if (UI.Hover(rr)) { Gfx.FillRect(rr, Th.Hover, 6); _quickSwitchIdx = i; }
+            Gfx.DrawText(it.Title, new R(rr.X + 10, rr.Y + 6, 300, 18), 13, it.IsVoice ? Th.Green : Th.Text, 600);
+            Gfx.DrawText(it.Sub, new R(rr.Right - 190, rr.Y + 6, 180, 18), 11.5f, Th.Dim, 400, 2);
+            if (UI.Click(UI.Id("qs", i), rr))
             {
-                dc.ActiveGuildId = "@me"; dc.ActiveChannelId = dm.Id; _inVoiceStage = false;
-                _ = dc.LoadMessagesAsync(dm.Id);
+                if (it.IsVoice)
+                {
+                    dc.ActiveGuildId = it.GuildId;
+                    _ = dc.JoinVoiceAsync(it.GuildId, it.ChannelId, _muted, _deafened);
+                    _inVoiceStage = true;
+                }
+                else
+                {
+                    SwitchToChannel(it.GuildId, it.ChannelId);
+                }
                 _showQuickSwitch = false; _searchQuery = "";
                 return;
             }
             y += 32;
         }
-
-        foreach (var g in dc.Guilds)
-        {
-            foreach (var ch in g.Channels)
-            {
-                if (ch.IsCategory || y + 32 > box.Bottom - 10) continue;
-                if (!string.IsNullOrEmpty(q) &&
-                    !ch.Name.Contains(q, StringComparison.OrdinalIgnoreCase) &&
-                    !g.Name.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
-                var rr = new R(box.X + 12, y, box.W - 24, 30);
-                if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 6);
-                Gfx.DrawText($"{(ch.IsVoice ? "🔊" : "#")} {ch.Name}", new R(rr.X + 10, rr.Y + 6, 300, 18), 13, ch.IsVoice ? Th.Green : Th.Text, 600);
-                Gfx.DrawText(g.Name, new R(rr.Right - 190, rr.Y + 6, 180, 18), 12, Th.Dim, 400, 2);
-                if (UI.Click(UI.Id("qs", idx++), rr))
-                {
-                    dc.ActiveGuildId = g.Id;
-                    if (ch.IsVoice) { _ = dc.JoinVoiceAsync(g.Id, ch.Id); _inVoiceStage = true; }
-                    else { dc.ActiveChannelId = ch.Id; _inVoiceStage = false; _ = dc.LoadMessagesAsync(ch.Id); }
-                    _showQuickSwitch = false; _searchQuery = "";
-                    return;
-                }
-                y += 32;
-            }
-            if (y + 32 > box.Bottom - 10) break;
-        }
-        if (idx == 0)
-            Gfx.DrawText("Ничего не найдено по запросу «" + q + "»", new R(box.X + 16, y + 12, box.W - 32, 22), 13, Th.Dim, 500, 1);
+        if (items.Count == 0)
+            Gfx.DrawText("Ничего не найдено по запросу «" + _searchQuery + "»", new R(box.X + 16, y + 12, box.W - 32, 22), 13, Th.Dim, 500, 1);
     }
 
     // ---------------- 7. Exact Discord Voice Connection Info + Live Ping Graph + RTC Turbo Region Switcher (c_026.jpg!) ----------------
@@ -1025,42 +1128,58 @@ public static unsafe partial class Shell
 
             List<RtcRegionInfo> regs;
             lock (dc.Regions) regs = [.. dc.Regions];
-            float ry = pop.Y + 84;
+            var regArea = new R(pop.X + 6, pop.Y + 82, pop.W - 12, pop.H - 90);
+            float totalRegH = 28 + regs.Count * 27f + 8;
+            float maxRegSc = MathF.Max(0, totalRegH - regArea.H);
+            if (UI.Hover(regArea) && UI.Wheel != 0) _regionsScroll = Math.Clamp(_regionsScroll - UI.Wheel * 40f, 0f, maxRegSc);
+            else _regionsScroll = Math.Clamp(_regionsScroll, 0f, maxRegSc);
+
+            Gfx.PushClip(regArea);
+            float ry = regArea.Y + 2 - _regionsScroll;
             string curPref = SettingsStore.Current.PreferredRtcRegion;
 
             // Automatic row
             var autoRow = new R(pop.X + 10, ry, pop.W - 20, 26);
-            if (UI.Hover(autoRow) || string.IsNullOrEmpty(curPref)) Gfx.FillRect(autoRow, string.IsNullOrEmpty(curPref) ? 0x2223A55A : Th.Hover, 5);
-            Gfx.DrawText("Авто (лучший сервер)", new R(autoRow.X + 8, autoRow.Y + 5, 190, 16), 12f, string.IsNullOrEmpty(curPref) ? Th.Green : Th.Text, 600);
-            if (UI.Click(UI.Id("vi_reg_auto"), autoRow))
+            if (autoRow.Bottom >= regArea.Y && autoRow.Y <= regArea.Bottom)
             {
-                _ = ShellAsync.SwitchRegionAsync(null);
-                _showVoiceInfo = false;
-                return;
+                if (UI.Hover(autoRow) || string.IsNullOrEmpty(curPref)) Gfx.FillRect(autoRow, string.IsNullOrEmpty(curPref) ? 0x2223A55A : Th.Hover, 5);
+                Gfx.DrawText("Авто (лучший сервер)", new R(autoRow.X + 8, autoRow.Y + 5, 190, 16), 12f, string.IsNullOrEmpty(curPref) ? Th.Green : Th.Text, 600);
+                if (UI.Click(UI.Id("vi_reg_auto"), autoRow))
+                {
+                    _ = ShellAsync.SwitchRegionAsync(null);
+                    _showVoiceInfo = false;
+                    Gfx.PopClip();
+                    return;
+                }
             }
             ry += 28;
 
-            for (int i = 0; i < regs.Count && ry + 26 < pop.Bottom - 8; i++)
+            for (int i = 0; i < regs.Count; i++)
             {
                 var reg = regs[i];
-                bool sel = string.Equals(curPref, reg.Id, StringComparison.OrdinalIgnoreCase);
                 var rr = new R(pop.X + 10, ry, pop.W - 20, 26);
-                if (sel) Gfx.FillRect(rr, 0x225865F2, 5);
-                else if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 5);
-
-                Gfx.DrawText(reg.Name, new R(rr.X + 8, rr.Y + 5, 185, 16), 12f, sel ? Th.Text : Th.Sub, sel ? 700 : 500);
-                string pTxt = reg.PingMs > 0 ? $"{reg.PingMs} мс" : "RTC";
-                uint pCol = reg.PingMs > 0 ? (reg.PingMs < 100 ? Th.Green : (reg.PingMs < 160 ? Th.Amber : Th.Red)) : Th.Dim;
-                Gfx.DrawText(pTxt, new R(rr.Right - 66, rr.Y + 5, 58, 16), 11.5f, pCol, 700, 2);
-
-                if (UI.Click(UI.Id("vi_reg", i), rr))
+                if (rr.Bottom >= regArea.Y && rr.Y <= regArea.Bottom)
                 {
-                    _ = ShellAsync.SwitchRegionAsync(reg.Id);
-                    _showVoiceInfo = false;
-                    return;
+                    bool sel = string.Equals(curPref, reg.Id, StringComparison.OrdinalIgnoreCase);
+                    if (sel) Gfx.FillRect(rr, 0x225865F2, 5);
+                    else if (UI.Hover(rr)) Gfx.FillRect(rr, Th.Hover, 5);
+
+                    Gfx.DrawText(reg.Name, new R(rr.X + 8, rr.Y + 5, 185, 16), 12f, sel ? Th.Text : Th.Sub, sel ? 700 : 500);
+                    string pTxt = reg.PingMs > 0 ? $"{reg.PingMs} мс" : "RTC";
+                    uint pCol = reg.PingMs > 0 ? (reg.PingMs < 100 ? Th.Green : (reg.PingMs < 160 ? Th.Amber : Th.Red)) : Th.Dim;
+                    Gfx.DrawText(pTxt, new R(rr.Right - 66, rr.Y + 5, 58, 16), 11.5f, pCol, 700, 2);
+
+                    if (UI.Click(UI.Id("vi_reg", i), rr))
+                    {
+                        _ = ShellAsync.SwitchRegionAsync(reg.Id);
+                        _showVoiceInfo = false;
+                        Gfx.PopClip();
+                        return;
+                    }
                 }
                 ry += 27;
             }
+            Gfx.PopClip();
         }
     }
 
@@ -1097,7 +1216,7 @@ public static unsafe partial class Shell
             var vm = _hoverStreamVm;
             _hoverStreamVm = null;
             _inVoiceStage = true;
-            _ = dc.WatchStreamAsync(_hoverStreamGuildId, vm.ChannelId, vm.UserId, vm.Username, focusImmediately: true);
+            _ = dc.WatchStreamAsync(_hoverStreamGuildId, vm.ChannelId, vm.UserId, vm.Username, focusImmediately: true, selfMute: _muted, selfDeaf: _deafened);
         }
     }
 
@@ -1201,26 +1320,36 @@ public static unsafe partial class Shell
         Gfx.FillRect(new R(pop.X + 10, pop.Y + 38, pop.W - 20, 1), Th.Border);
 
         var body = new R(pop.X + 10, pop.Y + 44, pop.W - 20, pop.H - 54);
-        Gfx.PushClip(body);
         if (dc.PinnedMessages.TryGetValue(dc.ActiveChannelId, out var pins) && pins.Count > 0)
         {
-            float y = body.Y + 4;
-            for (int i = 0; i < pins.Count && y < body.Bottom; i++)
+            float totalPinsH = 8f;
+            for (int i = 0; i < pins.Count; i++)
+                totalPinsH += MathF.Min(64, Gfx.MeasureText(pins[i].Content, 12.5f, 400, body.W - 20).H) + 40f;
+            float maxPinsSc = MathF.Max(0, totalPinsH - body.H);
+            if (UI.Hover(body) && UI.Wheel != 0) _pinsScroll = Math.Clamp(_pinsScroll - UI.Wheel * 44f, 0f, maxPinsSc);
+            else _pinsScroll = Math.Clamp(_pinsScroll, 0f, maxPinsSc);
+
+            Gfx.PushClip(body);
+            float y = body.Y + 4 - _pinsScroll;
+            for (int i = 0; i < pins.Count; i++)
             {
                 var p = pins[i];
                 float th = MathF.Min(64, Gfx.MeasureText(p.Content, 12.5f, 400, body.W - 20).H);
                 var card = new R(body.X, y, body.W, th + 32);
-                Gfx.FillRect(card, Th.Panel, 8);
-                Gfx.DrawText($"{p.AuthorName}  •  {p.Timestamp}", new R(card.X + 10, card.Y + 6, card.W - 20, 16), 12, p.AuthorColor, 700);
-                Gfx.DrawText(p.Content, new R(card.X + 10, card.Y + 24, card.W - 20, th + 4), 12.5f, Th.Text, 400, 0, true);
+                if (card.Bottom >= body.Y && card.Y <= body.Bottom)
+                {
+                    Gfx.FillRect(card, Th.Panel, 8);
+                    Gfx.DrawText($"{p.AuthorName}  •  {p.Timestamp}", new R(card.X + 10, card.Y + 6, card.W - 20, 16), 12, p.AuthorColor, 700);
+                    Gfx.DrawText(p.Content, new R(card.X + 10, card.Y + 24, card.W - 20, th + 4), 12.5f, Th.Text, 400, 0, true);
+                }
                 y += card.H + 8;
             }
+            Gfx.PopClip();
         }
         else
         {
             Gfx.DrawText("В этом канале нет закреплённых сообщений", new R(body.X, body.Y + 120, body.W, 24), 13, Th.Dim, 500, 1);
         }
-        Gfx.PopClip();
     }
 
     private static void DrawImageLightbox(R r)
@@ -1297,7 +1426,7 @@ public static unsafe partial class Shell
         var avr = new R(card.X + 16, card.Y + 24, 60, 60);
         Gfx.FillCircle(avr.X + 30, avr.Y + 30, 33, 0xFA14151B);
         if (av != null) Gfx.DrawBitmap(av, avr);
-        else { Gfx.FillCircle(avr.X + 30, avr.Y + 30, 30, Th.Brand); Gfx.DrawText(display.Length > 0 ? display[..1].ToUpperInvariant() : "?", new R(avr.X, avr.Y + 16, 60, 28), 22, 0xFFFFFFFF, 700, 1); }
+        else { Gfx.FillCircle(avr.X + 30, avr.Y + 30, 30, Th.Brand); Gfx.DrawText(FirstGrapheme(display), new R(avr.X, avr.Y + 16, 60, 28), 22, 0xFFFFFFFF, 700, 1); }
 
         uint dot = status switch { "online" => Th.Green, "idle" => Th.Amber, "dnd" => Th.Red, _ => Th.Dim };
         Gfx.FillCircle(avr.Right - 8, avr.Bottom - 8, 8.5f, 0xFA14151B);
@@ -1389,35 +1518,41 @@ internal static class ShellAsync
         if (snap == null) return;
         var dc = DiscordClient.Instance;
 
-        Shell.ApplyRestoredUiState(snap);
+        App.InvokeOnUiThread(() => Shell.ApplyRestoredUiState(snap));
 
         bool rejoinedVoice = false;
         if (!string.IsNullOrEmpty(snap.VoiceGuildId) && !string.IsNullOrEmpty(snap.VoiceChannelId))
         {
             await dc.JoinVoiceAsync(snap.VoiceGuildId, snap.VoiceChannelId, snap.Muted, snap.Deafened);
             rejoinedVoice = true;
-            await Task.Delay(750);
+            // Wait up to 6s for Voice Gateway handshake to complete instead of a blind 750ms sleep
+            for (int wait = 0; wait < 60 && !dc.VoiceConnected; wait++)
+                await Task.Delay(100);
 
             foreach (var w in snap.WatchedStreams)
             {
                 bool focus = snap.FocusedStreamUserId == w.UserId;
-                await dc.WatchStreamAsync(snap.VoiceGuildId, snap.VoiceChannelId, w.UserId, w.Name, focusImmediately: focus);
+                await dc.WatchStreamAsync(snap.VoiceGuildId, snap.VoiceChannelId, w.UserId, w.Name,
+                    focusImmediately: focus, selfMute: snap.Muted, selfDeaf: snap.Deafened);
                 dc.SetStreamVolume(w.UserId, w.Volume);
-                if (w.Muted) dc.ToggleStreamMute(w.UserId);
+                var ws = dc.GetWatchSession(w.UserId);
+                if (ws != null && w.Muted && !ws.Muted) dc.ToggleStreamMute(w.UserId);
             }
             if (!string.IsNullOrEmpty(snap.FocusedStreamUserId))
                 dc.FocusedStreamUserId = snap.FocusedStreamUserId;
 
             if (snap.WasStreaming)
             {
-                Shell.StartStream(snap.StreamMonitor, snap.StreamHwnd);
+                int mon = snap.StreamMonitor;
+                ulong hwnd = snap.StreamHwnd;
+                App.InvokeOnUiThread(() => Shell.StartStream(mon, hwnd));
             }
         }
 
         string msg = rejoinedVoice
             ? $"⚡ Обновлено до v{Updater.CurrentVersion} — звонок и стримы восстановлены!"
             : $"⚡ FluxCord успешно обновлён до v{Updater.CurrentVersion}!";
-        Shell.Toast(msg, 5000);
+        App.InvokeOnUiThread(() => Shell.Toast(msg, 5000));
         SettingsStore.Log($"Updater resume complete: rejoinedVoice={rejoinedVoice}, watches={snap.WatchedStreams.Count}, streaming={snap.WasStreaming}");
     }
 }

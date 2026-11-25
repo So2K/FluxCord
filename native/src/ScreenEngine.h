@@ -26,10 +26,12 @@ public:
     void getStats(FcScreenStats* out) const;
 
 private:
+    void stopLocked();
     void captureEncodeLoop();
     void systemAudioLoop();
 
     VoiceTransport* transport_;
+    std::mutex lifecycle_mtx_;
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> video_ssrc_{0};
     std::atomic<bool> force_keyframe_{true};

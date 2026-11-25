@@ -26,6 +26,8 @@ public static class UI
     public static float MX = -1, MY = -1;
     public static bool Down, Pressed, Released, RightClicked;
     public static float Wheel;
+    /// <summary>When true, background widgets ignore hover/click/right-click/wheel so modals & popups NEVER click through!</summary>
+    public static bool InputBlocked;
     private static int _activeId;
     private static bool _wantHand;
     private static bool _animate;
@@ -33,25 +35,27 @@ public static class UI
     public static bool WantHand => _wantHand;
     public static void Animate() => _animate = true;
     public static bool TakeAnimate() { var a = _animate; _animate = false; return a; }
+    public static void CancelDrag() { Down = false; _activeId = 0; }
 
-    public static void BeginFrame() { _wantHand = false; }
+    public static void BeginFrame() { _wantHand = false; InputBlocked = false; }
     public static void EndFrame()
     {
         if (Released) _activeId = 0;
         Pressed = Released = RightClicked = false;
         Wheel = 0;
+        InputBlocked = false;
     }
 
     public static int Id(string key, int idx = 0) => HashCode.Combine(key, idx);
-    public static bool Hover(R r) => r.Contains(MX, MY) && Gfx.Clip.Contains(MX, MY);
-    public static bool RightClick(R r) => RightClicked && Hover(r);
+    public static bool Hover(R r) => !InputBlocked && r.Contains(MX, MY) && Gfx.Clip.Contains(MX, MY);
+    public static bool RightClick(R r) => !InputBlocked && RightClicked && Hover(r);
 
     public static bool Click(int id, R r)
     {
         bool over = Hover(r);
         if (over) _wantHand = true;
         if (over && Pressed) _activeId = id;
-        return Released && _activeId == id && over;
+        return !InputBlocked && Released && _activeId == id && over;
     }
 
     public static bool Button(int id, R r, string label, uint bg, uint text = Th.Text, float radius = 6f, float fontSize = 13f, int weight = 600)
@@ -89,7 +93,7 @@ public static class UI
         bool over = Hover(hit);
         if (over) _wantHand = true;
         if (over && Pressed) _activeId = id;
-        if (_activeId == id && Down)
+        if (!InputBlocked && _activeId == id && Down)
         {
             float nt = Math.Clamp((MX - track.X) / MathF.Max(1f, track.W), 0f, 1f);
             float nv = min + nt * (max - min);

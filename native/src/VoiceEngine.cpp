@@ -1,4 +1,5 @@
 #include "VoiceEngine.h"
+#include "NetTurbo.h"
 #include <opus.h>
 #include <initguid.h>
 #include <audioclient.h>
@@ -18,11 +19,19 @@ namespace fc {
 
 namespace {
 constexpr int kRate = 48000;
-constexpr int kFrame = 960; // 20 ms @ 48 kHz
+constexpr int kFrame = 960;      // 20 ms @ 48 kHz
+constexpr int kMaxOpus = 5760;   // 120 ms max Opus packet size
 
 int64_t steadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool isDeviceLostHr(HRESULT hr) {
+    return hr == AUDCLNT_E_DEVICE_INVALIDATED ||
+           hr == AUDCLNT_E_SERVICE_NOT_RUNNING ||
+           hr == AUDCLNT_E_RESOURCES_INVALIDATED ||
+           hr == AUDCLNT_E_ENDPOINT_CREATE_FAILED;
 }
 
 std::string wideToUtf8(const wchar_t* w) {
@@ -44,6 +53,7 @@ std::wstring utf8ToWide(const char* s) {
 }
 
 bool openAudioClient(EDataFlow flow, const std::string& deviceId, int channels, ComPtr<IAudioClient>& client, HANDLE ev) {
+    client.Reset();
     ComPtr<IMMDeviceEnumerator> en;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en)))) return false;
 
@@ -68,12 +78,15 @@ bool openAudioClient(EDataFlow flow, const std::string& deviceId, int channels, 
     wf.nAvgBytesPerSec = kRate * wf.nBlockAlign;
 
     const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200000, 0, &wf, nullptr))) return false;
+    if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200000, 0, &wf, nullptr))) {
+        client.Reset();
+        return false;
+    }
     return SUCCEEDED(client->SetEventHandle(ev));
 }
 } // namespace
 
-/// Smooth 40ms adaptive jitter buffer with 64-bit sequence unwrapping + Opus PLC (zero clicks/dropouts!)
+/// Smooth adaptive 40ms jitter buffer with 64-bit seq unwrapping + Opus In-Band FEC/PLC (zero micro-dropouts!)
 struct VoiceEngine::RemoteStream {
     OpusDecoder* dec = nullptr;
     std::map<int64_t, std::vector<uint8_t>> jb;
@@ -81,6 +94,8 @@ struct VoiceEngine::RemoteStream {
     int64_t next_play_seq = 0;
     bool playing = false;
     int consecutive_plc = 0;
+    int stale_count = 0;
+    int64_t last_rx_ms = 0;
     int64_t last_loud_ms = 0;
     int64_t last_loss_ms = 0;
     std::vector<float> pcm_fifo; // interleaved stereo float32
@@ -88,7 +103,12 @@ struct VoiceEngine::RemoteStream {
     RemoteStream() {
         int err = 0;
         dec = opus_decoder_create(kRate, 2, &err);
+        if (err != OPUS_OK) {
+            if (dec) opus_decoder_destroy(dec);
+            dec = nullptr;
+        }
         pcm_fifo.reserve(kFrame * 2 * 6);
+        last_rx_ms = steadyMs();
     }
     ~RemoteStream() {
         if (dec) opus_decoder_destroy(dec);
@@ -107,10 +127,24 @@ struct VoiceEngine::RemoteStream {
     }
 
     void pushPacket(uint16_t seq, const uint8_t* opus, int len) {
+        last_rx_ms = steadyMs();
         int64_t ext = unwrapSeq(seq);
-        if (playing && ext < next_play_seq) return; // stale late packet
+        if (playing && ext < next_play_seq) {
+            // Recover cleanly if remote sender restarted its sequence counter while playing!
+            if (++stale_count > 50) {
+                jb.clear();
+                playing = false;
+                last_ext_seq = seq;
+                ext = seq;
+                stale_count = 0;
+            } else {
+                return;
+            }
+        } else {
+            stale_count = 0;
+        }
         jb[ext] = std::vector<uint8_t>(opus, opus + len);
-        // Prevent unbounded latency drift: keep at most 12 packets (240 ms)
+        // Cap at 12 packets (240 ms) to bound max latency
         while (jb.size() > 12) {
             jb.erase(jb.begin());
             if (playing && !jb.empty() && next_play_seq < jb.begin()->first)
@@ -119,73 +153,78 @@ struct VoiceEngine::RemoteStream {
     }
 
     void decodeIntoFifo(size_t needed_samples) {
-        float decBuf[kFrame * 2];
+        if (!dec) return;
+        std::vector<float> decBuf(kMaxOpus * 2);
         while (pcm_fifo.size() < needed_samples) {
             if (!playing) {
-                // Adaptive Turbo Jitter Buffer: 1 packet (20ms!) on clean links, auto-expands to 2 packets (40ms) for 10s if loss occurred!
-                size_t targetPrebuf = (steadyMs() - last_loss_ms < 10000) ? 2 : 1;
+                // Smooth 40ms (2-packet) prebuffer prevents jitter micro-dropouts; expands to 3 packets briefly after loss!
+                size_t targetPrebuf = (steadyMs() - last_loss_ms < 10000) ? 3 : 2;
                 if (jb.size() < targetPrebuf) break;
                 next_play_seq = jb.begin()->first;
                 playing = true;
                 consecutive_plc = 0;
             }
 
-            // If buffer got severely behind (>16 packets = 320 ms), skip cleanly to reduce latency
-            if (jb.size() > 16) {
-                while (jb.size() > 4) jb.erase(jb.begin());
-                next_play_seq = jb.begin()->first;
-            }
-
             auto it = jb.find(next_play_seq);
             int samples = 0;
             if (it != jb.end()) {
-                // Skip explicit 3-byte Discord silence frame (0xF8, 0xFF, 0xFE) cleanly
                 const auto& p = it->second;
                 if (p.size() == 3 && p[0] == 0xF8 && p[1] == 0xFF && p[2] == 0xFE) {
-                    std::memset(decBuf, 0, sizeof(decBuf));
+                    std::memset(decBuf.data(), 0, sizeof(float) * kFrame * 2);
                     samples = kFrame;
+                    jb.erase(it);
+                    next_play_seq++;
+                    consecutive_plc = 0;
+                    if (jb.empty()) playing = false; // explicit end-of-talkspurt
                 } else {
-                    samples = opus_decode_float(dec, p.data(), int(p.size()), decBuf, kFrame, 0);
+                    samples = opus_decode_float(dec, p.data(), int(p.size()), decBuf.data(), kMaxOpus, 0);
+                    jb.erase(it);
+                    next_play_seq++;
+                    consecutive_plc = 0;
                 }
-                jb.erase(it);
-                next_play_seq++;
-                consecutive_plc = 0;
             } else if (!jb.empty() && jb.begin()->first > next_play_seq && consecutive_plc < 4) {
                 // True packet loss: invoke Opus In-Band FEC if next packet exists, else Opus PLC!
                 auto itNext = jb.find(next_play_seq + 1);
                 if (itNext != jb.end() && itNext->second.size() > 3) {
-                    samples = opus_decode_float(dec, itNext->second.data(), int(itNext->second.size()), decBuf, kFrame, 1);
+                    samples = opus_decode_float(dec, itNext->second.data(), int(itNext->second.size()), decBuf.data(), kFrame, 1);
                 } else {
-                    samples = opus_decode_float(dec, nullptr, 0, decBuf, kFrame, 0);
+                    samples = opus_decode_float(dec, nullptr, 0, decBuf.data(), kFrame, 0);
                 }
                 next_play_seq++;
                 consecutive_plc++;
                 last_loss_ms = steadyMs();
             } else if (!jb.empty() && consecutive_plc >= 4) {
-                // Re-sync after burst drop
                 next_play_seq = jb.begin()->first;
                 consecutive_plc = 0;
                 continue;
             } else {
-                // Speaker stopped talking: smoothly fade out with 1 PLC frame then stop
+                // Buffer briefly empty: bridge 1 jitter tick with clean PLC before fading out on genuine silence!
                 if (consecutive_plc == 0) {
-                    samples = opus_decode_float(dec, nullptr, 0, decBuf, kFrame, 0);
-                    for (int i = 0; i < samples * 2; ++i) {
-                        float fade = 1.0f - float(i) / float(samples * 2);
-                        decBuf[i] *= fade;
-                    }
+                    samples = opus_decode_float(dec, nullptr, 0, decBuf.data(), kFrame, 0);
+                    next_play_seq++;
                     consecutive_plc = 1;
+                    last_loss_ms = steadyMs();
+                } else if (consecutive_plc == 1) {
+                    samples = opus_decode_float(dec, nullptr, 0, decBuf.data(), kFrame, 0);
+                    for (int i = 0; i < samples * 2; ++i) {
+                        float fade = 1.0f - float(i) / float(std::max(1, samples * 2));
+                        decBuf[size_t(i)] *= fade;
+                    }
+                    consecutive_plc = 2;
+                    playing = false;
+                } else {
+                    playing = false;
+                    break;
                 }
-                playing = false;
                 if (samples <= 0) break;
             }
 
             if (samples > 0) {
                 double energy = 0.0;
-                for (int i = 0; i < samples * 2; ++i) energy += double(decBuf[i]) * double(decBuf[i]);
+                for (int i = 0; i < samples * 2; ++i) energy += double(decBuf[size_t(i)]) * double(decBuf[size_t(i)]);
                 float rms = float(std::sqrt(energy / double(samples * 2)));
                 if (rms > 0.004f) last_loud_ms = steadyMs();
-                pcm_fifo.insert(pcm_fifo.end(), decBuf, decBuf + samples * 2);
+                pcm_fifo.insert(pcm_fifo.end(), decBuf.data(), decBuf.data() + samples * 2);
             } else {
                 break;
             }
@@ -202,6 +241,7 @@ VoiceEngine::VoiceEngine(VoiceTransport* transport) : transport_(transport) {
 }
 
 VoiceEngine::~VoiceEngine() {
+    if (transport_) transport_->setAudioRxCallback(nullptr);
     stop();
 }
 
@@ -259,7 +299,8 @@ int32_t VoiceEngine::listDevices(bool capture, FcDeviceInfo* out_list, int32_t m
 }
 
 bool VoiceEngine::start(const char* capture_device_id, const char* render_device_id) {
-    stop();
+    std::lock_guard life(lifecycle_mtx_);
+    stopLocked();
     cap_id_ = capture_device_id ? capture_device_id : "";
     ren_id_ = render_device_id ? render_device_id : "";
     suppressor_.reset();
@@ -270,13 +311,19 @@ bool VoiceEngine::start(const char* capture_device_id, const char* render_device
 }
 
 void VoiceEngine::stop() {
-    if (!running_.exchange(false)) return;
+    std::lock_guard life(lifecycle_mtx_);
+    stopLocked();
+}
+
+void VoiceEngine::stopLocked() {
+    running_.store(false);
     if (cap_thread_.joinable()) cap_thread_.join();
     if (ren_thread_.joinable()) ren_thread_.join();
     std::lock_guard lk(mtx_);
     streams_.clear();
     loopback_fifo_.clear();
     speaking_.store(false);
+    suppressor_.clearTelemetry();
 }
 
 void VoiceEngine::setUserVolume(uint32_t ssrc, float vol) {
@@ -322,17 +369,27 @@ void VoiceEngine::getStats(FcAudioStats* out) const {
 size_t VoiceEngine::pullMixedStereo(float* dst, size_t stereo_frames) {
     size_t samples = stereo_frames * 2;
     std::memset(dst, 0, sizeof(float) * samples);
-    if (deafened_.load()) return samples;
+
+    std::lock_guard lk(mtx_);
+    // When deafened, actively drain all queued packets so undeafening NEVER blasts stale audio!
+    if (deafened_.load()) {
+        loopback_fifo_.clear();
+        for (auto& [ssrc, st] : streams_) {
+            st->jb.clear();
+            st->pcm_fifo.clear();
+            st->playing = false;
+        }
+        return samples;
+    }
 
     float master = output_vol_.load();
-    std::lock_guard lk(mtx_);
-
     if (!loopback_fifo_.empty()) {
         size_t take = std::min(samples, loopback_fifo_.size());
         for (size_t i = 0; i < take; ++i) dst[i] += loopback_fifo_[i] * master;
         loopback_fifo_.erase(loopback_fifo_.begin(), loopback_fifo_.begin() + take);
     }
 
+    int64_t now = steadyMs();
     for (auto& [ssrc, st] : streams_) {
         float uvol = master;
         auto itv = user_volumes_.find(ssrc);
@@ -342,6 +399,19 @@ size_t VoiceEngine::pullMixedStereo(float* dst, size_t stereo_frames) {
         size_t take = std::min(samples, st->pcm_fifo.size());
         for (size_t i = 0; i < take; ++i) dst[i] += st->pcm_fifo[i] * uvol;
         if (take > 0) st->pcm_fifo.erase(st->pcm_fifo.begin(), st->pcm_fifo.begin() + take);
+    }
+
+    // Periodically evict long-idle remote Opus decoders (>30s inactive) to prevent unbounded memory growth!
+    if (now - last_evict_ms_ >= 10000) {
+        last_evict_ms_ = now;
+        for (auto it = streams_.begin(); it != streams_.end(); ) {
+            if (it->second && it->second->jb.empty() && it->second->pcm_fifo.empty() &&
+                (now - it->second->last_rx_ms) > 30000) {
+                it = streams_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     // Soft limiter on mixed master bus so loud speakers never hard-clip!
@@ -357,20 +427,17 @@ size_t VoiceEngine::pullMixedStereo(float* dst, size_t stereo_frames) {
 void VoiceEngine::captureLoop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioCaptureClient> cap;
-    if (!openAudioClient(eCapture, cap_id_, 1, client, ev) || FAILED(client->GetService(IID_PPV_ARGS(&cap)))) {
+    HANDLE mm = boostRealtimeThread(L"Pro Audio");
+
+    int err = 0;
+    OpusEncoder* enc = opus_encoder_create(kRate, 2, OPUS_APPLICATION_VOIP, &err);
+    if (!enc || err != OPUS_OK) {
+        if (enc) opus_encoder_destroy(enc);
+        revertRealtimeThread(mm);
         CloseHandle(ev);
         CoUninitialize();
         return;
     }
-
-    DWORD taskIdx = 0;
-    HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIdx);
-
-    // Encode 48 kHz 2-channel Opus (Discord native format!) at 128 kbps with FEC & zero DTX wakeup lag
-    int err = 0;
-    OpusEncoder* enc = opus_encoder_create(kRate, 2, OPUS_APPLICATION_VOIP, &err);
     opus_encoder_ctl(enc, OPUS_SET_BITRATE(128000));
     opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(5));
@@ -384,74 +451,106 @@ void VoiceEngine::captureLoop() {
     uint32_t rtpTs = 0;
     bool prevSpeaking = false;
 
-    client->Start();
+    // Outer device-recovery loop: automatically survives USB mic hot-unplug / Bluetooth switches!
     while (running_.load()) {
-        WaitForSingleObject(ev, 50);
-        UINT32 pktSize = 0;
-        while (SUCCEEDED(cap->GetNextPacketSize(&pktSize)) && pktSize > 0) {
-            BYTE* data = nullptr;
-            UINT32 frames = 0;
-            DWORD flags = 0;
-            if (FAILED(cap->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
-            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                acc.insert(acc.end(), frames, 0.0f);
-            } else {
-                const float* f = reinterpret_cast<const float*>(data);
-                float gain = input_gain_.load();
-                size_t oldSz = acc.size();
-                acc.resize(oldSz + frames);
-                for (UINT32 i = 0; i < frames; ++i) acc[oldSz + i] = f[i] * gain;
-            }
-            cap->ReleaseBuffer(frames);
+        ComPtr<IAudioClient> client;
+        ComPtr<IAudioCaptureClient> cap;
+        if (!openAudioClient(eCapture, cap_id_, 1, client, ev) || FAILED(client->GetService(IID_PPV_ARGS(&cap)))) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
+        }
+        acc.clear();
+        if (FAILED(client->Start())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
         }
 
-        size_t off = 0;
-        while (acc.size() - off >= size_t(kFrame)) {
-            float frame[kFrame];
-            std::memcpy(frame, acc.data() + off, sizeof(frame));
-            off += kFrame;
+        while (running_.load()) {
+            WaitForSingleObject(ev, 50);
+            UINT32 pktSize = 0;
+            HRESULT hr = cap->GetNextPacketSize(&pktSize);
+            if (isDeviceLostHr(hr)) break;
+            if (FAILED(hr)) continue;
 
-            if (muted_.load()) {
-                std::memset(frame, 0, sizeof(frame));
-                speaking_.store(false);
-            } else {
-                suppressor_.process(frame, kFrame);
-                speaking_.store(suppressor_.isVoiceActive());
+            bool deviceLost = false;
+            while (pktSize > 0) {
+                BYTE* data = nullptr;
+                UINT32 frames = 0;
+                DWORD flags = 0;
+                hr = cap->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+                if (isDeviceLostHr(hr)) { deviceLost = true; break; }
+                if (FAILED(hr)) break;
+
+                if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !data) {
+                    acc.insert(acc.end(), frames, 0.0f);
+                } else {
+                    const float* f = reinterpret_cast<const float*>(data);
+                    float gain = input_gain_.load();
+                    size_t oldSz = acc.size();
+                    acc.resize(oldSz + frames);
+                    for (UINT32 i = 0; i < frames; ++i) acc[oldSz + i] = f[i] * gain;
+                }
+                cap->ReleaseBuffer(frames);
+                hr = cap->GetNextPacketSize(&pktSize);
+                if (isDeviceLostHr(hr)) { deviceLost = true; break; }
+                if (FAILED(hr)) break;
             }
+            if (deviceLost) break;
 
-            if (loopback_.load() && !deafened_.load()) {
-                std::lock_guard lk(mtx_);
-                if (loopback_fifo_.size() < size_t(kFrame * 6)) {
-                    for (int i = 0; i < kFrame; ++i) {
-                        loopback_fifo_.push_back(frame[i]);
-                        loopback_fifo_.push_back(frame[i]);
+            size_t off = 0;
+            while (acc.size() - off >= size_t(kFrame)) {
+                float frame[kFrame];
+                std::memcpy(frame, acc.data() + off, sizeof(frame));
+                off += kFrame;
+
+                if (muted_.load()) {
+                    std::memset(frame, 0, sizeof(frame));
+                    speaking_.store(false);
+                    suppressor_.clearTelemetry();
+                } else {
+                    suppressor_.process(frame, kFrame);
+                    speaking_.store(suppressor_.isVoiceActive());
+                }
+
+                if (loopback_.load() && !deafened_.load()) {
+                    std::lock_guard lk(mtx_);
+                    if (loopback_fifo_.size() < size_t(kFrame * 6)) {
+                        for (int i = 0; i < kFrame; ++i) {
+                            loopback_fifo_.push_back(frame[i]);
+                            loopback_fifo_.push_back(frame[i]);
+                        }
                     }
                 }
-            }
 
-            bool nowSpeaking = !muted_.load() && speaking_.load();
-            if (nowSpeaking && transport_ && transport_->isReady()) {
-                for (int i = 0; i < kFrame; ++i) {
-                    stereoFrame[i * 2] = frame[i];
-                    stereoFrame[i * 2 + 1] = frame[i];
+                bool nowSpeaking = !muted_.load() && speaking_.load();
+                if (nowSpeaking && transport_ && transport_->isReady()) {
+                    for (int i = 0; i < kFrame; ++i) {
+                        stereoFrame[i * 2] = frame[i];
+                        stereoFrame[i * 2 + 1] = frame[i];
+                    }
+                    uint8_t opusOut[1200];
+                    int n = opus_encode_float(enc, stereoFrame, kFrame, opusOut, sizeof(opusOut));
+                    if (n > 2) {
+                        transport_->sendOpus(opusOut, n, rtpTs);
+                    }
+                } else if (prevSpeaking && !nowSpeaking && transport_ && transport_->isReady()) {
+                    transport_->sendSilenceFrames();
+                    rtpTs += 5 * kFrame; // Keep monotonic alignment with sendSilenceFrames()!
                 }
-                uint8_t opusOut[1200];
-                int n = opus_encode_float(enc, stereoFrame, kFrame, opusOut, sizeof(opusOut));
-                if (n > 2) {
-                    transport_->sendOpus(opusOut, n, rtpTs);
-                }
-            } else if (prevSpeaking && !nowSpeaking && transport_ && transport_->isReady()) {
-                transport_->sendSilenceFrames();
+                prevSpeaking = nowSpeaking;
+                rtpTs += kFrame;
             }
-            prevSpeaking = nowSpeaking;
-            rtpTs += kFrame;
+            if (off > 0) acc.erase(acc.begin(), acc.begin() + off);
         }
-        if (off > 0) acc.erase(acc.begin(), acc.begin() + off);
+
+        client->Stop();
+        cap.Reset();
+        client.Reset();
+        if (running_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    client->Stop();
     opus_encoder_destroy(enc);
-    if (mm) AvRevertMmThreadCharacteristics(mm);
+    revertRealtimeThread(mm);
     CloseHandle(ev);
     CoUninitialize();
 }
@@ -459,35 +558,60 @@ void VoiceEngine::captureLoop() {
 void VoiceEngine::renderLoop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioRenderClient> ren;
-    if (!openAudioClient(eRender, ren_id_, 2, client, ev) || FAILED(client->GetService(IID_PPV_ARGS(&ren)))) {
-        CloseHandle(ev);
-        CoUninitialize();
-        return;
-    }
+    HANDLE mm = boostRealtimeThread(L"Pro Audio");
 
-    UINT32 bufFrames = 0;
-    client->GetBufferSize(&bufFrames);
-    DWORD taskIdx = 0;
-    HANDLE mm = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIdx);
-
-    client->Start();
+    // Outer device-recovery loop: automatically survives DAC/headset hot-unplug!
     while (running_.load()) {
-        WaitForSingleObject(ev, 50);
-        UINT32 pad = 0;
-        if (FAILED(client->GetCurrentPadding(&pad))) continue;
-        UINT32 avail = bufFrames > pad ? bufFrames - pad : 0;
-        if (avail == 0) continue;
+        ComPtr<IAudioClient> client;
+        ComPtr<IAudioRenderClient> ren;
+        if (!openAudioClient(eRender, ren_id_, 2, client, ev) || FAILED(client->GetService(IID_PPV_ARGS(&ren)))) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
+        }
 
-        BYTE* dst = nullptr;
-        if (FAILED(ren->GetBuffer(avail, &dst))) continue;
-        pullMixedStereo(reinterpret_cast<float*>(dst), avail);
-        ren->ReleaseBuffer(avail, 0);
+        UINT32 bufFrames = 0;
+        if (FAILED(client->GetBufferSize(&bufFrames)) || bufFrames == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
+        }
+
+        // Pre-fill entire render buffer with silence BEFORE Start() per MSDN event-driven WASAPI requirement
+        BYTE* initDst = nullptr;
+        if (SUCCEEDED(ren->GetBuffer(bufFrames, &initDst))) {
+            ren->ReleaseBuffer(bufFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+        }
+        if (FAILED(client->Start())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
+        }
+
+        while (running_.load()) {
+            WaitForSingleObject(ev, 50);
+            UINT32 pad = 0;
+            HRESULT hr = client->GetCurrentPadding(&pad);
+            if (isDeviceLostHr(hr)) break;
+            if (FAILED(hr)) continue;
+
+            UINT32 avail = bufFrames > pad ? bufFrames - pad : 0;
+            if (avail == 0) continue;
+
+            BYTE* dst = nullptr;
+            hr = ren->GetBuffer(avail, &dst);
+            if (isDeviceLostHr(hr)) break;
+            if (FAILED(hr) || !dst) continue;
+
+            pullMixedStereo(reinterpret_cast<float*>(dst), avail);
+            hr = ren->ReleaseBuffer(avail, 0);
+            if (isDeviceLostHr(hr)) break;
+        }
+
+        client->Stop();
+        ren.Reset();
+        client.Reset();
+        if (running_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    client->Stop();
-    if (mm) AvRevertMmThreadCharacteristics(mm);
+    revertRealtimeThread(mm);
     CloseHandle(ev);
     CoUninitialize();
 }

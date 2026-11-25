@@ -17,7 +17,7 @@ namespace fc {
 /// for watching Discord Go Live streams in real time.
 class StreamReceiver {
 public:
-    explicit StreamReceiver(VoiceEngine* voice);
+    StreamReceiver(VoiceEngine* voice, int32_t slot_index = 0);
     ~StreamReceiver();
 
     bool connectAndDiscover(const char* ip, uint16_t port, uint32_t ssrc, HWND hwnd, std::string& out_ext_ip, uint16_t& out_ext_port);
@@ -41,21 +41,32 @@ public:
 
 private:
     void rxDecodeLoop();
+    void stopLocked();
     void daveDestroyLocked();
+    uint32_t makeVoiceAudioKey(uint32_t audio_ssrc) const {
+        return 0x80000000u | (uint32_t((slot_index_ & 0xF) + 1) << 24) | (audio_ssrc & 0x00FFFFFFu);
+    }
 
     VoiceEngine* voice_;
+    int32_t slot_index_ = 0;
+    bool wsa_ok_ = false;
+    std::mutex lifecycle_mtx_;
+
     SOCKET sock_ = INVALID_SOCKET;
+    ULONG qos_flow_id_ = 0;
     sockaddr_in remote_{};
     HWND hwnd_ = nullptr;
 
+    std::mutex key_mtx_;
     uint8_t key_[32]{};
     bool use_xchacha_ = true;
-    uint32_t local_ssrc_ = 0;
+    std::atomic<uint32_t> local_ssrc_{0};
     uint32_t rtcp_nonce_ = 1;
     std::atomic<bool> has_key_{false};
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> video_ssrc_{0};
     std::atomic<uint32_t> audio_ssrc_{0};
+    std::atomic<bool> reset_depack_{false};
     std::atomic<float> stream_vol_{1.0f};
     std::atomic<int32_t> pending_w_{0};
     std::atomic<int32_t> pending_h_{0};
