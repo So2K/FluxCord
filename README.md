@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="src/FluxCord/Assets/fluxcord.png" width="112" height="112" alt="FluxCord Logo" />
+  <img src="src/FluxCord/Assets/fluxcord.svg" width="128" height="128" alt="FluxCord Logo" />
   <h1>FluxCord</h1>
   <p><b>Ультрабыстрый нативный клиент Discord для Windows без Electron и Chromium</b></p>
   <p>
