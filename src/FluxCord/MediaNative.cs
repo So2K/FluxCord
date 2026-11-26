@@ -178,6 +178,7 @@ internal static unsafe partial class MediaNative
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf8)]
     public static partial int fc_watch_connect_slot(int slot, string ip, ushort port, uint ssrc, nint hwnd, byte* outExtIp, int extIpCap, ushort* outExtPort);
     [LibraryImport(Dll)] public static partial void fc_watch_set_key_slot(int slot, byte* secretKey32, int useXchachaRtpsize);
+    [LibraryImport(Dll)] public static partial void fc_watch_set_codec_slot(int slot, int codec, int videoPt);
     [LibraryImport(Dll, StringMarshalling = StringMarshalling.Utf8)]
     public static partial void fc_watch_set_remote_slot(int slot, uint videoSsrc, uint audioSsrc, string? streamerUserId);
     [LibraryImport(Dll)] public static partial void fc_watch_set_volume_slot(int slot, float volume);

@@ -751,7 +751,7 @@ public static unsafe partial class Shell
         // Block background click-through whenever ANY modal or popup is open (outside clicks dismiss ONLY the popup!)
         UI.InputBlocked = fullModalOpen || anyPopupOpen || hoverPreviewOver;
 
-        if (!dc.IsConnected && !dc.IsDemoMode)
+        if (!dc.IsConnected && !dc.HasActiveSession && !dc.IsDemoMode)
         {
             DrawLoginScreen(new R(0, TopH, w, h - TopH));
         }
@@ -834,11 +834,14 @@ public static unsafe partial class Shell
             catch { }
         }
         int showPing = dc.VoiceConnected && dc.VoicePingMs > 0 ? dc.VoicePingMs : dc.GatewayPingMs;
-        string perf = $"RAM {_cachedRamMb} МБ • {Gfx.LastFlushMs:F1} мс • Пинг {showPing} мс";
-        if (_streaming) perf += _activeStreamMonitor == -2 ? $" • 2-ЭКР {_selfScreenStats.Fps:F0}fps" : $" • LIVE {_selfScreenStats.Fps:F0}fps";
+        string perf = (dc.HasActiveSession && !dc.IsConnected)
+            ? $"RAM {_cachedRamMb} МБ • ⟳ Переподключение к Discord..."
+            : $"RAM {_cachedRamMb} МБ • {Gfx.LastFlushMs:F1} мс • Пинг {showPing} мс";
+        if (_streaming && dc.IsConnected) perf += _activeStreamMonitor == -2 ? $" • 2-ЭКР {_selfScreenStats.Fps:F0}fps" : $" • LIVE {_selfScreenStats.Fps:F0}fps";
         var pill = new R(112, r.Y + 8, MathF.Min(356, r.W * 0.32f), 22);
         Gfx.FillRect(pill, Th.Panel, 11);
-        Gfx.DrawText(perf, new R(pill.X + 10, pill.Y + 3, pill.W - 20, 16), 11f, _streaming ? Th.Green : (showPing > 0 && showPing < 95 ? Th.Green : Th.Dim), 600);
+        uint perfCol = (dc.HasActiveSession && !dc.IsConnected) ? Th.Amber : (_streaming ? Th.Green : (showPing > 0 && showPing < 95 ? Th.Green : Th.Dim));
+        Gfx.DrawText(perf, new R(pill.X + 10, pill.Y + 3, pill.W - 20, 16), 11f, perfCol, 600);
 
         // Centered server name (exact GoofCord top bar!)
         DiscordGuild? g;
@@ -886,7 +889,7 @@ public static unsafe partial class Shell
             _qrStartQueued = false;
             var dc = DiscordClient.Instance;
             var qr = RemoteAuthQr.Instance;
-            if (!dc.IsConnected && !dc.IsConnecting && !dc.IsDemoMode && !qr.IsRunning)
+            if (!dc.IsConnected && !dc.HasActiveSession && !dc.IsConnecting && !dc.HasToken && !dc.IsDemoMode && !qr.IsRunning)
                 qr.Start();
         });
     }

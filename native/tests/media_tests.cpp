@@ -366,6 +366,33 @@ void testGoLiveSystemAudioOpus128k() {
     std::snprintf(msg, sizeof(msg), "Go Live System Audio Stereo 128kbps Music Opus roundtrip: bytes=%d rms=%.4f", totalBytes, lastRms);
     check(totalBytes > 500 && lastRms > 0.18f, msg);
 }
+
+void testVideoDepacketizerHevcRfc7798() {
+    fc::VideoDepacketizer depack;
+    depack.setHevc(true);
+    fc::VideoDepacketizer::FrameOut out{};
+    bool pli = false;
+
+    // 1. RFC 7798 AP (type=48): VPS(32) + SPS(33) + PPS(34)
+    // HEVC 2-byte NAL header: (type << 1), tid=1 -> VPS=(32<<1)=0x40,0x01; SPS=(33<<1)=0x42,0x01; PPS=(34<<1)=0x44,0x01
+    std::vector<uint8_t> ap = {
+        uint8_t(48 << 1), 0x01,
+        0x00, 0x04, 0x40, 0x01, 0xAA, 0xBB,
+        0x00, 0x04, 0x42, 0x01, 0xCC, 0xDD,
+        0x00, 0x04, 0x44, 0x01, 0xEE, 0xFF
+    };
+    bool ok1 = depack.pushPacket(10, 9000, false, ap.data(), int(ap.size()), 100, out, pli);
+    check(!ok1, "HEVC RFC 7798 AP config packet queued waiting for IDR FU");
+
+    // 2. RFC 7798 FU (type=49) carrying IDR_W_RADL (type=19 -> orig hdr0 = 0x26, hdr1 = 0x01) across 2 fragments
+    std::vector<uint8_t> fuStart = { uint8_t(49 << 1), 0x01, uint8_t(0x80 | 19), 0x11, 0x22, 0x33 };
+    std::vector<uint8_t> fuEnd   = { uint8_t(49 << 1), 0x01, uint8_t(0x40 | 19), 0x44, 0x55, 0x66 };
+    depack.pushPacket(11, 9000, false, fuStart.data(), int(fuStart.size()), 101, out, pli);
+    bool okIdr = depack.pushPacket(12, 9000, true, fuEnd.data(), int(fuEnd.size()), 102, out, pli);
+    check(okIdr && out.is_keyframe && !depack.needKeyframe() &&
+          fc::VideoDepacketizer::hasHevcIdr(out.annexb.data(), out.annexb.size()),
+          "HEVC RFC 7798 AP + FU IDR_W_RADL reassembled cleanly with start codes & keyframe lock");
+}
 } // namespace
 
 int main() {
@@ -374,6 +401,7 @@ int main() {
     testVoiceJitterBufferWrapAndPlc();
     testVideoDepacketizerReorderAndLoss();
     testVideoDepacketizerOverflowAndRfc6184Guards();
+    testVideoDepacketizerHevcRfc7798();
     testAeadRtpPaddingAndEncryptedRtcpPli();
     testOutboundGoLiveDaveInit();
     testGoLiveSystemAudioOpus128k();

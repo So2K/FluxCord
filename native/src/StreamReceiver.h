@@ -22,6 +22,7 @@ public:
 
     bool connectAndDiscover(const char* ip, uint16_t port, uint32_t ssrc, HWND hwnd, std::string& out_ext_ip, uint16_t& out_ext_port);
     void setKey(const uint8_t key[32], bool use_xchacha_rtpsize);
+    void setCodec(int32_t codec, int32_t video_pt);
     void setRemoteStreams(uint32_t video_ssrc, uint32_t audio_ssrc, const char* streamer_user_id);
     void setVolume(float vol);
     void resize(int32_t w, int32_t h);
@@ -68,6 +69,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> video_ssrc_{0};
     std::atomic<uint32_t> audio_ssrc_{0};
+    std::atomic<int32_t> video_codec_{FC_CODEC_H264};
+    std::atomic<int32_t> video_pt_{101};
     std::atomic<bool> reset_depack_{false};
     std::atomic<float> stream_vol_{1.0f};
     std::atomic<int32_t> pending_w_{0};

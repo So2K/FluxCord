@@ -319,6 +319,7 @@ check(ok_p == 1 and kp_p > 100, f"Outbound Go Live Publisher DAVE E2EE MLS KeyPa
 
 slot_kps = []
 for slot in range(4):
+    dll.fc_watch_set_codec_slot(slot, 1 if (slot % 2) else 0, 103 if (slot % 2) else 101)
     ok_s = dll.fc_watch_dave_init_slot(slot, ctypes.c_uint16(1), ctypes.c_uint64(223456789012345678 + slot), b"987654321012345678", ctypes.c_uint32(22220 + slot))
     dll.fc_watch_dave_add_user_slot(slot, b"111222333444555666")
     dll.fc_watch_dave_remove_user_slot(slot, b"111222333444555666")

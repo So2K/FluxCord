@@ -31,6 +31,7 @@ public sealed class WatchSession
     internal readonly Dictionary<int, ushort> DaveTransitions = new();
     internal long ConnectedTick;
     internal long LastKickTick;
+    internal long LastRewatchTick;
     internal long LastDecodedFrames;
     internal long LastDecodedTick;
     internal long LastDiagLogTick;
@@ -221,6 +222,12 @@ public sealed class DiscordClient
                 if (kfDrops >= 0) ws.LastKfDrops = kfDrops;
                 _ = KickStreamKeyframeAsync(ws);
             }
+            // Deep DAVE/SFU auto-heal: if still 0 decoded frames after 6s, re-announce OP 26 KeyPackage + OP 20 STREAM_WATCH!
+            if (st.FramesEncoded == 0 && ws.ConnectedTick > 0 && (now - ws.ConnectedTick >= 6000) && (now - ws.LastRewatchTick >= 8000))
+            {
+                ws.LastRewatchTick = now;
+                _ = RewatchStalledStreamAsync(ws);
+            }
         }
 
         if (IsPublishingStream && now - _lastPubStatsTick >= 2000)
@@ -251,6 +258,25 @@ public sealed class DiscordClient
             await Task.Delay(120);
             if (session.Gw?.State == WebSocketState.Open)
                 await SendWsTextAsync(session.Gw, onMsg, CancellationToken.None);
+        }
+        catch { }
+    }
+
+    private async Task RewatchStalledStreamAsync(WatchSession ws)
+    {
+        try
+        {
+            SettingsStore.Log($"WatchGW[{ws.Slot}] 0-frame stall auto-heal -> refreshing DAVE KeyPackage + OP 20 STREAM_WATCH ({ws.StreamKey})");
+            if (ws.DaveVer > 0 && ws.Gw?.State == WebSocketState.Open)
+            {
+                ulong ch64 = ulong.TryParse(ws.RtcChannelId, out var c64) ? c64 : (ulong.TryParse(_voiceChannelId, out var c2) ? c2 : 0);
+                MediaNative.fc_watch_dave_init_slot(ws.Slot, ws.DaveVer, ch64, Me.Id, ws.LocalSsrc);
+                SeedWatchDaveUsers(ws);
+                var kp = GetWatchDaveKeyPackage(ws.Slot);
+                if (kp.Length > 0) await SendWsBinaryAsync(ws.Gw, 26, kp, CancellationToken.None);
+            }
+            if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(ws.StreamKey))
+                await SendWsTextAsync(_gw, $"{{\"op\":20,\"d\":{{\"stream_key\":\"{ws.StreamKey}\"}}}}", CancellationToken.None);
         }
         catch { }
     }
@@ -308,6 +334,9 @@ public sealed class DiscordClient
 
     public bool IsConnected { get; private set; }
     public bool IsConnecting { get; private set; }
+    public bool HasActiveSession { get; private set; }
+    public bool IsReconnecting { get; private set; }
+    public bool HasToken => !string.IsNullOrEmpty(_token);
     public bool IsDemoMode { get; private set; }
     public string StatusText { get; private set; } = "Отключён";
     public int GatewayPingMs { get; private set; }
@@ -376,7 +405,9 @@ public sealed class DiscordClient
         Disconnect();
         IsDemoMode = true;
         IsConnecting = false;
+        IsReconnecting = false;
         IsConnected = true;
+        HasActiveSession = true;
         StatusText = "Demo / Local Benchmark";
         GatewayPingMs = 8;
         Me = new DiscordUser { Id = "1001", Username = "flux_user", DisplayName = "Flux User (RTX 4070 Ti)", Status = "online" };
@@ -516,6 +547,7 @@ public sealed class DiscordClient
 
                 try
                 {
+                    gw.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
                     gw.Options.SetRequestHeader("Origin", "https://discord.com");
                     gw.Options.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
@@ -540,6 +572,8 @@ public sealed class DiscordClient
                                 if (code is 4004 or 4010 or 4011 or 4012 or 4013 or 4014)
                                 {
                                     IsConnecting = false;
+                                    IsReconnecting = false;
+                                    HasActiveSession = false;
                                     if (code == 4004)
                                     {
                                         SettingsStore.SetToken("");
@@ -553,10 +587,12 @@ public sealed class DiscordClient
                                     _sessionId = "";
                                     _lastSeq = null;
                                     _resumeGatewayUrl = "";
+                                    if (HasActiveSession) IsReconnecting = true; else IsConnecting = true;
                                     StatusText = "Переподключение к Discord...";
                                 }
                                 else
                                 {
+                                    if (HasActiveSession) IsReconnecting = true; else IsConnecting = true;
                                     StatusText = "Восстановление связи с Discord...";
                                 }
                                 Notify();
@@ -582,6 +618,7 @@ public sealed class DiscordClient
                     if (!ct.IsCancellationRequested)
                     {
                         IsConnected = false;
+                        if (HasActiveSession) IsReconnecting = true; else IsConnecting = true;
                         StatusText = "Переподключение: " + ex.Message;
                         SettingsStore.Log("GW error: " + ex.Message);
                         Notify();
@@ -615,6 +652,8 @@ public sealed class DiscordClient
         _resumeGatewayUrl = "";
         IsConnected = false;
         IsConnecting = false;
+        IsReconnecting = false;
+        HasActiveSession = false;
         IsDemoMode = false;
     }
 
@@ -637,6 +676,7 @@ public sealed class DiscordClient
             case 7: // RECONNECT
                 SettingsStore.Log("GW OP 7 RECONNECT -> resuming");
                 IsConnected = false;
+                if (HasActiveSession) IsReconnecting = true; else IsConnecting = true;
                 StatusText = "Переподключение к Discord...";
                 Notify();
                 connCts.Cancel();
@@ -652,6 +692,7 @@ public sealed class DiscordClient
                     _resumeGatewayUrl = "";
                 }
                 IsConnected = false;
+                if (HasActiveSession) IsReconnecting = true; else IsConnecting = true;
                 StatusText = "Обновление сессии Discord...";
                 Notify();
                 connCts.Cancel();
@@ -680,6 +721,8 @@ public sealed class DiscordClient
                 {
                     IsConnected = true;
                     IsConnecting = false;
+                    IsReconnecting = false;
+                    HasActiveSession = true;
                     int gCnt; lock (Guilds) gCnt = Guilds.Count;
                     StatusText = $"Подключён: {Me.DisplayName} ({gCnt} серверов)";
                     SettingsStore.Log("GW RESUMED cleanly");
@@ -1336,6 +1379,8 @@ public sealed class DiscordClient
 
         IsConnected = true;
         IsConnecting = false;
+        IsReconnecting = false;
+        HasActiveSession = true;
         StatusText = $"Подключён: {Me.DisplayName} ({parsedGuilds.Count} серверов)";
 
         // Restore last visited server & channel if valid, else fall back to first guild text channel
@@ -3466,249 +3511,305 @@ public sealed class DiscordClient
 
         _ = Task.Run(async () =>
         {
-            using var gw = new ClientWebSocket();
-            _voiceGw = gw;
-            bool hbAcked = true;
-            try
+            int attempt = 0;
+            bool tryResumeNext = false;
+            while (!ct.IsCancellationRequested && attempt < 10 && !string.IsNullOrEmpty(_voiceChannelId) && !string.IsNullOrEmpty(_voiceToken))
             {
-                await gw.ConnectAsync(new Uri($"wss://{_voiceEndpoint}/?v=8"), ct);
-                // Discord RTC spec: Guild Voice uses server_id = guild_id; DM / Group DM Call uses server_id = channel_id!
-                string rtcServerId = (string.IsNullOrEmpty(_voiceGuildId) || _voiceGuildId == "@me") ? _voiceChannelId : _voiceGuildId;
-                string identify = $"{{\"op\":0,\"d\":{{\"server_id\":\"{rtcServerId}\",\"user_id\":\"{Me.Id}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{_voiceToken}\",\"max_dave_protocol_version\":1}}}}";
-                await SendWsTextAsync(gw, identify, ct);
-                SettingsStore.Log($"VoiceGW connecting to {_voiceEndpoint} (DAVE v1)");
-
-                var buf = new byte[65536];
-                using var ms = new MemoryStream();
-                while (!ct.IsCancellationRequested && gw.State == WebSocketState.Open)
+                attempt++;
+                using var gw = new ClientWebSocket();
+                gw.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+                _voiceGw = gw;
+                bool hbAcked = true;
+                bool fatalTokenInvalid = false;
+                try
                 {
-                    ms.SetLength(0);
-                    WebSocketReceiveResult res;
-                    do
+                    await gw.ConnectAsync(new Uri($"wss://{_voiceEndpoint}/?v=8"), ct);
+                    string rtcServerId = (string.IsNullOrEmpty(_voiceGuildId) || _voiceGuildId == "@me") ? _voiceChannelId : _voiceGuildId;
+                    if (tryResumeNext && _voiceSeq >= 0)
                     {
-                        res = await gw.ReceiveAsync(buf, ct);
-                        if (res.MessageType == WebSocketMessageType.Close)
-                        {
-                            int code = (int?)res.CloseStatus ?? 0;
-                            SettingsStore.Log($"VoiceGW closed: {code} {res.CloseStatusDescription}");
-                            if (ReferenceEquals(_voiceGw, gw))
-                            {
-                                VoiceStatus = $"Голос отключён ({code})";
-                                VoiceConnected = false;
-                                _voiceGwStarted = false;
-                                if (code is 4006 or 4014) { _voiceToken = ""; _voiceSessionId = ""; }
-                                Notify();
-                                if (!ct.IsCancellationRequested && code is 1006 or 4015 && !string.IsNullOrEmpty(_voiceChannelId) && !string.IsNullOrEmpty(_voiceToken))
-                                {
-                                    await Task.Delay(1500, ct);
-                                    TryStartVoiceGateway();
-                                }
-                            }
-                            return;
-                        }
-                        ms.Write(buf, 0, res.Count);
-                    } while (!res.EndOfMessage);
-
-                    if (res.MessageType == WebSocketMessageType.Binary)
+                        tryResumeNext = false;
+                        string resume = $"{{\"op\":7,\"d\":{{\"server_id\":\"{rtcServerId}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{_voiceToken}\",\"seq_ack\":{_voiceSeq}}}}}";
+                        await SendWsTextAsync(gw, resume, ct);
+                        SettingsStore.Log($"VoiceGW resuming {_voiceEndpoint} seq_ack={_voiceSeq} attempt={attempt}");
+                    }
+                    else
                     {
-                        await HandleVoiceBinaryAsync(gw, ms.GetBuffer(), (int)ms.Length, ct);
-                        continue;
+                        tryResumeNext = false;
+                        _voiceSeq = -1;
+                        string identify = $"{{\"op\":0,\"d\":{{\"server_id\":\"{rtcServerId}\",\"user_id\":\"{Me.Id}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{_voiceToken}\",\"max_dave_protocol_version\":1}}}}";
+                        await SendWsTextAsync(gw, identify, ct);
+                        SettingsStore.Log($"VoiceGW connecting to {_voiceEndpoint} (DAVE v1) attempt={attempt}");
                     }
 
-                    using var doc = JsonDocument.Parse(ms.GetBuffer().AsMemory(0, (int)ms.Length));
-                    var root = doc.RootElement;
-                    if (root.TryGetProperty("seq", out var seqEl) && seqEl.ValueKind == JsonValueKind.Number) _voiceSeq = seqEl.GetInt32();
-                    int op = root.GetProperty("op").GetInt32();
-                    var data = root.TryGetProperty("d", out var dEl) ? dEl : default;
-
-                    if (op == 8)
+                    var buf = new byte[65536];
+                    using var ms = new MemoryStream();
+                    while (!ct.IsCancellationRequested && gw.State == WebSocketState.Open)
                     {
-                        int hb = Math.Clamp((int)data.GetProperty("heartbeat_interval").GetDouble(), 2000, 60000);
-                        _ = Task.Run(async () =>
+                        ms.SetLength(0);
+                        WebSocketReceiveResult res;
+                        bool closedNow = false;
+                        do
                         {
-                            try
+                            res = await gw.ReceiveAsync(buf, ct);
+                            if (res.MessageType == WebSocketMessageType.Close)
                             {
-                                while (!ct.IsCancellationRequested && gw.State == WebSocketState.Open)
+                                int code = (int?)res.CloseStatus ?? 0;
+                                SettingsStore.Log($"VoiceGW closed: {code} {res.CloseStatusDescription}");
+                                if (code is 4004 or 4006 or 4009 or 4014)
                                 {
-                                    if (!hbAcked)
+                                    fatalTokenInvalid = true;
+                                }
+                                else if (VoiceConnected && _voiceSeq >= 0)
+                                {
+                                    tryResumeNext = true;
+                                }
+                                closedNow = true;
+                                break;
+                            }
+                            ms.Write(buf, 0, res.Count);
+                        } while (!res.EndOfMessage);
+                        if (closedNow) break;
+
+                        if (res.MessageType == WebSocketMessageType.Binary)
+                        {
+                            await HandleVoiceBinaryAsync(gw, ms.GetBuffer(), (int)ms.Length, ct);
+                            continue;
+                        }
+
+                        using var doc = JsonDocument.Parse(ms.GetBuffer().AsMemory(0, (int)ms.Length));
+                        var root = doc.RootElement;
+                        if (root.TryGetProperty("seq", out var seqEl) && seqEl.ValueKind == JsonValueKind.Number) _voiceSeq = seqEl.GetInt32();
+                        int op = root.GetProperty("op").GetInt32();
+                        var data = root.TryGetProperty("d", out var dEl) ? dEl : default;
+
+                        if (op == 8)
+                        {
+                            int hb = Math.Clamp((int)data.GetProperty("heartbeat_interval").GetDouble(), 2000, 60000);
+                            var hbGw = gw;
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    while (!ct.IsCancellationRequested && hbGw.State == WebSocketState.Open)
                                     {
-                                        SettingsStore.Log("VoiceGW heartbeat ACK missed -> aborting zombie socket");
-                                        gw.Abort();
-                                        return;
+                                        if (!hbAcked)
+                                        {
+                                            SettingsStore.Log("VoiceGW heartbeat ACK missed -> aborting zombie socket");
+                                            hbGw.Abort();
+                                            return;
+                                        }
+                                        hbAcked = false;
+                                        _lastVoiceHbSent = Environment.TickCount64;
+                                        await SendWsTextAsync(hbGw, $"{{\"op\":3,\"d\":{{\"t\":{_lastVoiceHbSent},\"seq_ack\":{_voiceSeq}}}}}", ct);
+                                        await Task.Delay(hb, ct);
                                     }
-                                    hbAcked = false;
-                                    _lastVoiceHbSent = Environment.TickCount64;
-                                    await SendWsTextAsync(gw, $"{{\"op\":3,\"d\":{{\"t\":{_lastVoiceHbSent},\"seq_ack\":{_voiceSeq}}}}}", ct);
-                                    await Task.Delay(hb, ct);
                                 }
-                            }
-                            catch { }
-                        }, ct);
-                    }
-                    else if (op == 6) // HEARTBEAT_ACK -> exact live Voice RTT for Discord Connection Graph!
-                    {
-                        hbAcked = true;
-                        if (_lastVoiceHbSent > 0)
-                        {
-                            int prev = VoicePingMs;
-                            int rtt = (int)(Environment.TickCount64 - _lastVoiceHbSent);
-                            RecordVoicePing(rtt);
-                            if (prev == 0 || Math.Abs(VoicePingMs - prev) >= 3) Notify();
+                                catch { }
+                            }, ct);
                         }
-                    }
-                    else if (op == 2)
-                    {
-                        _voiceSsrc = data.GetProperty("ssrc").GetUInt32();
-                        string ip = data.GetProperty("ip").GetString() ?? "";
-                        ushort port = (ushort)data.GetProperty("port").GetInt32();
-                        string chosenMode = SelectSupportedVoiceCipher(data);
-
-                        if (DiscoverUdpEndpoint(ip, port, _voiceSsrc, out string extIp, out ushort extPort) &&
-                            System.Net.IPAddress.TryParse(extIp, out _))
+                        else if (op == 9) // Voice GW RESUMED!
                         {
-                            SettingsStore.Log($"Voice UDP discovered: {extIp}:{extPort} -> {ip}:{port} mode={chosenMode}");
-                            string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"{chosenMode}\"}}}}}}";
-                            await SendWsTextAsync(gw, sel, ct);
-                        }
-                        else
-                        {
-                            SettingsStore.Log($"Voice UDP discovery FAILED for {ip}:{port} ssrc={_voiceSsrc}");
-                            VoiceStatus = "Ошибка UDP-обнаружения (проверьте сеть/VPN)";
+                            attempt = 0;
+                            VoiceConnected = true;
+                            VoiceStatus = "Голосовая связь подключена";
+                            SettingsStore.Log("VoiceGW RESUMED cleanly (zero audio drop)");
                             Notify();
                         }
-                    }
-                    else if (op == 4)
-                    {
-                        var keyArr = data.GetProperty("secret_key");
-                        byte[] key = new byte[32];
-                        int i = 0;
-                        foreach (var el in keyArr.EnumerateArray()) if (i < 32) key[i++] = (byte)el.GetInt32();
-                        string mode = data.TryGetProperty("mode", out var m) ? m.GetString() ?? "" : "";
-                        bool useXchacha = mode.Contains("xchacha", StringComparison.OrdinalIgnoreCase);
-                        ushort daveVer = data.TryGetProperty("dave_protocol_version", out var dv) ? (ushort)dv.GetInt32() : (ushort)0;
-                        _davePendingVersion = daveVer;
-
-                        SetTransportKey(key, useXchacha);
-                        ulong chIdU64 = ulong.TryParse(_voiceChannelId, out var c64) ? c64 : 0;
-                        MediaNative.fc_dave_init(daveVer, chIdU64, Me.Id, _voiceSsrc);
-                        SeedVoiceDaveUsers();
-
-                        if (daveVer > 0)
+                        else if (op == 6) // HEARTBEAT_ACK -> exact live Voice RTT for Discord Connection Graph!
                         {
-                            var kp = GetDaveKeyPackage();
-                            if (kp.Length > 0) await SendWsBinaryAsync(gw, 26, kp, ct);
-                        }
-
-                        _lastSentVoiceSpeaking = false;
-                        MediaNative.fc_transport_send_silence();
-
-                        bool wasVoice = VoiceConnected;
-                        VoiceConnected = true;
-                        VoiceStatus = "Голосовая связь подключена";
-                        VoiceEndpointHost = _voiceEndpoint.Split(':')[0].Replace(".discord.media", "");
-                        int udpPing = MediaNative.fc_transport_get_ping_ms();
-                        if (udpPing > 0) RecordVoicePing(udpPing);
-                        if (!wasVoice) SoundFx.Play(UiSound.VoiceJoin);
-                        SettingsStore.Log($"Voice connected! host={VoiceEndpointHost} dave_ver={daveVer} ping={udpPing}ms");
-
-                        // If user started local screen capture BEFORE joining voice, auto-publish Go Live now!
-                        if (Shell.IsLocalStreaming && string.IsNullOrEmpty(_pubStreamKey))
-                        {
-                            _ = StartPublishingGoLiveAsync(_pubWidth, _pubHeight, _pubFps, _pubIsDualScreen);
-                        }
-                        Notify();
-                    }
-                    else if (op == 5)
-                    {
-                        if (data.TryGetProperty("ssrc", out var se) && data.TryGetProperty("user_id", out var ue))
-                        {
-                            string uid = ue.GetString() ?? "";
-                            uint rSsrc = se.GetUInt32();
-                            bool isSpk = data.TryGetProperty("speaking", out var spkEl) &&
-                                         ((spkEl.ValueKind == JsonValueKind.Number && spkEl.GetInt32() != 0) || spkEl.ValueKind == JsonValueKind.True);
-                            if (!string.IsNullOrEmpty(uid))
+                            hbAcked = true;
+                            if (_lastVoiceHbSent > 0)
                             {
-                                _userToSsrc[uid] = rSsrc;
-                                MediaNative.fc_dave_add_user(uid);
-                                MediaNative.fc_dave_map_ssrc(rSsrc, uid);
-                                if (_userVolumes.TryGetValue(uid, out var uv))
-                                    MediaNative.fc_voice_set_user_volume(rSsrc, uv);
-                                DiscordGuild? g;
-                                lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
-                                if (g != null)
+                                int prev = VoicePingMs;
+                                int rtt = (int)(Environment.TickCount64 - _lastVoiceHbSent);
+                                RecordVoicePing(rtt);
+                                if (prev == 0 || Math.Abs(VoicePingMs - prev) >= 3) Notify();
+                            }
+                        }
+                        else if (op == 2)
+                        {
+                            _voiceSsrc = data.GetProperty("ssrc").GetUInt32();
+                            string ip = data.GetProperty("ip").GetString() ?? "";
+                            ushort port = (ushort)data.GetProperty("port").GetInt32();
+                            string chosenMode = SelectSupportedVoiceCipher(data);
+
+                            if (DiscoverUdpEndpoint(ip, port, _voiceSsrc, out string extIp, out ushort extPort) &&
+                                System.Net.IPAddress.TryParse(extIp, out _))
+                            {
+                                SettingsStore.Log($"Voice UDP discovered: {extIp}:{extPort} -> {ip}:{port} mode={chosenMode}");
+                                string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"{chosenMode}\"}}}}}}";
+                                await SendWsTextAsync(gw, sel, ct);
+                            }
+                            else
+                            {
+                                SettingsStore.Log($"Voice UDP discovery FAILED for {ip}:{port} ssrc={_voiceSsrc}");
+                                VoiceStatus = "Ошибка UDP-обнаружения (проверьте сеть/VPN)";
+                                Notify();
+                            }
+                        }
+                        else if (op == 4)
+                        {
+                            attempt = 0;
+                            var keyArr = data.GetProperty("secret_key");
+                            byte[] key = new byte[32];
+                            int i = 0;
+                            foreach (var el in keyArr.EnumerateArray()) if (i < 32) key[i++] = (byte)el.GetInt32();
+                            string mode = data.TryGetProperty("mode", out var m) ? m.GetString() ?? "" : "";
+                            bool useXchacha = mode.Contains("xchacha", StringComparison.OrdinalIgnoreCase);
+                            ushort daveVer = data.TryGetProperty("dave_protocol_version", out var dv) ? (ushort)dv.GetInt32() : (ushort)0;
+                            _davePendingVersion = daveVer;
+
+                            SetTransportKey(key, useXchacha);
+                            ulong chIdU64 = ulong.TryParse(_voiceChannelId, out var c64) ? c64 : 0;
+                            MediaNative.fc_dave_init(daveVer, chIdU64, Me.Id, _voiceSsrc);
+                            SeedVoiceDaveUsers();
+
+                            if (daveVer > 0)
+                            {
+                                var kp = GetDaveKeyPackage();
+                                if (kp.Length > 0) await SendWsBinaryAsync(gw, 26, kp, ct);
+                            }
+
+                            _lastSentVoiceSpeaking = false;
+                            MediaNative.fc_transport_send_silence();
+
+                            bool wasVoice = VoiceConnected;
+                            VoiceConnected = true;
+                            VoiceStatus = "Голосовая связь подключена";
+                            VoiceEndpointHost = _voiceEndpoint.Split(':')[0].Replace(".discord.media", "");
+                            int udpPing = MediaNative.fc_transport_get_ping_ms();
+                            if (udpPing > 0) RecordVoicePing(udpPing);
+                            if (!wasVoice) SoundFx.Play(UiSound.VoiceJoin);
+                            SettingsStore.Log($"Voice connected! host={VoiceEndpointHost} dave_ver={daveVer} ping={udpPing}ms");
+
+                            if (Shell.IsLocalStreaming && string.IsNullOrEmpty(_pubStreamKey))
+                            {
+                                _ = StartPublishingGoLiveAsync(_pubWidth, _pubHeight, _pubFps, _pubIsDualScreen);
+                            }
+                            Notify();
+                        }
+                        else if (op == 5)
+                        {
+                            if (data.TryGetProperty("ssrc", out var se) && data.TryGetProperty("user_id", out var ue))
+                            {
+                                string uid = ue.GetString() ?? "";
+                                uint rSsrc = se.GetUInt32();
+                                bool isSpk = data.TryGetProperty("speaking", out var spkEl) &&
+                                             ((spkEl.ValueKind == JsonValueKind.Number && spkEl.GetInt32() != 0) || spkEl.ValueKind == JsonValueKind.True);
+                                if (!string.IsNullOrEmpty(uid))
                                 {
-                                    lock (g.VoiceStates)
+                                    _userToSsrc[uid] = rSsrc;
+                                    MediaNative.fc_dave_add_user(uid);
+                                    MediaNative.fc_dave_map_ssrc(rSsrc, uid);
+                                    if (_userVolumes.TryGetValue(uid, out var uv))
+                                        MediaNative.fc_voice_set_user_volume(rSsrc, uv);
+                                    DiscordGuild? g;
+                                    lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
+                                    if (g != null)
                                     {
-                                        if (g.VoiceStates.TryGetValue(uid, out var vm))
+                                        lock (g.VoiceStates)
                                         {
-                                            vm.Speaking = isSpk;
-                                            vm.SpeakingUntil = isSpk ? Environment.TickCount64 + 650 : 0;
+                                            if (g.VoiceStates.TryGetValue(uid, out var vm))
+                                            {
+                                                vm.Speaking = isSpk;
+                                                vm.SpeakingUntil = isSpk ? Environment.TickCount64 + 650 : 0;
+                                            }
                                         }
+                                        Notify();
                                     }
-                                    Notify();
                                 }
                             }
                         }
-                    }
-                    else if (op == 11 && data.TryGetProperty("user_ids", out var uids) && uids.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var u in uids.EnumerateArray())
-                            if (u.ValueKind == JsonValueKind.String) MediaNative.fc_dave_add_user(u.GetString()!);
-                    }
-                    else if (op == 13 && data.TryGetProperty("user_id", out var du) && du.ValueKind == JsonValueKind.String)
-                    {
-                        string remUid = du.GetString()!;
-                        _userToSsrc.TryRemove(remUid, out _);
-                        MediaNative.fc_dave_remove_user(remUid);
-                    }
-                    else if (op == 21)
-                    {
-                        ushort pv = data.TryGetProperty("protocol_version", out var pvEl) ? (ushort)pvEl.GetInt32() : (ushort)1;
-                        int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
-                        _davePendingVersion = pv;
-                        if (tid == 0) MediaNative.fc_dave_execute_transition(pv);
-                        else
+                        else if (op == 11 && data.TryGetProperty("user_ids", out var uids) && uids.ValueKind == JsonValueKind.Array)
                         {
-                            _voiceDaveTransitions[tid] = pv;
-                            await SendWsTextAsync(gw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                            foreach (var u in uids.EnumerateArray())
+                                if (u.ValueKind == JsonValueKind.String) MediaNative.fc_dave_add_user(u.GetString()!);
                         }
-                    }
-                    else if (op == 22)
-                    {
-                        int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
-                        ushort ver = _voiceDaveTransitions.Remove(tid, out var v) ? v : _davePendingVersion;
-                        MediaNative.fc_dave_execute_transition(ver);
-                    }
-                    else if (op == 24)
-                    {
-                        ushort pv = data.TryGetProperty("protocol_version", out var pve) ? (ushort)pve.GetInt32() : (ushort)1;
-                        int epoch = data.TryGetProperty("epoch", out var ep) ? ep.GetInt32() : 0;
-                        _davePendingVersion = pv;
-                        if (epoch == 1)
+                        else if (op == 13 && data.TryGetProperty("user_id", out var du) && du.ValueKind == JsonValueKind.String)
                         {
-                            ulong chIdU64 = ulong.TryParse(_voiceChannelId, out var c64) ? c64 : 0;
-                            MediaNative.fc_dave_init(pv, chIdU64, Me.Id, _voiceSsrc);
-                            SeedVoiceDaveUsers();
-                            var kp = GetDaveKeyPackage();
-                            if (kp.Length > 0) await SendWsBinaryAsync(gw, 26, kp, ct);
+                            string remUid = du.GetString()!;
+                            _userToSsrc.TryRemove(remUid, out _);
+                            MediaNative.fc_dave_remove_user(remUid);
+                        }
+                        else if (op == 21)
+                        {
+                            ushort pv = data.TryGetProperty("protocol_version", out var pvEl) ? (ushort)pvEl.GetInt32() : (ushort)1;
+                            int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
+                            _davePendingVersion = pv;
+                            if (tid == 0) MediaNative.fc_dave_execute_transition(pv);
+                            else
+                            {
+                                _voiceDaveTransitions[tid] = pv;
+                                await SendWsTextAsync(gw, $"{{\"op\":23,\"d\":{{\"transition_id\":{tid}}}}}", ct);
+                            }
+                        }
+                        else if (op == 22)
+                        {
+                            int tid = data.TryGetProperty("transition_id", out var tEl) ? tEl.GetInt32() : 0;
+                            ushort ver = _voiceDaveTransitions.Remove(tid, out var v) ? v : _davePendingVersion;
+                            MediaNative.fc_dave_execute_transition(ver);
+                        }
+                        else if (op == 24)
+                        {
+                            ushort pv = data.TryGetProperty("protocol_version", out var pve) ? (ushort)pve.GetInt32() : (ushort)1;
+                            int epoch = data.TryGetProperty("epoch", out var ep) ? ep.GetInt32() : 0;
+                            _davePendingVersion = pv;
+                            if (epoch == 1)
+                            {
+                                ulong chIdU64 = ulong.TryParse(_voiceChannelId, out var c64) ? c64 : 0;
+                                MediaNative.fc_dave_init(pv, chIdU64, Me.Id, _voiceSsrc);
+                                SeedVoiceDaveUsers();
+                                var kp = GetDaveKeyPackage();
+                                if (kp.Length > 0) await SendWsBinaryAsync(gw, 26, kp, ct);
+                            }
                         }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                if (!ct.IsCancellationRequested && ReferenceEquals(_voiceGw, gw))
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    VoiceConnected = false;
-                    VoiceStatus = "Ошибка голоса: " + ex.Message;
-                    _voiceGwStarted = false;
-                    SettingsStore.Log("VoiceGW error: " + ex.Message);
-                    Notify();
+                    break;
                 }
+                catch (Exception ex)
+                {
+                    if (!ct.IsCancellationRequested)
+                    {
+                        if (VoiceConnected && _voiceSeq >= 0) tryResumeNext = true;
+                        VoiceStatus = "Восстановление голоса...";
+                        SettingsStore.Log($"VoiceGW error (attempt={attempt}): " + ex.Message);
+                        Notify();
+                    }
+                }
+                finally
+                {
+                    if (ReferenceEquals(_voiceGw, gw)) _voiceGw = null;
+                }
+
+                if (ct.IsCancellationRequested || string.IsNullOrEmpty(_voiceChannelId)) break;
+                if (fatalTokenInvalid)
+                {
+                    _voiceToken = "";
+                    _voiceGwStarted = false;
+                    VoiceStatus = "Обновление голосового токена...";
+                    Notify();
+                    if (_gw?.State == WebSocketState.Open)
+                    {
+                        string gJson = (string.IsNullOrEmpty(_voiceGuildId) || _voiceGuildId == "@me") ? "null" : $"\"{_voiceGuildId}\"";
+                        string sm = Shell.IsMuted ? "true" : "false";
+                        string sd = Shell.IsDeafened ? "true" : "false";
+                        await SendWsTextAsync(_gw, $"{{\"op\":4,\"d\":{{\"guild_id\":{gJson},\"channel_id\":\"{_voiceChannelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}", CancellationToken.None);
+                    }
+                    return;
+                }
+
+                try { await Task.Delay(Math.Min(800 * attempt, 4000), ct); }
+                catch { break; }
             }
-            finally
+
+            if (!ct.IsCancellationRequested)
             {
-                if (ReferenceEquals(_voiceGw, gw)) _voiceGw = null;
+                _voiceGwStarted = false;
+                VoiceConnected = false;
+                Notify();
             }
         }, ct);
     }
@@ -4030,7 +4131,7 @@ public sealed class DiscordClient
         _ = Task.Run(async () =>
         {
             int attempt = 0;
-            while (!ct.IsCancellationRequested && attempt < 3)
+            while (!ct.IsCancellationRequested && attempt < 8)
             {
                 attempt++;
                 bool hbAcked = true;
@@ -4038,6 +4139,7 @@ public sealed class DiscordClient
                 {
                     try { ws.Gw?.Dispose(); } catch { }
                     ws.Gw = new ClientWebSocket();
+                    ws.Gw.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
                     await ws.Gw.ConnectAsync(new Uri($"wss://{ws.Endpoint}/?v=8"), ct);
                     string identify = $"{{\"op\":0,\"d\":{{\"server_id\":\"{ws.RtcServerId}\",\"user_id\":\"{Me.Id}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{ws.Token}\",\"video\":true,\"streams\":[{{\"type\":\"screen\",\"rid\":\"100\",\"quality\":100}}],\"max_dave_protocol_version\":1}}}}";
                     await SendWsTextAsync(ws.Gw, identify, ct);
@@ -4058,7 +4160,13 @@ public sealed class DiscordClient
                             {
                                 int ccode = (int)(res.CloseStatus ?? 0);
                                 SettingsStore.Log($"WatchGW[{ws.Slot}] closed: {ccode} ({res.CloseStatus}) {res.CloseStatusDescription}");
-                                if (ccode is 4004 or 4006 or 4014) return;
+                                if (ccode is 4004 or 4006 or 4014)
+                                {
+                                    ws.GwStarted = false;
+                                    if (!ct.IsCancellationRequested && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(ws.StreamKey))
+                                        _ = SendWsTextAsync(_gw, $"{{\"op\":20,\"d\":{{\"stream_key\":\"{ws.StreamKey}\"}}}}", CancellationToken.None);
+                                    return;
+                                }
                                 retryLoop = true;
                                 break;
                             }
@@ -4111,7 +4219,7 @@ public sealed class DiscordClient
                             if (DiscoverWatchEndpoint(ws.Slot, ip, port, mySsrc, App.StreamHwnds[ws.Slot], out string extIp, out ushort extPort) &&
                                 System.Net.IPAddress.TryParse(extIp, out _))
                             {
-                                string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"{chosenMode}\"}},\"codecs\":[{{\"name\":\"opus\",\"type\":\"audio\",\"priority\":1000,\"payload_type\":120}},{{\"name\":\"H264\",\"type\":\"video\",\"priority\":1000,\"payload_type\":101,\"rtx_payload_type\":102}}]}}}}";
+                                string sel = $"{{\"op\":1,\"d\":{{\"protocol\":\"udp\",\"data\":{{\"address\":\"{extIp}\",\"port\":{extPort},\"mode\":\"{chosenMode}\"}},\"codecs\":[{{\"name\":\"opus\",\"type\":\"audio\",\"priority\":1000,\"payload_type\":120}},{{\"name\":\"H264\",\"type\":\"video\",\"priority\":1000,\"payload_type\":101,\"rtx_payload_type\":102}},{{\"name\":\"H265\",\"type\":\"video\",\"priority\":900,\"payload_type\":103,\"rtx_payload_type\":104}}]}}}}";
                                 await SendWsTextAsync(ws.Gw, sel, ct);
                             }
                             else
@@ -4123,6 +4231,7 @@ public sealed class DiscordClient
                         }
                         else if (op == 4)
                         {
+                            attempt = 0;
                             var keyArr = data.GetProperty("secret_key");
                             byte[] key = new byte[32];
                             int i = 0;
@@ -4130,8 +4239,11 @@ public sealed class DiscordClient
                             string mode = data.TryGetProperty("mode", out var m) ? m.GetString() ?? "" : "";
                             bool useX = mode.Contains("xchacha", StringComparison.OrdinalIgnoreCase);
                             ushort dv = data.TryGetProperty("dave_protocol_version", out var dve) ? (ushort)dve.GetInt32() : (ushort)0;
+                            string vCodec = data.TryGetProperty("video_codec", out var vce) && vce.ValueKind == JsonValueKind.String ? vce.GetString() ?? "H264" : "H264";
+                            bool isHevc = vCodec.Contains("265", StringComparison.OrdinalIgnoreCase) || vCodec.Contains("HEVC", StringComparison.OrdinalIgnoreCase);
                             ws.DaveVer = dv;
 
+                            MediaNative.fc_watch_set_codec_slot(ws.Slot, isHevc ? (int)VideoCodec.Hevc : (int)VideoCodec.H264, isHevc ? 103 : 101);
                             SetWatchKey(ws.Slot, key, useX);
                             ulong ch64 = ulong.TryParse(ws.RtcChannelId, out var c64) ? c64 : (ulong.TryParse(_voiceChannelId, out var c2) ? c2 : 0);
                             MediaNative.fc_watch_dave_init_slot(ws.Slot, dv, ch64, Me.Id, mySsrc);
@@ -4145,15 +4257,13 @@ public sealed class DiscordClient
                                 var kp = GetWatchDaveKeyPackage(ws.Slot);
                                 if (kp.Length > 0) await SendWsBinaryAsync(ws.Gw, 26, kp, ct);
                             }
-                            else
-                            {
-                                // No DAVE -> request full quality immediately
-                                await SendWsTextAsync(ws.Gw, "{\"op\":15,\"d\":{\"any\":100}}", ct);
-                            }
+                            // ALWAYS send OP 15 media_sink_wants immediately on OP 4 so Discord SFU activates stream forwarding & MLS Welcome!
+                            string initWants = ws.VideoSsrc != 0 ? $"{{\"op\":15,\"d\":{{\"{ws.VideoSsrc}\":100,\"any\":100}}}}" : "{\"op\":15,\"d\":{\"any\":100}}";
+                            await SendWsTextAsync(ws.Gw, initWants, ct);
 
                             ws.ConnectedTick = Environment.TickCount64;
                             ws.Status = $"Стрим {ws.StreamerName}";
-                            SettingsStore.Log($"WatchGW[{ws.Slot}] connected! dave_ver={dv} streamer={ws.StreamerUserId}");
+                            SettingsStore.Log($"WatchGW[{ws.Slot}] connected! dave_ver={dv} codec={vCodec} streamer={ws.StreamerUserId}");
                             Notify();
                         }
                         else if (op == 12)
@@ -4182,6 +4292,8 @@ public sealed class DiscordClient
                                 if (vssrc != 0) ws.VideoSsrc = vssrc;
                                 SettingsStore.Log($"WatchGW[{ws.Slot}] OP12 video_ssrc={vssrc} audio_ssrc={assrc} user={suid}");
                                 MediaNative.fc_watch_set_remote_slot(ws.Slot, vssrc, assrc, suid);
+                                if (vssrc != 0 && ws.Gw?.State == WebSocketState.Open)
+                                    await SendWsTextAsync(ws.Gw, $"{{\"op\":15,\"d\":{{\"{vssrc}\":100,\"any\":100}}}}", ct);
                             }
                         }
                         else if (op == 24)
@@ -4341,7 +4453,7 @@ public sealed class DiscordClient
         _ = Task.Run(async () =>
         {
             int attempt = 0;
-            while (!ct.IsCancellationRequested && attempt < 3)
+            while (!ct.IsCancellationRequested && attempt < 8)
             {
                 attempt++;
                 bool hbAcked = true;
@@ -4349,6 +4461,7 @@ public sealed class DiscordClient
                 {
                     try { _pubGw?.Dispose(); } catch { }
                     _pubGw = new ClientWebSocket();
+                    _pubGw.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
                     await _pubGw.ConnectAsync(new Uri($"wss://{_pubEndpoint}/?v=8"), ct);
                     string identify = $"{{\"op\":0,\"d\":{{\"server_id\":\"{_pubRtcServerId}\",\"user_id\":\"{Me.Id}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{_pubToken}\",\"video\":true,\"streams\":[{{\"type\":\"screen\",\"rid\":\"100\",\"quality\":100}}],\"max_dave_protocol_version\":1}}}}";
                     await SendWsTextAsync(_pubGw, identify, ct);
@@ -4438,6 +4551,7 @@ public sealed class DiscordClient
                         }
                         else if (op == 4)
                         {
+                            attempt = 0;
                             var keyArr = data.GetProperty("secret_key");
                             byte[] key = new byte[32];
                             int i = 0;

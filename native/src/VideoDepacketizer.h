@@ -20,6 +20,14 @@ public:
         bool is_keyframe = false;
     };
 
+    void setHevc(bool hevc) {
+        if (is_hevc_ != hevc) {
+            is_hevc_ = hevc;
+            reset();
+        }
+    }
+    bool isHevc() const { return is_hevc_; }
+
     void reset() {
         frames_.clear();
         empty_probe_seqs_.clear();
@@ -107,12 +115,14 @@ public:
                 }
             }
 
-            // Check that the first packet is NOT a mid-FU-A continuation (guards out-of-order initial IDR!)
+            // Check that the first packet is NOT a mid-FU continuation (guards out-of-order initial IDR!)
             bool startsClean = true;
             {
                 const auto& fp = fb.packets.begin()->second;
-                if (fp.size() >= 2 && (fp[0] & 0x1F) == 28 && (fp[1] & 0x80) == 0) {
-                    startsClean = false;
+                if (!is_hevc_) {
+                    if (fp.size() >= 2 && (fp[0] & 0x1F) == 28 && (fp[1] & 0x80) == 0) startsClean = false;
+                } else {
+                    if (fp.size() >= 3 && ((fp[0] >> 1) & 0x3F) == 49 && (fp[2] & 0x80) == 0) startsClean = false;
                 }
             }
 
@@ -130,14 +140,14 @@ public:
 
             // Fast-path: complete frame that is either contiguous with previous (when NOT awaiting keyframe) OR is a keyframe
             if (frameComplete && (contiguousWithPrev || need_keyframe_)) {
-                bool assembled = assembleAnnexB(fb, out.annexb);
+                bool assembled = is_hevc_ ? assembleAnnexBHevc(fb, out.annexb) : assembleAnnexB(fb, out.annexb);
                 out.timestamp = bestIt->first;
-                out.is_keyframe = assembled && hasIdrOrSps(out.annexb.data(), out.annexb.size());
+                out.is_keyframe = assembled && (is_hevc_ ? hasHevcKeyOrConfig(out.annexb.data(), out.annexb.size()) : hasIdrOrSps(out.annexb.data(), out.annexb.size()));
                 if ((!need_keyframe_ && contiguousWithPrev) || out.is_keyframe) {
                     advanceLastEmitted(maxSeq);
                     frames_.erase(bestIt);
                     if (assembled && !out.annexb.empty()) {
-                        if (hasIdr(out.annexb.data(), out.annexb.size())) need_keyframe_ = false;
+                        if (is_hevc_ ? hasHevcIdr(out.annexb.data(), out.annexb.size()) : hasIdr(out.annexb.data(), out.annexb.size())) need_keyframe_ = false;
                         frames_ok_++;
                         return true;
                     }
@@ -172,16 +182,16 @@ public:
             if (!timedOut) break;
 
             if (frameComplete) {
-                bool assembled = assembleAnnexB(fb, out.annexb);
+                bool assembled = is_hevc_ ? assembleAnnexBHevc(fb, out.annexb) : assembleAnnexB(fb, out.annexb);
                 out.timestamp = bestIt->first;
-                out.is_keyframe = assembled && hasIdrOrSps(out.annexb.data(), out.annexb.size());
+                out.is_keyframe = assembled && (is_hevc_ ? hasHevcKeyOrConfig(out.annexb.data(), out.annexb.size()) : hasIdrOrSps(out.annexb.data(), out.annexb.size()));
                 int64_t gap = (last_emitted_max_seq_ >= 0) ? (minSeq - last_emitted_max_seq_ - 1) : 0;
                 advanceLastEmitted(maxSeq);
                 frames_.erase(bestIt);
 
                 if (assembled && !out.annexb.empty()) {
                     if (out.is_keyframe) {
-                        if (hasIdr(out.annexb.data(), out.annexb.size())) need_keyframe_ = false;
+                        if (is_hevc_ ? hasHevcIdr(out.annexb.data(), out.annexb.size()) : hasIdr(out.annexb.data(), out.annexb.size())) need_keyframe_ = false;
                         frames_ok_++;
                         return true;
                     }
@@ -235,6 +245,34 @@ public:
                 if (sc > 0 && i + sc < len) {
                     uint8_t nt = data[i + sc] & 0x1F;
                     if (nt == 5 || nt == 7) return true;
+                    i += sc;
+                }
+            }
+        }
+        return false;
+    }
+
+    static bool hasHevcIdr(const uint8_t* data, size_t len) {
+        for (size_t i = 0; i + 4 < len; ++i) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                size_t sc = (data[i + 2] == 1) ? 3 : ((i + 5 <= len && data[i + 2] == 0 && data[i + 3] == 1) ? 4 : 0);
+                if (sc > 0 && i + sc < len) {
+                    uint8_t nt = (data[i + sc] >> 1) & 0x3F;
+                    if (nt >= 16 && nt <= 21) return true;
+                    i += sc;
+                }
+            }
+        }
+        return false;
+    }
+
+    static bool hasHevcKeyOrConfig(const uint8_t* data, size_t len) {
+        for (size_t i = 0; i + 4 < len; ++i) {
+            if (data[i] == 0 && data[i + 1] == 0) {
+                size_t sc = (data[i + 2] == 1) ? 3 : ((i + 5 <= len && data[i + 2] == 0 && data[i + 3] == 1) ? 4 : 0);
+                if (sc > 0 && i + sc < len) {
+                    uint8_t nt = (data[i + sc] >> 1) & 0x3F;
+                    if ((nt >= 16 && nt <= 21) || nt == 32 || nt == 33) return true;
                     i += sc;
                 }
             }
@@ -354,8 +392,69 @@ private:
         return !inFu && !out.empty();
     }
 
+    static bool assembleAnnexBHevc(const FrameBuf& fb, std::vector<uint8_t>& out) {
+        out.clear();
+        std::vector<uint8_t> fu;
+        bool inFu = false;
+
+        for (const auto& [seq, pkt] : fb.packets) {
+            if (pkt.size() < 2) return false;
+            const uint8_t* pay = pkt.data();
+            int payLen = int(pkt.size());
+            uint8_t nalType = (pay[0] >> 1) & 0x3F;
+
+            if (nalType <= 47) {
+                if (inFu) return false;
+                appendStartCode(out);
+                out.insert(out.end(), pay, pay + payLen);
+            } else if (nalType == 48) { // RFC 7798 AP
+                if (inFu || payLen <= 4) return false;
+                int off = 2;
+                while (off + 2 <= payLen) {
+                    uint16_t sz = uint16_t((uint16_t(pay[off]) << 8) | pay[off + 1]);
+                    off += 2;
+                    if (sz < 2 || off + sz > payLen) return false;
+                    appendStartCode(out);
+                    out.insert(out.end(), pay + off, pay + off + sz);
+                    off += sz;
+                }
+                if (off != payLen) return false;
+            } else if (nalType == 49) { // RFC 7798 FU
+                if (payLen <= 3) return false;
+                uint8_t fuHdr = pay[2];
+                uint8_t origType = fuHdr & 0x3F;
+                if (origType > 47) return false;
+                bool startBit = (fuHdr & 0x80) != 0;
+                bool endBit = (fuHdr & 0x40) != 0;
+                if (startBit && endBit) return false;
+                if (startBit) {
+                    if (inFu) return false;
+                    fu.clear();
+                    fu.push_back(uint8_t((pay[0] & 0x81) | (origType << 1)));
+                    fu.push_back(pay[1]);
+                    fu.insert(fu.end(), pay + 3, pay + payLen);
+                    inFu = true;
+                } else if (inFu) {
+                    fu.insert(fu.end(), pay + 3, pay + payLen);
+                } else {
+                    return false;
+                }
+                if (endBit && inFu) {
+                    appendStartCode(out);
+                    out.insert(out.end(), fu.begin(), fu.end());
+                    fu.clear();
+                    inFu = false;
+                }
+            } else {
+                return false;
+            }
+        }
+        return !inFu && !out.empty();
+    }
+
     std::map<uint32_t, FrameBuf> frames_;
     std::set<int64_t> empty_probe_seqs_;
+    bool is_hevc_ = false;
     bool has_seq_ = false;
     int64_t last_ext_seq_ = -1;
     int64_t last_emitted_max_seq_ = -1;

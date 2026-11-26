@@ -316,6 +316,12 @@ void StreamReceiver::setKey(const uint8_t key[32], bool use_xchacha_rtpsize) {
     has_key_.store(true);
 }
 
+void StreamReceiver::setCodec(int32_t codec, int32_t video_pt) {
+    int32_t prevC = video_codec_.exchange(codec);
+    if (video_pt > 0) video_pt_.store(video_pt);
+    if (prevC != codec) reset_depack_.store(true);
+}
+
 void StreamReceiver::resize(int32_t w, int32_t h) {
     if (w > 16 && h > 16) {
         pending_w_.store(w);
@@ -440,30 +446,87 @@ void StreamReceiver::rxDecodeLoop() {
     }
 
     ComPtr<IMFTransform> decMft;
-    if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&decMft)))) {
-        if (dxgiMgr) decMft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(dxgiMgr.Get()));
-        ComPtr<IMFAttributes> attrs;
-        if (SUCCEEDED(decMft->GetAttributes(&attrs))) attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
-
-        ComPtr<IMFMediaType> mtIn;
-        if (SUCCEEDED(MFCreateMediaType(&mtIn)) && mtIn) {
-            mtIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-            mtIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-            decMft->SetInputType(0, mtIn.Get(), 0);
+    int32_t activeDecCodec = -1;
+    auto initDecoderForCodec = [&](int32_t targetCodec) {
+        if (decMft && activeDecCodec == targetCodec) return;
+        if (decMft) {
+            decMft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            ComPtr<IMFShutdown> shut;
+            if (SUCCEEDED(decMft.As(&shut))) shut->Shutdown();
+            decMft.Reset();
         }
+        activeDecCodec = targetCodec;
+        const GUID subtype = (targetCodec == FC_CODEC_HEVC) ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+        MFT_REGISTER_TYPE_INFO inInfo{ MFMediaType_Video, subtype };
 
-        for (DWORD i = 0; ; ++i) {
-            ComPtr<IMFMediaType> mtOut;
-            if (FAILED(decMft->GetOutputAvailableType(0, i, &mtOut))) break;
-            GUID sub{};
-            if (SUCCEEDED(mtOut->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_NV12) {
-                decMft->SetOutputType(0, mtOut.Get(), 0);
-                break;
+        auto tryInitMft = [&](IMFTransform* mft, bool bindD3d) -> bool {
+            if (!mft) return false;
+            ComPtr<IMFAttributes> attrs;
+            if (SUCCEEDED(mft->GetAttributes(&attrs)) && attrs) {
+                UINT32 isAsync = 0;
+                if (SUCCEEDED(attrs->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync)) && isAsync)
+                    attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+                attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
+            }
+            if (bindD3d && dxgiMgr) {
+                if (FAILED(mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(dxgiMgr.Get()))))
+                    return false;
+            }
+            ComPtr<IMFMediaType> mtIn;
+            if (FAILED(MFCreateMediaType(&mtIn)) || !mtIn) return false;
+            mtIn->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            mtIn->SetGUID(MF_MT_SUBTYPE, subtype);
+            if (FAILED(mft->SetInputType(0, mtIn.Get(), 0))) return false;
+
+            bool outSet = false;
+            for (DWORD i = 0; ; ++i) {
+                ComPtr<IMFMediaType> mtOut;
+                if (FAILED(mft->GetOutputAvailableType(0, i, &mtOut))) break;
+                GUID sub{};
+                if (SUCCEEDED(mtOut->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_NV12) {
+                    if (SUCCEEDED(mft->SetOutputType(0, mtOut.Get(), 0))) { outSet = true; break; }
+                }
+            }
+            if (!outSet) return false;
+            mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+            mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            return true;
+        };
+
+        for (UINT32 flagsPass : { UINT32(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER),
+                                  UINT32(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER) }) {
+            IMFActivate** acts = nullptr;
+            UINT32 count = 0;
+            if (SUCCEEDED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flagsPass, &inInfo, nullptr, &acts, &count)) && count > 0) {
+                for (UINT32 i = 0; i < count; ++i) {
+                    ComPtr<IMFTransform> cand;
+                    if (!decMft && SUCCEEDED(acts[i]->ActivateObject(IID_PPV_ARGS(&cand)))) {
+                        if (tryInitMft(cand.Get(), (flagsPass & MFT_ENUM_FLAG_HARDWARE) != 0) || tryInitMft(cand.Get(), false)) {
+                            decMft = cand;
+                        } else {
+                            ComPtr<IMFShutdown> shut;
+                            if (SUCCEEDED(cand.As(&shut))) shut->Shutdown();
+                            acts[i]->ShutdownObject();
+                        }
+                    }
+                    acts[i]->Release();
+                }
+                CoTaskMemFree(acts);
+                if (decMft) return;
+            } else if (acts) {
+                CoTaskMemFree(acts);
             }
         }
-        decMft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-        decMft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    }
+
+        if (!decMft && targetCodec == FC_CODEC_H264) {
+            ComPtr<IMFTransform> cand;
+            if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&cand)))) {
+                if (tryInitMft(cand.Get(), true) || tryInitMft(cand.Get(), false)) decMft = cand;
+            }
+        }
+    };
+    initDecoderForCodec(video_codec_.load());
 
     ComPtr<ID3D11VideoDevice> vdev;
     ComPtr<ID3D11VideoContext> vctx;
@@ -479,6 +542,7 @@ void StreamReceiver::rxDecodeLoop() {
     uint8_t pkt[2048];
     uint8_t plain[2048];
     std::vector<uint8_t> daveBuf(2 * 1024 * 1024);
+    std::vector<uint8_t> cachedVps;
     std::vector<uint8_t> cachedSps;
     std::vector<uint8_t> cachedPps;
     std::vector<uint8_t> prependBuf;
@@ -487,6 +551,7 @@ void StreamReceiver::rxDecodeLoop() {
     int64_t framesWindow = 0;
     int64_t bytesWindow = 0;
     int64_t rxUdpPkts = 0;
+    int64_t rxVideoPkts = 0;
     int64_t daveOk = 0;
     int64_t daveFail = 0;
     int64_t kfSkipped = 0;
@@ -499,14 +564,14 @@ void StreamReceiver::rxDecodeLoop() {
 
     auto updateDiagText = [&]() {
         char diag[64]{};
-        std::snprintf(diag, sizeof(diag), "rx=%lld dv=%lld/%lld kf=%lld in=%lld dec=%lld nt=%u",
-                      (long long)rxUdpPkts, (long long)daveOk, (long long)daveFail,
-                      (long long)kfSkipped, (long long)mftFed, (long long)framesDecoded, unsigned(lastNaluType));
+        std::snprintf(diag, sizeof(diag), "rx=%lld v=%lld dv=%lld/%lld kf=%lld dec=%lld nt=%u",
+                      (long long)rxUdpPkts, (long long)rxVideoPkts, (long long)daveOk, (long long)daveFail,
+                      (long long)kfSkipped, (long long)framesDecoded, unsigned(lastNaluType));
         std::lock_guard lk(stats_mtx_);
         std::strncpy(stats_.encoder_name, diag, sizeof(stats_.encoder_name) - 1);
     };
 
-    auto cacheSpsPpsFromFrame = [&](const uint8_t* data, size_t len) {
+    auto cacheSpsPpsFromFrame = [&](const uint8_t* data, size_t len, bool isHevc) {
         size_t pos = 0;
         while (pos + 3 < len) {
             size_t sc = 0;
@@ -522,24 +587,41 @@ void StreamReceiver::rxDecodeLoop() {
             }
             if (next + 3 >= len) next = len;
             if (start < next) {
-                uint8_t nt = data[start] & 0x1F;
-                if (nt == 7) {
-                    cachedSps.assign({0, 0, 0, 1});
-                    cachedSps.insert(cachedSps.end(), data + start, data + next);
-                } else if (nt == 8) {
-                    cachedPps.assign({0, 0, 0, 1});
-                    cachedPps.insert(cachedPps.end(), data + start, data + next);
+                if (!isHevc) {
+                    uint8_t nt = data[start] & 0x1F;
+                    if (nt == 7) {
+                        cachedSps.assign({0, 0, 0, 1});
+                        cachedSps.insert(cachedSps.end(), data + start, data + next);
+                    } else if (nt == 8) {
+                        cachedPps.assign({0, 0, 0, 1});
+                        cachedPps.insert(cachedPps.end(), data + start, data + next);
+                    }
+                } else {
+                    uint8_t nt = (data[start] >> 1) & 0x3F;
+                    if (nt == 32) {
+                        cachedVps.assign({0, 0, 0, 1});
+                        cachedVps.insert(cachedVps.end(), data + start, data + next);
+                    } else if (nt == 33) {
+                        cachedSps.assign({0, 0, 0, 1});
+                        cachedSps.insert(cachedSps.end(), data + start, data + next);
+                    } else if (nt == 34) {
+                        cachedPps.assign({0, 0, 0, 1});
+                        cachedPps.insert(cachedPps.end(), data + start, data + next);
+                    }
                 }
             }
             pos = next;
         }
     };
 
-    auto frameHasNalu = [](const uint8_t* data, size_t len, uint8_t targetNt) -> bool {
+    auto frameHasNalu = [](const uint8_t* data, size_t len, uint8_t targetNt, bool isHevc) -> bool {
         for (size_t i = 0; i + 3 < len; ++i) {
             if (data[i] == 0 && data[i + 1] == 0) {
                 size_t sc = (data[i + 2] == 1) ? 3 : ((i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1) ? 4 : 0);
-                if (sc > 0 && i + sc < len && ((data[i + sc] & 0x1F) == targetNt)) return true;
+                if (sc > 0 && i + sc < len) {
+                    uint8_t nt = isHevc ? uint8_t((data[i + sc] >> 1) & 0x3F) : uint8_t(data[i + sc] & 0x1F);
+                    if (nt == targetNt) return true;
+                }
             }
         }
         return false;
@@ -726,18 +808,21 @@ void StreamReceiver::rxDecodeLoop() {
             }
         }
 
-        // Cache SPS(7) and PPS(8) separately so NVDEC always has codec config even if IDR omits repeated SPS/PPS
-        cacheSpsPpsFromFrame(frameData, frameLen);
+        // Cache VPS/SPS/PPS separately so NVDEC always has codec config even if IDR omits repeated parameter sets
+        const bool isHevc = (video_codec_.load() == FC_CODEC_HEVC);
+        cacheSpsPpsFromFrame(frameData, frameLen, isHevc);
         if (frameLen >= 5 && frameData[0] == 0 && frameData[1] == 0) {
-            lastNaluType = (frameData[2] == 1 ? frameData[3] : frameData[4]) & 0x1F;
+            uint8_t hdrByte = (frameData[2] == 1 ? frameData[3] : frameData[4]);
+            lastNaluType = isHevc ? uint8_t((hdrByte >> 1) & 0x3F) : uint8_t(hdrByte & 0x1F);
         }
 
-        // Gate strictly on an actual IDR (NAL type 5) + valid SPS/PPS (in-frame or cached) so NVDEC never smears or hangs!
+        // Gate strictly on an actual IDR + valid SPS/PPS (and VPS for HEVC) so NVDEC never smears or hangs!
         if (decNeedsKf) {
-            bool hasIdr = VideoDepacketizer::hasIdr(frameData, frameLen);
-            bool hasSps = frameHasNalu(frameData, frameLen, 7);
-            bool hasPps = frameHasNalu(frameData, frameLen, 8);
-            bool configReady = (hasSps || !cachedSps.empty()) && (hasPps || !cachedPps.empty());
+            bool hasIdr = isHevc ? VideoDepacketizer::hasHevcIdr(frameData, frameLen) : VideoDepacketizer::hasIdr(frameData, frameLen);
+            bool hasVps = !isHevc || frameHasNalu(frameData, frameLen, 32, true);
+            bool hasSps = frameHasNalu(frameData, frameLen, isHevc ? 33 : 7, isHevc);
+            bool hasPps = frameHasNalu(frameData, frameLen, isHevc ? 34 : 8, isHevc);
+            bool configReady = (hasVps || !cachedVps.empty()) && (hasSps || !cachedSps.empty()) && (hasPps || !cachedPps.empty());
             if (!hasIdr || !configReady) {
                 kfSkipped++;
                 depack.setNeedKeyframe(true);
@@ -748,8 +833,9 @@ void StreamReceiver::rxDecodeLoop() {
                 }
                 return;
             }
-            if ((!hasSps && !cachedSps.empty()) || (!hasPps && !cachedPps.empty())) {
+            if ((!hasVps && !cachedVps.empty()) || (!hasSps && !cachedSps.empty()) || (!hasPps && !cachedPps.empty())) {
                 prependBuf.clear();
+                if (!hasVps) prependBuf.insert(prependBuf.end(), cachedVps.begin(), cachedVps.end());
                 if (!hasSps) prependBuf.insert(prependBuf.end(), cachedSps.begin(), cachedSps.end());
                 if (!hasPps) prependBuf.insert(prependBuf.end(), cachedPps.begin(), cachedPps.end());
                 prependBuf.insert(prependBuf.end(), frameData, frameData + frameLen);
@@ -810,9 +896,20 @@ void StreamReceiver::rxDecodeLoop() {
     int64_t lastDiagMs = steadyMs();
 
     while (running_.load()) {
+        int32_t wantCodec = video_codec_.load();
+        if (wantCodec != activeDecCodec) {
+            initDecoderForCodec(wantCodec);
+            depack.setHevc(wantCodec == FC_CODEC_HEVC);
+            decNeedsKf = true;
+            cachedVps.clear();
+            cachedSps.clear();
+            cachedPps.clear();
+        }
         if (reset_depack_.exchange(false)) {
+            depack.setHevc(wantCodec == FC_CODEC_HEVC);
             depack.reset();
             decNeedsKf = true;
+            cachedVps.clear();
             cachedSps.clear();
             cachedPps.clear();
             if (decMft) decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
@@ -988,8 +1085,13 @@ void StreamReceiver::rxDecodeLoop() {
             continue;
         }
 
-        // Stream video H.264 (PT 101 / 103; skip RTX 102/104 and secondary simulcast SSRCs)
-        if (pt != 101 && pt != 103) continue;
+        // Stream video H.264 / HEVC (accept negotiated video_pt_ or 101/103; skip even RTX PTs 102/104/106)
+        int32_t negPt = video_pt_.load();
+        bool isVideoPt = (pt == uint8_t(negPt)) || (pt == 101) || (pt == 103);
+        if (!isVideoPt) continue;
+        if (pt == 103 && negPt == 103 && video_codec_.load() != FC_CODEC_HEVC) {
+            video_codec_.store(FC_CODEC_HEVC);
+        }
         uint32_t targetVssrc = video_ssrc_.load();
         if (targetVssrc == 0) {
             video_ssrc_.store(ssrc);
@@ -997,6 +1099,7 @@ void StreamReceiver::rxDecodeLoop() {
         } else if (ssrc != targetVssrc) {
             continue;
         }
+        rxVideoPkts++;
 
         bool anyPli = false;
         bool stepPli = false;

@@ -143,6 +143,7 @@ FC_API void fc_pub_dave_execute_transition(uint16_t protocol_version);
 // Multi-Stream (up to 4 simultaneous!) Zero-Copy Go Live Stream Receivers (slot 0..3)
 FC_API int32_t fc_watch_connect_slot(int32_t slot, const char* ip, uint16_t port, uint32_t ssrc, void* hwnd, char* out_ext_ip, int32_t ext_ip_cap, uint16_t* out_ext_port);
 FC_API void fc_watch_set_key_slot(int32_t slot, const uint8_t* secret_key_32, int32_t use_xchacha_rtpsize);
+FC_API void fc_watch_set_codec_slot(int32_t slot, int32_t codec, int32_t video_pt);
 FC_API void fc_watch_set_remote_slot(int32_t slot, uint32_t video_ssrc, uint32_t audio_ssrc, const char* streamer_user_id);
 FC_API void fc_watch_set_volume_slot(int32_t slot, float volume);
 FC_API void fc_watch_resize_slot(int32_t slot, int32_t width, int32_t height);

@@ -456,6 +456,10 @@ FC_API void fc_watch_set_key_slot(int32_t slot, const uint8_t* secret_key_32, in
     std::shared_lock lk(g_smtx);
     if (auto* w = getWatchUnlocked(slot); w && secret_key_32) w->setKey(secret_key_32, use_xchacha_rtpsize != 0);
 }
+FC_API void fc_watch_set_codec_slot(int32_t slot, int32_t codec, int32_t video_pt) {
+    std::shared_lock lk(g_smtx);
+    if (auto* w = getWatchUnlocked(slot)) w->setCodec(codec, video_pt);
+}
 FC_API void fc_watch_set_remote_slot(int32_t slot, uint32_t video_ssrc, uint32_t audio_ssrc, const char* streamer_user_id) {
     std::shared_lock lk(g_smtx);
     if (auto* w = getWatchUnlocked(slot)) w->setRemoteStreams(video_ssrc, audio_ssrc, streamer_user_id);
