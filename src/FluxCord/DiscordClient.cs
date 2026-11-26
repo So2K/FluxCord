@@ -322,7 +322,8 @@ public sealed class DiscordClient
     public ConcurrentDictionary<string, List<DiscordMessage>> Messages { get; } = new();
     public ConcurrentDictionary<string, List<DiscordMessage>> PinnedMessages { get; } = new();
     public ConcurrentDictionary<string, (string Name, long Until)> TypingUsers { get; } = new();
-    public ConcurrentDictionary<string, byte> UnreadChannels { get; } = new();
+    public ConcurrentDictionary<string, int> UnreadChannels { get; } = new();
+    public ConcurrentDictionary<string, DiscordCallState> DmCalls { get; } = new();
     private readonly ConcurrentDictionary<string, uint> _userToSsrc = new();
     private readonly ConcurrentDictionary<string, float> _userVolumes = new();
     private readonly ConcurrentDictionary<string, byte> _loadingOlder = new();
@@ -401,11 +402,29 @@ public sealed class DiscordClient
         g2.Channels.Add(new DiscordChannel { Id = "v_g2", GuildId = "g2", Name = "Созвон команды", Type = 2, Position = 1 });
         Guilds.Add(g2);
 
-        DmChannels.Add(new DiscordChannel { Id = "dm_1", GuildId = "@me", Name = "Сохранённые заметки", Type = 1 });
+        DmChannels.Add(new DiscordChannel { Id = "dm_1", GuildId = "@me", Name = "mirrorcoder, DemoTeammate", Type = 3, RecipientIds = ["2001", "2002"] });
+        DmChannels.Add(new DiscordChannel { Id = "dm_2", GuildId = "@me", Name = "Draka (slowed+reverb)", RecipientId = "2001", Type = 1 });
         Friends.Clear();
-        Friends.Add(new DiscordFriend { UserId = "2001", Username = "draka", DisplayName = "Draka (slowed+reverb)", Status = "online", Type = 1 });
-        Friends.Add(new DiscordFriend { UserId = "2002", Username = "lapki", DisplayName = "lapki >.<", Status = "online", Type = 1 });
+        Friends.Add(new DiscordFriend { UserId = "2001", Username = "draka", DisplayName = "Draka (slowed+reverb)", Status = "online", ActivityText = "🎮 Granny Remake 2", Type = 1 });
+        Friends.Add(new DiscordFriend { UserId = "2002", Username = "lapki", DisplayName = "lapki >.<", Status = "dnd", ActivityText = ">_<", Type = 1 });
         Friends.Add(new DiscordFriend { UserId = "2003", Username = "mrmeat", DisplayName = "MR MEAT", Status = "idle", Type = 1 });
+        Friends.Add(new DiscordFriend { UserId = "2004", Username = "new_pal", DisplayName = "IncomingFriend", Status = "online", Type = 3 });
+
+        Messages["dm_1"] =
+        [
+            new DiscordMessage
+            {
+                Id = "dm_m1", ChannelId = "dm_1", AuthorId = "2001", AuthorName = "Draka (slowed+reverb)", AuthorColor = 0xFF7BD88F,
+                Timestamp = "18:50", DateLabel = "11 ноября 2026 г.", MsgType = 3, CallMissed = false,
+                Content = "Draka (slowed+reverb) начал звонок продолжительностью 3 часа."
+            },
+            new DiscordMessage
+            {
+                Id = "dm_m2", ChannelId = "dm_1", AuthorId = "2002", AuthorName = "lapki >.<", AuthorColor = 0xFFF472B6,
+                Timestamp = "03:51", DateLabel = "26 ноября 2026 г.", MsgType = 3, CallMissed = true,
+                Content = "Вы пропустили звонок от lapki >.<, который длился 19 минут."
+            }
+        ];
 
         Messages["c_gen"] =
         [
@@ -756,6 +775,12 @@ public sealed class DiscordClient
             case "MESSAGE_REACTION_ADD": ParseReactionAdd(d); break;
             case "MESSAGE_REACTION_REMOVE": ParseReactionRemove(d); break;
             case "PRESENCE_UPDATE": ParsePresenceUpdate(d); break;
+            case "SESSIONS_REPLACE": ParseSessionsReplace(d); break;
+            case "RELATIONSHIP_ADD": ParseRelationshipAdd(d); break;
+            case "RELATIONSHIP_REMOVE": ParseRelationshipRemove(d); break;
+            case "CALL_CREATE": ParseCallUpsert(d); break;
+            case "CALL_UPDATE": ParseCallUpsert(d); break;
+            case "CALL_DELETE": ParseCallDelete(d); break;
             case "TYPING_START": ParseTypingStart(d); break;
             case "VOICE_STATE_UPDATE": ParseVoiceStateUpdate(d); break;
             case "VOICE_SERVER_UPDATE": ParseVoiceServerUpdate(d); break;
@@ -958,6 +983,89 @@ public sealed class DiscordClient
         Notify();
     }
 
+    private DiscordChannel ParseDmChannelElement(JsonElement cEl)
+    {
+        string cid = cEl.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? "" : "";
+        int type = cEl.TryGetProperty("type", out var ct) ? ct.GetInt32() : 1;
+        string customName = cEl.TryGetProperty("name", out var cn) && cn.ValueKind == JsonValueKind.String ? cn.GetString() ?? "" : "";
+        string icon = cEl.TryGetProperty("icon", out var ic) && ic.ValueKind == JsonValueKind.String ? ic.GetString() ?? "" : "";
+        string lastMsgId = cEl.TryGetProperty("last_message_id", out var lm) && lm.ValueKind == JsonValueKind.String ? lm.GetString() ?? "" : "";
+
+        var recIds = new List<string>();
+        var recNames = new List<string>();
+        string firstId = "", firstAv = "";
+
+        if (cEl.TryGetProperty("recipients", out var recs) && recs.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var rEl in recs.EnumerateArray())
+            {
+                string rid = rEl.TryGetProperty("id", out var rie) ? rie.GetString() ?? "" : "";
+                if (string.IsNullOrEmpty(rid)) continue;
+                string un = rEl.TryGetProperty("username", out var rn) ? rn.GetString() ?? "" : "";
+                string dn = rEl.TryGetProperty("global_name", out var rgn) && rgn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(rgn.GetString())
+                    ? rgn.GetString()! : un;
+                string av = rEl.TryGetProperty("avatar", out var rav) && rav.ValueKind == JsonValueKind.String ? rav.GetString() ?? "" : "";
+                if (!Users.TryGetValue(rid, out var prevU))
+                    Users[rid] = new DiscordUser { Id = rid, Username = un, DisplayName = string.IsNullOrEmpty(dn) ? "User" : dn, Avatar = av };
+                else
+                {
+                    if (!string.IsNullOrEmpty(dn)) prevU.DisplayName = dn;
+                    if (!string.IsNullOrEmpty(av)) prevU.Avatar = av;
+                }
+                if (rid != Me.Id)
+                {
+                    recIds.Add(rid);
+                    if (!string.IsNullOrEmpty(dn)) recNames.Add(dn);
+                    if (string.IsNullOrEmpty(firstId)) { firstId = rid; firstAv = av; }
+                }
+            }
+        }
+        if (recIds.Count == 0 && cEl.TryGetProperty("recipient_ids", out var rids) && rids.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var rie in rids.EnumerateArray())
+            {
+                string rid = rie.ValueKind == JsonValueKind.String ? rie.GetString() ?? "" : "";
+                if (string.IsNullOrEmpty(rid) || rid == Me.Id) continue;
+                recIds.Add(rid);
+                if (Users.TryGetValue(rid, out var ru))
+                {
+                    if (!string.IsNullOrEmpty(ru.DisplayName)) recNames.Add(ru.DisplayName);
+                    if (string.IsNullOrEmpty(firstId)) { firstId = rid; firstAv = ru.Avatar; }
+                }
+                else if (string.IsNullOrEmpty(firstId)) firstId = rid;
+            }
+        }
+
+        string name = !string.IsNullOrEmpty(customName)
+            ? customName
+            : (recNames.Count > 0 ? string.Join(", ", recNames) : (Users.TryGetValue(firstId, out var u0) && !string.IsNullOrEmpty(u0.DisplayName) ? u0.DisplayName : "Беседа"));
+
+        return new DiscordChannel
+        {
+            Id = cid,
+            GuildId = "@me",
+            Name = name,
+            RecipientId = firstId,
+            RecipientAvatar = firstAv,
+            ChannelIcon = icon,
+            RecipientIds = recIds,
+            LastMessageId = lastMsgId,
+            Type = type
+        };
+    }
+
+    private static ulong DmSortKey(DiscordChannel c)
+    {
+        ulong lm = ulong.TryParse(c.LastMessageId, out var x) ? x : 0UL;
+        ulong cid = ulong.TryParse(c.Id, out var y) ? y : 0UL;
+        return Math.Max(lm, cid);
+    }
+
+    private void SortDmChannelsLocked()
+    {
+        DmChannels.Sort((a, b) => DmSortKey(b).CompareTo(DmSortKey(a)));
+    }
+
     private void ParseChannelUpsert(JsonElement d)
     {
         string cid = d.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? "" : "";
@@ -965,23 +1073,18 @@ public sealed class DiscordClient
         int type = d.TryGetProperty("type", out var te) ? te.GetInt32() : 0;
         if (type is 1 or 3)
         {
-            string name = d.TryGetProperty("name", out var cn) && cn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(cn.GetString()) ? cn.GetString()! : "DM";
-            string recId = "", recAv = "";
-            if (d.TryGetProperty("recipients", out var recs) && recs.ValueKind == JsonValueKind.Array && recs.GetArrayLength() > 0)
-            {
-                var r0 = recs[0];
-                recId = r0.TryGetProperty("id", out var rid) ? rid.GetString() ?? "" : "";
-                recAv = r0.TryGetProperty("avatar", out var rav) && rav.ValueKind == JsonValueKind.String ? rav.GetString() ?? "" : "";
-                if (name == "DM")
-                    name = r0.TryGetProperty("global_name", out var rgn) && rgn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(rgn.GetString())
-                        ? rgn.GetString()! : (r0.TryGetProperty("username", out var rn) ? rn.GetString() ?? "DM" : "DM");
-            }
-            var dm = new DiscordChannel { Id = cid, GuildId = "@me", Name = name, RecipientId = recId, RecipientAvatar = recAv, Type = type };
+            var dm = ParseDmChannelElement(d);
             lock (DmChannels)
             {
                 int idx = DmChannels.FindIndex(x => x.Id == cid);
-                if (idx >= 0) DmChannels[idx] = dm;
-                else DmChannels.Insert(0, dm);
+                if (idx >= 0)
+                {
+                    if (string.IsNullOrEmpty(dm.LastMessageId)) dm.LastMessageId = DmChannels[idx].LastMessageId;
+                    dm.MentionCount = DmChannels[idx].MentionCount;
+                    DmChannels[idx] = dm;
+                }
+                else DmChannels.Add(dm);
+                SortDmChannelsLocked();
             }
             Notify();
             return;
@@ -1103,62 +1206,101 @@ public sealed class DiscordClient
                 parsedGuilds.Add(ParseGuildElement(gEl, mmSlice));
             }
         }
+        // Order guilds by user_settings.guild_folders / guild_positions so left rail matches Official Discord!
+        var guildOrder = new List<string>();
+        if (d.TryGetProperty("user_settings", out var uset) && uset.ValueKind == JsonValueKind.Object)
+        {
+            if (uset.TryGetProperty("guild_folders", out var gfs) && gfs.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var gf in gfs.EnumerateArray())
+                {
+                    if (gf.TryGetProperty("guild_ids", out var gids) && gids.ValueKind == JsonValueKind.Array)
+                        foreach (var gi in gids.EnumerateArray())
+                            if (gi.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gi.GetString()))
+                                guildOrder.Add(gi.GetString()!);
+                }
+            }
+            if (guildOrder.Count == 0 && uset.TryGetProperty("guild_positions", out var gps) && gps.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var gi in gps.EnumerateArray())
+                    if (gi.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gi.GetString()))
+                        guildOrder.Add(gi.GetString()!);
+            }
+        }
+        if (guildOrder.Count > 0)
+        {
+            var posMap = new Dictionary<string, int>(guildOrder.Count);
+            for (int i = 0; i < guildOrder.Count; i++) posMap.TryAdd(guildOrder[i], i);
+            parsedGuilds = parsedGuilds.OrderBy(g => posMap.TryGetValue(g.Id, out var p) ? p : int.MaxValue).ToList();
+        }
         lock (Guilds) { Guilds.Clear(); Guilds.AddRange(parsedGuilds); }
 
+        DmCalls.Clear();
+        UnreadChannels.Clear();
         var parsedDms = new List<DiscordChannel>();
         if (d.TryGetProperty("private_channels", out var pcs) && pcs.ValueKind == JsonValueKind.Array)
         {
             foreach (var cEl in pcs.EnumerateArray())
+                parsedDms.Add(ParseDmChannelElement(cEl));
+            parsedDms.Sort((a, b) => DmSortKey(b).CompareTo(DmSortKey(a)));
+        }
+
+        // Parse initial read_state (exact unread dots + red mention badges on DMs & Guilds!)
+        if (d.TryGetProperty("read_state", out var rsEl))
+        {
+            JsonElement entries = rsEl.ValueKind == JsonValueKind.Array
+                ? rsEl
+                : (rsEl.ValueKind == JsonValueKind.Object && rsEl.TryGetProperty("entries", out var ent) && ent.ValueKind == JsonValueKind.Array ? ent : default);
+            if (entries.ValueKind == JsonValueKind.Array)
             {
-                string name = "DM";
-                string recId = "", recAv = "";
-                if (cEl.TryGetProperty("name", out var cn) && cn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(cn.GetString()))
-                    name = cn.GetString()!;
-                else if (cEl.TryGetProperty("recipient_ids", out var rids) && rids.ValueKind == JsonValueKind.Array && rids.GetArrayLength() > 0)
+                var readMap = new Dictionary<string, (ulong LastRead, int Mentions)>();
+                foreach (var re in entries.EnumerateArray())
                 {
-                    recId = rids[0].GetString() ?? "";
-                    if (Users.TryGetValue(recId, out var ru)) { name = ru.DisplayName; recAv = ru.Avatar; }
+                    string rcid = re.TryGetProperty("id", out var rie) ? rie.GetString() ?? "" : "";
+                    if (string.IsNullOrEmpty(rcid)) continue;
+                    ulong lr = re.TryGetProperty("last_message_id", out var lme) && lme.ValueKind == JsonValueKind.String && ulong.TryParse(lme.GetString(), out var ulr) ? ulr : 0UL;
+                    int mc = re.TryGetProperty("mention_count", out var mce) && mce.ValueKind == JsonValueKind.Number ? mce.GetInt32() : 0;
+                    readMap[rcid] = (lr, mc);
                 }
-                else if (cEl.TryGetProperty("recipients", out var recs) && recs.ValueKind == JsonValueKind.Array && recs.GetArrayLength() > 0)
+                foreach (var dm in parsedDms)
                 {
-                    var r0 = recs[0];
-                    recId = r0.TryGetProperty("id", out var rid) ? rid.GetString() ?? "" : "";
-                    recAv = r0.TryGetProperty("avatar", out var rav) && rav.ValueKind == JsonValueKind.String ? rav.GetString() ?? "" : "";
-                    name = r0.TryGetProperty("global_name", out var rgn) && rgn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(rgn.GetString())
-                        ? rgn.GetString()! : (r0.TryGetProperty("username", out var rn) ? rn.GetString() ?? "DM" : "DM");
+                    if (readMap.TryGetValue(dm.Id, out var st))
+                    {
+                        dm.MentionCount = st.Mentions;
+                        ulong lm = ulong.TryParse(dm.LastMessageId, out var ulm) ? ulm : 0UL;
+                        if (st.Mentions > 0 || (lm > 0 && st.LastRead > 0 && lm > st.LastRead))
+                            UnreadChannels[dm.Id] = Math.Max(1, st.Mentions);
+                    }
                 }
-                parsedDms.Add(new DiscordChannel
+                foreach (var g in parsedGuilds)
                 {
-                    Id = cEl.GetProperty("id").GetString() ?? "",
-                    GuildId = "@me",
-                    Name = name,
-                    RecipientId = recId,
-                    RecipientAvatar = recAv,
-                    LastMessageId = cEl.TryGetProperty("last_message_id", out var lm) && lm.ValueKind == JsonValueKind.String ? lm.GetString() ?? "" : "",
-                    Type = cEl.TryGetProperty("type", out var ct) ? ct.GetInt32() : 1
-                });
+                    int gMentions = 0;
+                    foreach (var ch in g.Channels)
+                    {
+                        if (readMap.TryGetValue(ch.Id, out var st) && st.Mentions > 0)
+                        {
+                            ch.MentionCount = st.Mentions;
+                            gMentions += st.Mentions;
+                            UnreadChannels[ch.Id] = st.Mentions;
+                        }
+                    }
+                    g.MentionCount = gMentions;
+                }
             }
-            parsedDms.Sort((a, b) =>
-            {
-                ulong la = ulong.TryParse(a.LastMessageId, out var x) ? x : 0;
-                ulong lb = ulong.TryParse(b.LastMessageId, out var y) ? y : 0;
-                return lb.CompareTo(la);
-            });
         }
         lock (DmChannels) { DmChannels.Clear(); DmChannels.AddRange(parsedDms); }
 
-        // Parse Friends (relationships) + initial presences
-        var initStatus = new Dictionary<string, string>();
+        // Parse Friends + Incoming/Outgoing Requests (relationships type 1, 3, 4) + initial presences
+        var initStatus = new Dictionary<string, (string Status, string Activity)>();
         if (d.TryGetProperty("presences", out var pres) && pres.ValueKind == JsonValueKind.Array)
         {
             foreach (var pr in pres.EnumerateArray())
             {
-                string puid = pr.TryGetProperty("user", out var pu) && pu.TryGetProperty("id", out var pi) ? pi.GetString() ?? "" : "";
-                string pst = pr.TryGetProperty("status", out var ps) && ps.ValueKind == JsonValueKind.String ? ps.GetString() ?? "offline" : "offline";
+                var (puid, pst, pact) = ExtractPresenceTuple(pr);
                 if (!string.IsNullOrEmpty(puid))
                 {
-                    initStatus[puid] = pst;
-                    if (Users.TryGetValue(puid, out var uo)) uo.Status = pst;
+                    initStatus[puid] = (pst, pact);
+                    if (Users.TryGetValue(puid, out var uo)) { uo.Status = pst; uo.ActivityText = pact; }
                 }
             }
         }
@@ -1168,7 +1310,7 @@ public sealed class DiscordClient
             foreach (var rel in rels.EnumerateArray())
             {
                 int rtype = rel.TryGetProperty("type", out var rt) ? rt.GetInt32() : 0;
-                if (rtype != 1) continue; // Friends only
+                if (rtype is not (1 or 3 or 4)) continue; // 1=Friend, 3=Incoming request, 4=Outgoing request
                 string fuid = rel.TryGetProperty("user_id", out var f1) ? f1.GetString() ?? "" : (rel.TryGetProperty("id", out var f2) ? f2.GetString() ?? "" : "");
                 if (string.IsNullOrEmpty(fuid)) continue;
                 string uname = "", dname = "", fav = "";
@@ -1183,15 +1325,12 @@ public sealed class DiscordClient
                     uname = cu.Username; dname = cu.DisplayName; fav = cu.Avatar;
                 }
                 if (string.IsNullOrEmpty(dname)) dname = uname;
-                string fst = initStatus.GetValueOrDefault(fuid, "offline");
-                parsedFriends.Add(new DiscordFriend { UserId = fuid, Username = uname, DisplayName = dname, Avatar = fav, Status = fst, Type = rtype });
+                var (fst, fact) = initStatus.TryGetValue(fuid, out var pair)
+                    ? pair
+                    : (Users.TryGetValue(fuid, out var u2) ? (u2.Status, u2.ActivityText) : ("offline", ""));
+                parsedFriends.Add(new DiscordFriend { UserId = fuid, Username = uname, DisplayName = dname, Avatar = fav, Status = fst, ActivityText = fact, Type = rtype });
             }
-            parsedFriends.Sort((a, b) =>
-            {
-                int oa = a.Status == "offline" ? 1 : 0, ob = b.Status == "offline" ? 1 : 0;
-                int c = oa.CompareTo(ob);
-                return c != 0 ? c : string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase);
-            });
+            SortFriendsList(parsedFriends);
         }
         lock (Friends) { Friends.Clear(); Friends.AddRange(parsedFriends); }
 
@@ -1245,6 +1384,304 @@ public sealed class DiscordClient
         ReadyCompleted?.Invoke();
     }
 
+    private static void SortFriendsList(List<DiscordFriend> list)
+    {
+        list.Sort((a, b) =>
+        {
+            int ta = a.Type == 3 ? 0 : (a.Type == 1 ? 1 : 2);
+            int tb = b.Type == 3 ? 0 : (b.Type == 1 ? 1 : 2);
+            if (ta != tb) return ta.CompareTo(tb);
+            int oa = a.Status is "offline" or "invisible" ? 1 : 0;
+            int ob = b.Status is "offline" or "invisible" ? 1 : 0;
+            int c = oa.CompareTo(ob);
+            return c != 0 ? c : string.Compare(a.DisplayName, b.DisplayName, StringComparison.OrdinalIgnoreCase);
+        });
+    }
+
+    private static string ExtractActivitySummary(JsonElement pr)
+    {
+        if (!pr.TryGetProperty("activities", out var acts) || acts.ValueKind != JsonValueKind.Array) return "";
+        string fallback = "";
+        foreach (var a in acts.EnumerateArray())
+        {
+            int at = a.TryGetProperty("type", out var te) && te.ValueKind == JsonValueKind.Number ? te.GetInt32() : 0;
+            string nm = a.TryGetProperty("name", out var ne) && ne.ValueKind == JsonValueKind.String ? ne.GetString() ?? "" : "";
+            string st = a.TryGetProperty("state", out var se) && se.ValueKind == JsonValueKind.String ? se.GetString() ?? "" : "";
+            if (at == 4) // Custom Status
+            {
+                string emo = "";
+                if (a.TryGetProperty("emoji", out var em) && em.ValueKind == JsonValueKind.Object &&
+                    em.TryGetProperty("name", out var emn) && emn.ValueKind == JsonValueKind.String &&
+                    !em.TryGetProperty("id", out _))
+                {
+                    emo = emn.GetString() ?? "";
+                }
+                string custom = string.IsNullOrEmpty(emo) ? st : (string.IsNullOrEmpty(st) ? emo : $"{emo} {st}");
+                if (!string.IsNullOrWhiteSpace(custom)) return custom.Trim();
+            }
+            else if (string.IsNullOrEmpty(fallback) && !string.IsNullOrWhiteSpace(nm))
+            {
+                fallback = at switch
+                {
+                    0 => $"🎮 {nm}",
+                    1 => $"🟣 Стримит {nm}",
+                    2 => $"🎵 {(string.IsNullOrEmpty(st) ? nm : nm + " — " + st)}",
+                    3 => $"📺 {nm}",
+                    5 => $"🏆 {nm}",
+                    _ => nm
+                };
+            }
+        }
+        return fallback;
+    }
+
+    private static (string UserId, string Status, string Activity) ExtractPresenceTuple(JsonElement pr)
+    {
+        string uid = "";
+        if (pr.TryGetProperty("user_id", out var uie) && uie.ValueKind == JsonValueKind.String)
+            uid = uie.GetString() ?? "";
+        else if (pr.TryGetProperty("user", out var u) && u.ValueKind == JsonValueKind.Object && u.TryGetProperty("id", out var ie))
+            uid = ie.GetString() ?? "";
+        string st = pr.TryGetProperty("status", out var se) && se.ValueKind == JsonValueKind.String ? se.GetString() ?? "offline" : "offline";
+        string act = st is "offline" or "invisible" ? "" : ExtractActivitySummary(pr);
+        return (uid, st, act);
+    }
+
+    private void ApplyPresenceTuple(string uid, string st, string act)
+    {
+        if (string.IsNullOrEmpty(uid)) return;
+        if (Users.TryGetValue(uid, out var uo))
+        {
+            uo.Status = st;
+            uo.ActivityText = act;
+        }
+        else
+        {
+            Users[uid] = new DiscordUser { Id = uid, Status = st, ActivityText = act };
+        }
+        lock (Friends)
+        {
+            var fr = Friends.FirstOrDefault(f => f.UserId == uid);
+            if (fr != null)
+            {
+                fr.Status = st;
+                fr.ActivityText = act;
+            }
+        }
+    }
+
+    private void ParseSessionsReplace(JsonElement d)
+    {
+        if (d.ValueKind != JsonValueKind.Array) return;
+        foreach (var s in d.EnumerateArray())
+        {
+            string st = s.TryGetProperty("status", out var se) && se.ValueKind == JsonValueKind.String ? se.GetString() ?? "" : "";
+            if (!string.IsNullOrEmpty(st) && st != "offline")
+            {
+                Me.Status = st;
+                Me.ActivityText = ExtractActivitySummary(s);
+                break;
+            }
+        }
+        Notify();
+    }
+
+    private void ParseRelationshipAdd(JsonElement d)
+    {
+        int rtype = d.TryGetProperty("type", out var rt) ? rt.GetInt32() : 0;
+        string fuid = d.TryGetProperty("user_id", out var f1) ? f1.GetString() ?? "" : (d.TryGetProperty("id", out var f2) ? f2.GetString() ?? "" : "");
+        if (string.IsNullOrEmpty(fuid)) return;
+        if (rtype is not (1 or 3 or 4))
+        {
+            lock (Friends) Friends.RemoveAll(x => x.UserId == fuid);
+            Notify();
+            return;
+        }
+        string uname = "", dname = "", fav = "";
+        if (d.TryGetProperty("user", out var fu) && fu.ValueKind == JsonValueKind.Object)
+        {
+            uname = fu.TryGetProperty("username", out var un) ? un.GetString() ?? "" : "";
+            dname = fu.TryGetProperty("global_name", out var gn) && gn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gn.GetString()) ? gn.GetString()! : uname;
+            fav = fu.TryGetProperty("avatar", out var av) && av.ValueKind == JsonValueKind.String ? av.GetString() ?? "" : "";
+        }
+        else if (Users.TryGetValue(fuid, out var cu))
+        {
+            uname = cu.Username; dname = cu.DisplayName; fav = cu.Avatar;
+        }
+        string fst = Users.TryGetValue(fuid, out var u2) ? u2.Status : "offline";
+        string fact = Users.TryGetValue(fuid, out var u3) ? u3.ActivityText : "";
+        lock (Friends)
+        {
+            int idx = Friends.FindIndex(x => x.UserId == fuid);
+            var item = new DiscordFriend { UserId = fuid, Username = uname, DisplayName = string.IsNullOrEmpty(dname) ? uname : dname, Avatar = fav, Status = fst, ActivityText = fact, Type = rtype };
+            if (idx >= 0) Friends[idx] = item;
+            else Friends.Add(item);
+            SortFriendsList(Friends);
+        }
+        Notify();
+    }
+
+    private void ParseRelationshipRemove(JsonElement d)
+    {
+        string fuid = d.TryGetProperty("user_id", out var f1) ? f1.GetString() ?? "" : (d.TryGetProperty("id", out var f2) ? f2.GetString() ?? "" : "");
+        if (string.IsNullOrEmpty(fuid)) return;
+        lock (Friends) Friends.RemoveAll(x => x.UserId == fuid);
+        Notify();
+    }
+
+    public async Task AcceptFriendRequestAsync(string userId)
+    {
+        if (string.IsNullOrEmpty(userId)) return;
+        if (IsDemoMode)
+        {
+            lock (Friends)
+            {
+                var f = Friends.FirstOrDefault(x => x.UserId == userId);
+                if (f != null) f.Type = 1;
+            }
+            Notify();
+            return;
+        }
+        try
+        {
+            using var resp = await SendRestAsync(() =>
+            {
+                var r = new HttpRequestMessage(HttpMethod.Put, $"https://discord.com/api/v10/users/@me/relationships/{userId}");
+                r.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+                return r;
+            }, "AcceptFriend");
+        }
+        catch { }
+    }
+
+    public async Task RemoveRelationshipAsync(string userId)
+    {
+        if (string.IsNullOrEmpty(userId)) return;
+        if (IsDemoMode)
+        {
+            lock (Friends) Friends.RemoveAll(x => x.UserId == userId);
+            Notify();
+            return;
+        }
+        try
+        {
+            using var resp = await SendRestAsync(
+                () => new HttpRequestMessage(HttpMethod.Delete, $"https://discord.com/api/v10/users/@me/relationships/{userId}"),
+                "RemoveRelationship");
+        }
+        catch { }
+    }
+
+    private void ParseCallUpsert(JsonElement d)
+    {
+        string cid = d.TryGetProperty("channel_id", out var ce) ? ce.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(cid)) return;
+        var call = DmCalls.GetOrAdd(cid, _ => new DiscordCallState { ChannelId = cid });
+        if (d.TryGetProperty("message_id", out var me) && me.ValueKind == JsonValueKind.String) call.MessageId = me.GetString() ?? "";
+        if (d.TryGetProperty("region", out var re) && re.ValueKind == JsonValueKind.String) call.Region = re.GetString() ?? "";
+        lock (call)
+        {
+            call.Ringing.Clear();
+            if (d.TryGetProperty("ringing", out var rng) && rng.ValueKind == JsonValueKind.Array)
+                foreach (var r in rng.EnumerateArray())
+                    if (r.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(r.GetString()))
+                        call.Ringing.Add(r.GetString()!);
+
+            if (d.TryGetProperty("voice_states", out var vss) && vss.ValueKind == JsonValueKind.Array)
+            {
+                call.VoiceStates.Clear();
+                foreach (var vs in vss.EnumerateArray())
+                {
+                    var vm = ParseDmVoiceMember(cid, vs);
+                    if (vm != null) call.VoiceStates[vm.UserId] = vm;
+                }
+            }
+        }
+        if (Messages.TryGetValue(cid, out var mlist) && !string.IsNullOrEmpty(call.MessageId))
+        {
+            lock (mlist)
+            {
+                var cm = mlist.FirstOrDefault(x => x.Id == call.MessageId);
+                if (cm != null) cm.CallActive = true;
+            }
+        }
+        lock (DmChannels)
+        {
+            var dm = DmChannels.FirstOrDefault(x => x.Id == cid);
+            if (dm != null && !string.IsNullOrEmpty(call.MessageId))
+            {
+                dm.LastMessageId = call.MessageId;
+                SortDmChannelsLocked();
+            }
+        }
+        Notify();
+    }
+
+    private void ParseCallDelete(JsonElement d)
+    {
+        string cid = d.TryGetProperty("channel_id", out var ce) ? ce.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(cid)) return;
+        DmCalls.TryRemove(cid, out _);
+        if (Messages.TryGetValue(cid, out var mlist))
+        {
+            lock (mlist)
+            {
+                foreach (var m in mlist)
+                    if (m.MsgType == 3 && m.CallActive) m.CallActive = false;
+            }
+        }
+        if (_voiceChannelId == cid)
+        {
+            TearDownVoiceLocalOnly();
+            _voiceChannelId = "";
+            _voiceGuildId = "";
+        }
+        Notify();
+    }
+
+    private VoiceMember? ParseDmVoiceMember(string cid, JsonElement vs)
+    {
+        string vuid = vs.TryGetProperty("user_id", out var vu) ? vu.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(vuid)) return null;
+        string vcid = vs.TryGetProperty("channel_id", out var vc) && vc.ValueKind == JsonValueKind.String ? vc.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(vcid)) return null;
+        string uname = vuid == Me.Id ? Me.DisplayName : (Users.TryGetValue(vuid, out var uo) ? uo.DisplayName : ("User " + (vuid.Length >= 4 ? vuid[^4..] : vuid)));
+        string uav = vuid == Me.Id ? Me.Avatar : (Users.TryGetValue(vuid, out var u2) ? u2.Avatar : "");
+        return new VoiceMember
+        {
+            UserId = vuid,
+            ChannelId = cid,
+            Username = uname,
+            Avatar = uav,
+            SelfMute = vs.TryGetProperty("self_mute", out var sm) && sm.ValueKind == JsonValueKind.True,
+            SelfDeaf = vs.TryGetProperty("self_deaf", out var sd) && sd.ValueKind == JsonValueKind.True,
+            SelfStream = vs.TryGetProperty("self_stream", out var ss) && ss.ValueKind == JsonValueKind.True,
+        };
+    }
+
+    public List<VoiceMember> GetVoiceMembersSnapshot(string? guildId, string? channelId)
+    {
+        if (string.IsNullOrEmpty(channelId)) return [];
+        if (string.IsNullOrEmpty(guildId) || guildId == "@me")
+        {
+            if (DmCalls.TryGetValue(channelId, out var call))
+            {
+                lock (call) return [.. call.VoiceStates.Values];
+            }
+            return [];
+        }
+        DiscordGuild? g;
+        lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == guildId);
+        if (g == null) return [];
+        lock (g.VoiceStates) return g.VoiceStates.Values.Where(v => v.ChannelId == channelId).ToList();
+    }
+
+    public void SubscribeDmCall(string channelId)
+    {
+        if (IsDemoMode || string.IsNullOrEmpty(channelId) || _gw?.State != WebSocketState.Open) return;
+        _ = SendWsTextAsync(_gw, $"{{\"op\":13,\"d\":{{\"channel_id\":\"{channelId}\"}}}}", CancellationToken.None);
+    }
+
     private void ParseMessageCreate(JsonElement d)
     {
         var msg = ParseMessage(d);
@@ -1257,17 +1694,34 @@ public sealed class DiscordClient
         LocalCache.SaveMessages(msg.ChannelId, [msg]);
         if (!string.IsNullOrEmpty(msg.AuthorId) && !Users.ContainsKey(msg.AuthorId))
             Users[msg.AuthorId] = new DiscordUser { Id = msg.AuthorId, Username = msg.AuthorName, DisplayName = msg.AuthorName, Avatar = msg.AuthorAvatar };
-        if (d.TryGetProperty("guild_id", out var gEl) && gEl.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(msg.AuthorId))
+
+        bool isGuildMsg = d.TryGetProperty("guild_id", out var gEl) && gEl.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(gEl.GetString());
+        if (isGuildMsg && !string.IsNullOrEmpty(msg.AuthorId))
         {
             var mset = GuildMemberIds.GetOrAdd(gEl.GetString()!, _ => new HashSet<string>());
             lock (mset) mset.Add(msg.AuthorId);
         }
+        else if (!isGuildMsg)
+        {
+            // Bump DM / Group DM to the very top of DmChannels immediately on new message or call!
+            lock (DmChannels)
+            {
+                var dm = DmChannels.FirstOrDefault(x => x.Id == msg.ChannelId);
+                if (dm != null)
+                {
+                    dm.LastMessageId = msg.Id;
+                    if (msg.ChannelId != ActiveChannelId && msg.AuthorId != Me.Id) dm.MentionCount++;
+                    SortDmChannelsLocked();
+                }
+            }
+        }
+
         if (msg.ChannelId != ActiveChannelId && msg.AuthorId != Me.Id)
-            UnreadChannels[msg.ChannelId] = 1;
+            UnreadChannels.AddOrUpdate(msg.ChannelId, 1, (_, prev) => prev + 1);
         if (msg.AuthorId != Me.Id && (msg.ChannelId != ActiveChannelId || Shell.IsInVoiceStage))
             SoundFx.Play(UiSound.Message);
         if (msg.AuthorId != Me.Id && SettingsStore.Current.DesktopNotifications && !SettingsStore.Current.StreamerMode &&
-            W.GetForegroundWindow() != App.Hwnd)
+            (App.IsHiddenToTray || W.GetForegroundWindow() != App.Hwnd))
         {
             W.FlashWindow(App.Hwnd, true);
         }
@@ -1277,15 +1731,10 @@ public sealed class DiscordClient
 
     private void ParsePresenceUpdate(JsonElement d)
     {
-        string uid = d.TryGetProperty("user", out var u) && u.TryGetProperty("id", out var ie) ? ie.GetString() ?? "" : "";
-        string st = d.TryGetProperty("status", out var se) && se.ValueKind == JsonValueKind.String ? se.GetString() ?? "offline" : "offline";
+        var (uid, st, act) = ExtractPresenceTuple(d);
         if (string.IsNullOrEmpty(uid)) return;
-        if (Users.TryGetValue(uid, out var uo)) uo.Status = st;
-        lock (Friends)
-        {
-            var fr = Friends.FirstOrDefault(f => f.UserId == uid);
-            if (fr != null) fr.Status = st;
-        }
+        ApplyPresenceTuple(uid, st, act);
+        lock (Friends) SortFriendsList(Friends);
         Notify();
     }
 
@@ -1486,23 +1935,49 @@ public sealed class DiscordClient
         return 0xFF000000u | (((h & 0x7F) + 0x70) << 16) | ((((h >> 8) & 0x7F) + 0x70) << 8) | (((h >> 16) & 0x7F) + 0x70);
     }
 
+    private static string FormatCallDurationRu(TimeSpan dur)
+    {
+        if (dur.TotalSeconds < 60) return "несколько секунд";
+        if (dur.TotalMinutes < 60)
+        {
+            int m = Math.Max(1, (int)Math.Round(dur.TotalMinutes));
+            int mod10 = m % 10, mod100 = m % 100;
+            string unit = (mod10 == 1 && mod100 != 11) ? "минута" : (mod10 is >= 2 and <= 4 && (mod100 < 10 || mod100 >= 20) ? "минуты" : "минут");
+            return $"{m} {unit}";
+        }
+        int h = Math.Max(1, (int)Math.Round(dur.TotalHours));
+        if (h == 1) return "час";
+        int hm10 = h % 10, hm100 = h % 100;
+        string hUnit = (hm10 == 1 && hm100 != 11) ? "час" : (hm10 is >= 2 and <= 4 && (hm100 < 10 || hm100 >= 20) ? "часа" : "часов");
+        return $"{h} {hUnit}";
+    }
+
     private static DiscordMessage ParseMessage(JsonElement d)
     {
+        int mtype = d.TryGetProperty("type", out var mte) && mte.ValueKind == JsonValueKind.Number ? mte.GetInt32() : 0;
         var msg = new DiscordMessage
         {
             Id = d.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
             ChannelId = d.TryGetProperty("channel_id", out var cid) ? cid.GetString() ?? "" : "",
             Content = d.TryGetProperty("content", out var cnt) ? cnt.GetString() ?? "" : "",
+            MsgType = mtype,
             IsEdited = d.TryGetProperty("edited_timestamp", out var et) && et.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(et.GetString()),
         };
+        DateTimeOffset msgDto = default;
+        bool hasMsgDto = false;
         if (d.TryGetProperty("timestamp", out var ts) && ts.ValueKind == JsonValueKind.String)
         {
-            if (DateTimeOffset.TryParse(ts.GetString(), out var dto))
+            if (DateTimeOffset.TryParse(ts.GetString(), out msgDto))
             {
-                var loc = dto.ToLocalTime();
+                hasMsgDto = true;
+                var loc = msgDto.ToLocalTime();
                 msg.Timestamp = loc.Date == DateTime.Now.Date ? loc.ToString("HH:mm") : loc.ToString("dd.MM HH:mm");
+                msg.DateLabel = DiscordMessage.FormatRussianDate(loc.DateTime);
             }
         }
+        if (string.IsNullOrEmpty(msg.DateLabel))
+            msg.DateLabel = DiscordMessage.DateLabelFromSnowflake(msg.Id);
+
         if (d.TryGetProperty("author", out var au))
         {
             msg.AuthorId = au.TryGetProperty("id", out var aid) ? aid.GetString() ?? "" : "";
@@ -1512,28 +1987,134 @@ public sealed class DiscordClient
                 : (au.TryGetProperty("username", out var un) ? un.GetString() ?? "User" : "User");
             msg.AuthorColor = ComputeAuthorColor(!string.IsNullOrEmpty(msg.AuthorId) ? msg.AuthorId : msg.AuthorName);
         }
-        if (string.IsNullOrEmpty(msg.Content) && d.TryGetProperty("sticker_items", out var stks) && stks.ValueKind == JsonValueKind.Array && stks.GetArrayLength() > 0)
+
+        // Parse Discord Call Messages (type == 3) & System Messages (type == 1,2,4..11) so they NEVER render blank!
+        if (mtype == 3)
         {
-            string sname = stks[0].TryGetProperty("name", out var sn) && sn.ValueKind == JsonValueKind.String ? sn.GetString() ?? "стикер" : "стикер";
-            msg.Content = $"[Стикер: {sname}]";
-        }
-        if (d.TryGetProperty("attachments", out var atts) && atts.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var a in atts.EnumerateArray())
+            bool participated = msg.AuthorId == Instance.Me.Id;
+            bool ended = false;
+            TimeSpan callDur = TimeSpan.Zero;
+            if (d.TryGetProperty("call", out var callEl) && callEl.ValueKind == JsonValueKind.Object)
             {
-                string url = a.TryGetProperty("url", out var uel) && uel.ValueKind == JsonValueKind.String ? uel.GetString()! : "";
-                if (string.IsNullOrEmpty(url)) continue;
-                string fname = a.TryGetProperty("filename", out var fn) && fn.ValueKind == JsonValueKind.String ? fn.GetString()! : Path.GetFileName(url.Split('?')[0]);
-                long fsz = a.TryGetProperty("size", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0;
-                string ct = a.TryGetProperty("content_type", out var cte) && cte.ValueKind == JsonValueKind.String ? cte.GetString()! : "";
-                bool isImg = ct.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
-                             url.Contains(".png", StringComparison.OrdinalIgnoreCase) || url.Contains(".jpg", StringComparison.OrdinalIgnoreCase) ||
-                             url.Contains(".jpeg", StringComparison.OrdinalIgnoreCase) || url.Contains(".webp", StringComparison.OrdinalIgnoreCase) ||
-                             url.Contains(".gif", StringComparison.OrdinalIgnoreCase) || url.Contains(".bmp", StringComparison.OrdinalIgnoreCase);
-                msg.AttachmentUrls.Add(url);
-                msg.Attachments.Add(new DiscordAttachment { Url = url, Filename = fname, Size = fsz, IsImage = isImg });
+                if (callEl.TryGetProperty("participants", out var parts) && parts.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var p in parts.EnumerateArray())
+                        if (p.ValueKind == JsonValueKind.String && p.GetString() == Instance.Me.Id)
+                            participated = true;
+                }
+                if (callEl.TryGetProperty("ended_timestamp", out var endEl) && endEl.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(endEl.GetString()))
+                {
+                    ended = true;
+                    if (hasMsgDto && DateTimeOffset.TryParse(endEl.GetString(), out var endDto) && endDto > msgDto)
+                        callDur = endDto - msgDto;
+                }
+            }
+            else
+            {
+                ended = true;
+            }
+
+            if (!ended)
+            {
+                msg.CallActive = true;
+                msg.CallMissed = false;
+                msg.Content = $"{msg.AuthorName} начинает звонок.";
+            }
+            else
+            {
+                msg.CallActive = false;
+                msg.CallMissed = !participated;
+                string durStr = FormatCallDurationRu(callDur);
+                msg.Content = participated
+                    ? $"{msg.AuthorName} начал звонок продолжительностью {durStr}."
+                    : $"Вы пропустили звонок от {msg.AuthorName}, который длился {durStr}.";
             }
         }
+        else if (mtype is 1 or 2)
+        {
+            string targetName = "участника";
+            string targetId = "";
+            if (d.TryGetProperty("mentions", out var ments) && ments.ValueKind == JsonValueKind.Array && ments.GetArrayLength() > 0)
+            {
+                var m0 = ments[0];
+                targetId = m0.TryGetProperty("id", out var mid) ? mid.GetString() ?? "" : "";
+                targetName = m0.TryGetProperty("global_name", out var mgn) && mgn.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(mgn.GetString())
+                    ? mgn.GetString()! : (m0.TryGetProperty("username", out var mun) ? mun.GetString() ?? targetName : targetName);
+            }
+            msg.Content = mtype == 1
+                ? $"{msg.AuthorName} добавил(а) {targetName} в группу."
+                : (targetId == msg.AuthorId ? $"{msg.AuthorName} покинул(а) группу." : $"{msg.AuthorName} удалил(а) {targetName} из группы.");
+        }
+        else if (mtype == 4)
+        {
+            msg.Content = $"{msg.AuthorName} изменил(а) название чата: «{msg.Content}».";
+        }
+        else if (mtype == 5)
+        {
+            msg.Content = $"{msg.AuthorName} изменил(а) значок группы.";
+        }
+        else if (mtype == 6)
+        {
+            msg.Content = $"{msg.AuthorName} закрепил(а) сообщение в этом канале.";
+        }
+        else if (mtype == 7)
+        {
+            msg.Content = $"{msg.AuthorName} присоединился(-ась) к серверу.";
+        }
+        else if (mtype is 8 or 9 or 10 or 11)
+        {
+            msg.Content = $"{msg.AuthorName} забустил(а) сервер!";
+        }
+
+        // Forwarded messages (Discord message_snapshots)
+        if (d.TryGetProperty("message_snapshots", out var snaps) && snaps.ValueKind == JsonValueKind.Array && snaps.GetArrayLength() > 0)
+        {
+            var s0 = snaps[0];
+            if (s0.TryGetProperty("message", out var sm) && sm.ValueKind == JsonValueKind.Object)
+            {
+                string sc = sm.TryGetProperty("content", out var scnt) && scnt.ValueKind == JsonValueKind.String ? scnt.GetString() ?? "" : "";
+                if (!string.IsNullOrEmpty(sc))
+                    msg.Content = string.IsNullOrEmpty(msg.Content) ? $"↪ Переслано:\n{sc}" : $"{msg.Content}\n↪ Переслано:\n{sc}";
+                else if (string.IsNullOrEmpty(msg.Content))
+                    msg.Content = "↪ Пересланное сообщение";
+
+                if (sm.TryGetProperty("attachments", out var satts) && satts.ValueKind == JsonValueKind.Array)
+                    ParseAttachmentsElement(satts, msg);
+                if (sm.TryGetProperty("embeds", out var sembs) && sembs.ValueKind == JsonValueKind.Array)
+                {
+                    var embList = msg.Embeds.ToList();
+                    ParseEmbeds(sembs, embList);
+                    msg.Embeds = [.. embList];
+                }
+                if (sm.TryGetProperty("sticker_items", out var sstks) && sstks.ValueKind == JsonValueKind.Array)
+                    ParseStickersElement(sstks, msg);
+            }
+        }
+
+        // Polls (Discord poll object)
+        if (d.TryGetProperty("poll", out var pollEl) && pollEl.ValueKind == JsonValueKind.Object)
+        {
+            string qTxt = pollEl.TryGetProperty("question", out var pq) && pq.ValueKind == JsonValueKind.Object && pq.TryGetProperty("text", out var pqt)
+                ? pqt.GetString() ?? "Опрос" : "Опрос";
+            var sbPoll = new StringBuilder();
+            if (!string.IsNullOrEmpty(msg.Content)) sbPoll.AppendLine(msg.Content);
+            sbPoll.Append("📊 Опрос: ").Append(qTxt);
+            if (pollEl.TryGetProperty("answers", out var ans) && ans.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var a in ans.EnumerateArray())
+                {
+                    if (a.TryGetProperty("poll_media", out var pm) && pm.ValueKind == JsonValueKind.Object && pm.TryGetProperty("text", out var pmt))
+                        sbPoll.Append("\n  • ").Append(pmt.GetString());
+                }
+            }
+            msg.Content = sbPoll.ToString();
+        }
+
+        if (d.TryGetProperty("sticker_items", out var stks) && stks.ValueKind == JsonValueKind.Array && stks.GetArrayLength() > 0)
+            ParseStickersElement(stks, msg);
+
+        if (d.TryGetProperty("attachments", out var atts) && atts.ValueKind == JsonValueKind.Array)
+            ParseAttachmentsElement(atts, msg);
         if (d.TryGetProperty("embeds", out var embs) && embs.ValueKind == JsonValueKind.Array)
         {
             var embList = new List<DiscordEmbed>();
@@ -1567,6 +2148,47 @@ public sealed class DiscordClient
         }
         msg.Content = ResolveMentions(msg.Content);
         return msg;
+    }
+
+    private static void ParseAttachmentsElement(JsonElement atts, DiscordMessage msg)
+    {
+        foreach (var a in atts.EnumerateArray())
+        {
+            string url = a.TryGetProperty("url", out var uel) && uel.ValueKind == JsonValueKind.String ? uel.GetString()! : "";
+            if (string.IsNullOrEmpty(url)) continue;
+            string fname = a.TryGetProperty("filename", out var fn) && fn.ValueKind == JsonValueKind.String ? fn.GetString()! : Path.GetFileName(url.Split('?')[0]);
+            long fsz = a.TryGetProperty("size", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0;
+            string ct = a.TryGetProperty("content_type", out var cte) && cte.ValueKind == JsonValueKind.String ? cte.GetString()! : "";
+            if (a.TryGetProperty("duration_secs", out var dse) && dse.ValueKind == JsonValueKind.Number)
+                fname = $"🎤 Голосовое сообщение ({dse.GetDouble():F0} сек) — {fname}";
+            bool isImg = ct.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+                         url.Contains(".png", StringComparison.OrdinalIgnoreCase) || url.Contains(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                         url.Contains(".jpeg", StringComparison.OrdinalIgnoreCase) || url.Contains(".webp", StringComparison.OrdinalIgnoreCase) ||
+                         url.Contains(".gif", StringComparison.OrdinalIgnoreCase) || url.Contains(".bmp", StringComparison.OrdinalIgnoreCase);
+            msg.AttachmentUrls.Add(url);
+            msg.Attachments.Add(new DiscordAttachment { Url = url, Filename = fname, Size = fsz, IsImage = isImg });
+        }
+    }
+
+    private static void ParseStickersElement(JsonElement stks, DiscordMessage msg)
+    {
+        foreach (var st in stks.EnumerateArray())
+        {
+            string sid = st.TryGetProperty("id", out var sie) ? sie.GetString() ?? "" : "";
+            string sname = st.TryGetProperty("name", out var sn) && sn.ValueKind == JsonValueKind.String ? sn.GetString() ?? "стикер" : "стикер";
+            int fmt = st.TryGetProperty("format_type", out var fe) && fe.ValueKind == JsonValueKind.Number ? fe.GetInt32() : 1;
+            if (!string.IsNullOrEmpty(sid) && fmt is 1 or 2 or 4)
+            {
+                string ext = fmt == 4 ? "gif" : "png";
+                string surl = $"https://media.discordapp.net/stickers/{sid}.{ext}?size=160";
+                msg.AttachmentUrls.Add(surl);
+                msg.Attachments.Add(new DiscordAttachment { Url = surl, Filename = sname, IsImage = true });
+            }
+            else if (string.IsNullOrEmpty(msg.Content))
+            {
+                msg.Content = $"[Стикер: {sname}]";
+            }
+        }
     }
 
     public async Task LoadOlderMessagesAsync(string channelId)
@@ -1612,6 +2234,34 @@ public sealed class DiscordClient
     {
         if (string.IsNullOrEmpty(channelId)) return;
         UnreadChannels.TryRemove(channelId, out _);
+        bool isDmChannel = false;
+        lock (DmChannels)
+        {
+            var dm = DmChannels.FirstOrDefault(x => x.Id == channelId);
+            if (dm != null) { dm.MentionCount = 0; isDmChannel = true; }
+        }
+        if (!isDmChannel)
+        {
+            lock (Guilds)
+            {
+                foreach (var g in Guilds)
+                {
+                    var gc = g.Channels.FirstOrDefault(x => x.Id == channelId);
+                    if (gc != null && gc.MentionCount > 0)
+                    {
+                        g.MentionCount = Math.Max(0, g.MentionCount - gc.MentionCount);
+                        gc.MentionCount = 0;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Subscribe to live CALL_CREATE / voice_states for this DM / Group DM just like Official Discord!
+            SubscribeDmCall(channelId);
+        }
+
         if (!Messages.ContainsKey(channelId))
         {
             var cached = LocalCache.LoadMessages(channelId, 50);
@@ -2320,7 +2970,8 @@ public sealed class DiscordClient
     public async Task UpdateVoiceSelfStateAsync(bool selfMute, bool selfDeaf)
     {
         bool effMute = selfMute || selfDeaf;
-        if (!string.IsNullOrEmpty(_voiceGuildId))
+        bool isDm = string.IsNullOrEmpty(_voiceGuildId) || _voiceGuildId == "@me";
+        if (!isDm)
         {
             DiscordGuild? g;
             lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
@@ -2336,13 +2987,25 @@ public sealed class DiscordClient
                 }
             }
         }
-        if (IsDemoMode || _gw?.State != WebSocketState.Open || string.IsNullOrEmpty(_voiceGuildId) || string.IsNullOrEmpty(_voiceChannelId))
+        else if (!string.IsNullOrEmpty(_voiceChannelId) && DmCalls.TryGetValue(_voiceChannelId, out var call))
+        {
+            lock (call)
+            {
+                if (call.VoiceStates.TryGetValue(Me.Id, out var vm))
+                {
+                    vm.SelfMute = effMute;
+                    vm.SelfDeaf = selfDeaf;
+                }
+            }
+        }
+        if (IsDemoMode || _gw?.State != WebSocketState.Open || string.IsNullOrEmpty(_voiceChannelId))
             return;
         try
         {
             string sm = effMute ? "true" : "false";
             string sd = selfDeaf ? "true" : "false";
-            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{_voiceGuildId}\",\"channel_id\":\"{_voiceChannelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}";
+            string gidJson = isDm ? "null" : $"\"{_voiceGuildId}\"";
+            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":{gidJson},\"channel_id\":\"{_voiceChannelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}";
             await SendWsTextAsync(_gw, json, CancellationToken.None);
         }
         catch { }
@@ -2378,17 +3041,17 @@ public sealed class DiscordClient
         FocusedStreamUserId = null;
     }
 
-    public async Task JoinVoiceAsync(string guildId, string channelId, bool selfMute = false, bool selfDeaf = false)
+    public async Task JoinVoiceAsync(string guildId, string channelId, bool selfMute = false, bool selfDeaf = false, bool ringIfEmpty = false)
     {
-        // When moving directly between voice channels in the SAME guild, do NOT send OP 4 channel_id:null first
-        // (that creates a race where Discord echoes null back and tears down the new channel!).
-        bool sameGuildSwitch = !string.IsNullOrEmpty(_voiceGuildId) && _voiceGuildId == guildId && !string.IsNullOrEmpty(_voiceChannelId);
-        if (sameGuildSwitch)
+        bool isDm = string.IsNullOrEmpty(guildId) || guildId == "@me";
+        string normGuild = isDm ? "@me" : guildId;
+        bool sameScopeSwitch = !string.IsNullOrEmpty(_voiceGuildId) && _voiceGuildId == normGuild && !string.IsNullOrEmpty(_voiceChannelId);
+        if (sameScopeSwitch)
             TearDownVoiceLocalOnly();
         else
             LeaveVoice();
 
-        _voiceGuildId = guildId;
+        _voiceGuildId = normGuild;
         _voiceChannelId = channelId;
 
         var s = SettingsStore.Current;
@@ -2406,19 +3069,47 @@ public sealed class DiscordClient
             VoiceStatus = "Голосовая связь подключена";
             VoiceEndpointHost = "c-ams13-turbo";
             RecordVoicePing(28);
+            if (isDm)
+            {
+                var call = DmCalls.GetOrAdd(channelId, _ => new DiscordCallState { ChannelId = channelId });
+                lock (call) call.VoiceStates[Me.Id] = new VoiceMember { UserId = Me.Id, ChannelId = channelId, Username = Me.DisplayName, Avatar = Me.Avatar, SelfMute = effMute, SelfDeaf = selfDeaf };
+            }
             SoundFx.Play(UiSound.VoiceJoin);
             Notify();
             return;
         }
 
-        VoiceStatus = "Подключение к голосу...";
+        VoiceStatus = isDm ? "Подключение к звонку..." : "Подключение к голосу...";
         Notify();
         if (_gw?.State == WebSocketState.Open)
         {
+            if (isDm) SubscribeDmCall(channelId);
             string sm = (selfMute || selfDeaf) ? "true" : "false";
             string sd = selfDeaf ? "true" : "false";
-            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{guildId}\",\"channel_id\":\"{channelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}";
+            string gidJson = isDm ? "null" : $"\"{guildId}\"";
+            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":{gidJson},\"channel_id\":\"{channelId}\",\"self_mute\":{sm},\"self_deaf\":{sd}}}}}";
             await SendWsTextAsync(_gw, json, CancellationToken.None);
+
+            if (isDm && ringIfEmpty)
+            {
+                bool othersAlreadyInCall = DmCalls.TryGetValue(channelId, out var c) && c.VoiceStates.Keys.Any(k => k != Me.Id);
+                if (!othersAlreadyInCall)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            using var resp = await SendRestAsync(() =>
+                            {
+                                var r = new HttpRequestMessage(HttpMethod.Post, $"https://discord.com/api/v9/channels/{channelId}/call/ring");
+                                r.Content = new StringContent("{\"recipients\":null}", Encoding.UTF8, "application/json");
+                                return r;
+                            }, "RingDmCall");
+                        }
+                        catch { }
+                    });
+                }
+            }
         }
     }
 
@@ -2426,12 +3117,19 @@ public sealed class DiscordClient
     {
         bool wasConnected = VoiceConnected || !string.IsNullOrEmpty(_voiceChannelId);
         string prevGuild = _voiceGuildId;
+        string prevChan = _voiceChannelId;
         if (wasConnected) SoundFx.Play(UiSound.VoiceLeave);
 
-        if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(prevGuild))
+        if (!IsDemoMode && _gw?.State == WebSocketState.Open && !string.IsNullOrEmpty(prevChan))
         {
-            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":\"{prevGuild}\",\"channel_id\":null,\"self_mute\":false,\"self_deaf\":false}}}}";
+            bool isDm = string.IsNullOrEmpty(prevGuild) || prevGuild == "@me";
+            string gidJson = isDm ? "null" : $"\"{prevGuild}\"";
+            string json = $"{{\"op\":4,\"d\":{{\"guild_id\":{gidJson},\"channel_id\":null,\"self_mute\":false,\"self_deaf\":false}}}}";
             _ = SendWsTextAsync(_gw, json, CancellationToken.None);
+        }
+        if ((string.IsNullOrEmpty(prevGuild) || prevGuild == "@me") && !string.IsNullOrEmpty(prevChan) && DmCalls.TryGetValue(prevChan, out var dmCall))
+        {
+            lock (dmCall) dmCall.VoiceStates.Remove(Me.Id);
         }
         TearDownVoiceLocalOnly();
         _voiceGuildId = "";
@@ -2441,6 +3139,33 @@ public sealed class DiscordClient
 
     private void ParseReadySupplemental(JsonElement d)
     {
+        // 1. Parse merged_presences (friends + guilds) — Discord v9/v10 sends ALL initial online statuses & custom statuses here!
+        if (d.TryGetProperty("merged_presences", out var mp) && mp.ValueKind == JsonValueKind.Object)
+        {
+            if (mp.TryGetProperty("friends", out var fpres) && fpres.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var pr in fpres.EnumerateArray())
+                {
+                    var (uid, st, act) = ExtractPresenceTuple(pr);
+                    if (!string.IsNullOrEmpty(uid)) ApplyPresenceTuple(uid, st, act);
+                }
+            }
+            if (mp.TryGetProperty("guilds", out var gpres) && gpres.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var gArr in gpres.EnumerateArray())
+                {
+                    if (gArr.ValueKind != JsonValueKind.Array) continue;
+                    foreach (var pr in gArr.EnumerateArray())
+                    {
+                        var (uid, st, act) = ExtractPresenceTuple(pr);
+                        if (!string.IsNullOrEmpty(uid)) ApplyPresenceTuple(uid, st, act);
+                    }
+                }
+            }
+            lock (Friends) SortFriendsList(Friends);
+        }
+
+        // 2. Parse initial guild voice_states
         if (d.TryGetProperty("guilds", out var gs) && gs.ValueKind == JsonValueKind.Array)
         {
             foreach (var gEl in gs.EnumerateArray())
@@ -2452,8 +3177,8 @@ public sealed class DiscordClient
                 if (gEl.TryGetProperty("voice_states", out var vss) && vss.ValueKind == JsonValueKind.Array)
                     foreach (var vs in vss.EnumerateArray()) UpsertVoiceState(g, vs, emitSounds: false, allowFetch: false);
             }
-            Notify();
         }
+        Notify();
     }
 
     private void UpsertVoiceState(DiscordGuild g, JsonElement vs, bool emitSounds = false, bool allowFetch = true)
@@ -2601,13 +3326,51 @@ public sealed class DiscordClient
     {
         string gid = d.TryGetProperty("guild_id", out var gEl) && gEl.ValueKind == JsonValueKind.String ? gEl.GetString() ?? "" : "";
         string vcid = d.TryGetProperty("channel_id", out var cEl) && cEl.ValueKind == JsonValueKind.String ? cEl.GetString() ?? "" : "";
+        string uid = d.TryGetProperty("user_id", out var u) ? u.GetString() ?? "" : "";
+
         if (!string.IsNullOrEmpty(gid))
         {
             DiscordGuild? g;
             lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == gid);
             if (g != null) { UpsertVoiceState(g, d, emitSounds: true); Notify(); }
         }
-        string uid = d.TryGetProperty("user_id", out var u) ? u.GetString() ?? "" : "";
+        else if (!string.IsNullOrEmpty(uid))
+        {
+            // Private DM / Group DM call voice_state update (guild_id == null)
+            if (string.IsNullOrEmpty(vcid))
+            {
+                foreach (var kv in DmCalls)
+                {
+                    bool removed = false;
+                    lock (kv.Value) removed = kv.Value.VoiceStates.Remove(uid);
+                    if (removed)
+                    {
+                        if (IsWatchingStream(uid)) StopWatchingStream(uid);
+                        if (VoiceConnected && uid != Me.Id && kv.Key == _voiceChannelId) SoundFx.Play(UiSound.UserLeave);
+                    }
+                }
+            }
+            else
+            {
+                var call = DmCalls.GetOrAdd(vcid, _ => new DiscordCallState { ChannelId = vcid });
+                bool wasIn = false;
+                lock (call)
+                {
+                    wasIn = call.VoiceStates.ContainsKey(uid);
+                    var vm = ParseDmVoiceMember(vcid, d);
+                    if (vm != null)
+                    {
+                        if (!vm.SelfStream && IsWatchingStream(uid)) StopWatchingStream(uid);
+                        call.VoiceStates[uid] = vm;
+                    }
+                    call.Ringing.Remove(uid);
+                }
+                if (!wasIn && VoiceConnected && uid != Me.Id && vcid == _voiceChannelId)
+                    SoundFx.Play(UiSound.UserJoin);
+            }
+            Notify();
+        }
+
         if (uid == Me.Id)
         {
             if (string.IsNullOrEmpty(vcid))
@@ -2621,7 +3384,7 @@ public sealed class DiscordClient
                 return;
             }
             _voiceChannelId = vcid;
-            if (!string.IsNullOrEmpty(gid)) _voiceGuildId = gid;
+            _voiceGuildId = string.IsNullOrEmpty(gid) ? "@me" : gid;
             _voiceSessionId = d.TryGetProperty("session_id", out var sid) ? sid.GetString() ?? "" : "";
             TryStartVoiceGateway();
         }
@@ -2665,16 +3428,8 @@ public sealed class DiscordClient
 
     private void SeedVoiceDaveUsers()
     {
-        DiscordGuild? g;
-        lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
-        if (g != null)
-        {
-            lock (g.VoiceStates)
-            {
-                foreach (var vm in g.VoiceStates.Values)
-                    if (vm.ChannelId == _voiceChannelId) MediaNative.fc_dave_add_user(vm.UserId);
-            }
-        }
+        foreach (var vm in GetVoiceMembersSnapshot(_voiceGuildId, _voiceChannelId))
+            MediaNative.fc_dave_add_user(vm.UserId);
         foreach (var kv in _userToSsrc)
         {
             MediaNative.fc_dave_add_user(kv.Key);
@@ -2685,32 +3440,16 @@ public sealed class DiscordClient
     private void SeedPubDaveUsers()
     {
         MediaNative.fc_pub_dave_add_user(Me.Id);
-        DiscordGuild? g;
-        lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
-        if (g != null)
-        {
-            lock (g.VoiceStates)
-            {
-                foreach (var vm in g.VoiceStates.Values)
-                    if (vm.ChannelId == _voiceChannelId) MediaNative.fc_pub_dave_add_user(vm.UserId);
-            }
-        }
+        foreach (var vm in GetVoiceMembersSnapshot(_voiceGuildId, _voiceChannelId))
+            MediaNative.fc_pub_dave_add_user(vm.UserId);
     }
 
     private void SeedWatchDaveUsers(WatchSession ws)
     {
         MediaNative.fc_watch_dave_add_user_slot(ws.Slot, ws.StreamerUserId);
         MediaNative.fc_watch_dave_add_user_slot(ws.Slot, Me.Id);
-        DiscordGuild? g;
-        lock (Guilds) g = Guilds.FirstOrDefault(x => x.Id == _voiceGuildId);
-        if (g != null)
-        {
-            lock (g.VoiceStates)
-            {
-                foreach (var vm in g.VoiceStates.Values)
-                    if (vm.ChannelId == _voiceChannelId) MediaNative.fc_watch_dave_add_user_slot(ws.Slot, vm.UserId);
-            }
-        }
+        foreach (var vm in GetVoiceMembersSnapshot(_voiceGuildId, _voiceChannelId))
+            MediaNative.fc_watch_dave_add_user_slot(ws.Slot, vm.UserId);
     }
 
     private void TryStartVoiceGateway()
@@ -2733,7 +3472,9 @@ public sealed class DiscordClient
             try
             {
                 await gw.ConnectAsync(new Uri($"wss://{_voiceEndpoint}/?v=8"), ct);
-                string identify = $"{{\"op\":0,\"d\":{{\"server_id\":\"{_voiceGuildId}\",\"user_id\":\"{Me.Id}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{_voiceToken}\",\"max_dave_protocol_version\":1}}}}";
+                // Discord RTC spec: Guild Voice uses server_id = guild_id; DM / Group DM Call uses server_id = channel_id!
+                string rtcServerId = (string.IsNullOrEmpty(_voiceGuildId) || _voiceGuildId == "@me") ? _voiceChannelId : _voiceGuildId;
+                string identify = $"{{\"op\":0,\"d\":{{\"server_id\":\"{rtcServerId}\",\"user_id\":\"{Me.Id}\",\"session_id\":\"{_voiceSessionId}\",\"token\":\"{_voiceToken}\",\"max_dave_protocol_version\":1}}}}";
                 await SendWsTextAsync(gw, identify, ct);
                 SettingsStore.Log($"VoiceGW connecting to {_voiceEndpoint} (DAVE v1)");
 
@@ -3071,10 +3812,11 @@ public sealed class DiscordClient
                 _watches.Remove(oldest.StreamerUserId);
             }
 
+            bool isDmStream = string.IsNullOrEmpty(guildId) || guildId == "@me";
             ws = new WatchSession
             {
                 Slot = freeSlot,
-                StreamKey = $"guild:{guildId}:{channelId}:{streamerUserId}",
+                StreamKey = isDmStream ? $"call:{channelId}:{streamerUserId}" : $"guild:{guildId}:{channelId}:{streamerUserId}",
                 StreamerUserId = streamerUserId,
                 StreamerName = streamerName,
                 Status = $"Подключение к стриму {streamerName}..."
@@ -3138,7 +3880,7 @@ public sealed class DiscordClient
     {
         StopPublishingGoLive();
         _pubWidth = width; _pubHeight = height; _pubFps = fps; _pubIsDualScreen = isDualScreen;
-        if (IsDemoMode || !VoiceConnected || string.IsNullOrEmpty(_voiceGuildId) || string.IsNullOrEmpty(_voiceChannelId))
+        if (IsDemoMode || !VoiceConnected || string.IsNullOrEmpty(_voiceChannelId))
         {
             IsPublishingStream = true;
             PublishStatus = isDualScreen ? $"Локально: 2 Экрана {width}×{height}" : "Локальный 4K Zero-Copy";
@@ -3146,7 +3888,8 @@ public sealed class DiscordClient
             return;
         }
 
-        _pubStreamKey = $"guild:{_voiceGuildId}:{_voiceChannelId}:{Me.Id}";
+        bool isDmCall = string.IsNullOrEmpty(_voiceGuildId) || _voiceGuildId == "@me";
+        _pubStreamKey = isDmCall ? $"call:{_voiceChannelId}:{Me.Id}" : $"guild:{_voiceGuildId}:{_voiceChannelId}:{Me.Id}";
         IsPublishingStream = true;
         PublishStatus = isDualScreen ? "Запуск Go Live (2 Экрана)..." : "Запуск Go Live...";
         Notify();
@@ -3157,9 +3900,12 @@ public sealed class DiscordClient
                 ? SettingsStore.Current.PreferredRtcRegion
                 : BestRtcRegion;
             string prefJson = string.IsNullOrEmpty(pref) ? "null" : $"\"{pref}\"";
-            await SendWsTextAsync(_gw, $"{{\"op\":18,\"d\":{{\"type\":\"guild\",\"guild_id\":\"{_voiceGuildId}\",\"channel_id\":\"{_voiceChannelId}\",\"preferred_region\":{prefJson}}}}}", CancellationToken.None);
+            string op18 = isDmCall
+                ? $"{{\"op\":18,\"d\":{{\"type\":\"call\",\"guild_id\":null,\"channel_id\":\"{_voiceChannelId}\",\"preferred_region\":{prefJson}}}}}"
+                : $"{{\"op\":18,\"d\":{{\"type\":\"guild\",\"guild_id\":\"{_voiceGuildId}\",\"channel_id\":\"{_voiceChannelId}\",\"preferred_region\":{prefJson}}}}}";
+            await SendWsTextAsync(_gw, op18, CancellationToken.None);
             await SendWsTextAsync(_gw, $"{{\"op\":22,\"d\":{{\"stream_key\":\"{_pubStreamKey}\",\"paused\":false}}}}", CancellationToken.None);
-            SettingsStore.Log($"Sent OP 18 STREAM_CREATE (region={prefJson}) + OP 22 unpaused: {_pubStreamKey} ({width}x{height}@{fps} dual={isDualScreen})");
+            SettingsStore.Log($"Sent OP 18 STREAM_CREATE (dm={isDmCall}, region={prefJson}) + OP 22 unpaused: {_pubStreamKey} ({width}x{height}@{fps} dual={isDualScreen})");
         }
     }
 

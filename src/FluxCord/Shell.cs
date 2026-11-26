@@ -25,6 +25,8 @@ public static unsafe partial class Shell
     internal const string IcMin = "\ue11e";
     internal const string IcMonitor = "\ue120";
     internal const string IcMonitorOff = "\ue1db";
+    internal const string IcPhoneCall = "\ue138";
+    internal const string IcPhoneMissed = "\ue13a";
     internal const string IcPhoneOff = "\ue13b";
     internal const string IcPlus = "\ue140";
     internal const string IcRefresh = "\ue148";
@@ -135,6 +137,25 @@ public static unsafe partial class Shell
         if (s.Length >= 2 && char.IsHighSurrogate(s[0]) && char.IsLowSurrogate(s[1]))
             return s[..2];
         return s[..1].ToUpperInvariant();
+    }
+
+    internal static string PluralizeMembers(int n)
+    {
+        int m10 = n % 10, m100 = n % 100;
+        if (m10 == 1 && m100 != 11) return "участник";
+        if (m10 is >= 2 and <= 4 && (m100 < 10 || m100 >= 20)) return "участника";
+        return "участников";
+    }
+
+    private static void DrawRedBadge(float rightX, float bottomY, int count, uint borderBg)
+    {
+        if (count <= 0) return;
+        string txt = count > 99 ? "99+" : count.ToString();
+        float w = MathF.Max(18f, Gfx.MeasureText(txt, 10.5f, 800, 48).W + 10f);
+        var br = new R(rightX - w, bottomY - 18f, w, 18f);
+        Gfx.FillRect(br.Inset(-2f), borderBg, 10f);
+        Gfx.FillRect(br, Th.Red, 9f);
+        Gfx.DrawText(txt, new R(br.X, br.Y + 2f, br.W, 14f), 10.5f, 0xFFFFFFFF, 800, 1);
     }
 
     internal static void SwitchToChannel(string guildId, string channelId, bool showFriends = false)
@@ -375,21 +396,13 @@ public static unsafe partial class Shell
             dc.UpdateLocalSpeaking(dc.VoiceConnected && selfSpk, _localVoiceLevel);
             if (selfSpk != _prevLocalSpkPoll || selfSpk) { _prevLocalSpkPoll = selfSpk; needRedraw = true; }
 
-            // Check if any peer speaking state changed
+            // Check if any peer speaking state changed (Guild Voice OR DM / Group DM Call!)
             int peerHash = 0;
             if (dc.VoiceConnected)
             {
-                DiscordGuild? vg;
-                lock (dc.Guilds) vg = dc.Guilds.FirstOrDefault(x => x.Id == dc.ConnectedVoiceGuildId);
-                if (vg != null)
-                {
-                    lock (vg.VoiceStates)
-                    {
-                        foreach (var vm in vg.VoiceStates.Values)
-                            if (vm.ChannelId == dc.ConnectedVoiceChannelId && dc.IsUserActuallySpeaking(vm))
-                                peerHash = HashCode.Combine(peerHash, vm.UserId);
-                    }
-                }
+                foreach (var vm in dc.GetVoiceMembersSnapshot(dc.ConnectedVoiceGuildId, dc.ConnectedVoiceChannelId))
+                    if (dc.IsUserActuallySpeaking(vm))
+                        peerHash = HashCode.Combine(peerHash, vm.UserId);
             }
             if (peerHash != _prevPeerSpkHash) { _prevPeerSpkHash = peerHash; needRedraw = true; }
 
@@ -1018,6 +1031,13 @@ public static unsafe partial class Shell
             Gfx.DrawIcon(IcChat, "ЛС", dmRect, 20, Th.Text);
         }
         if (dmOver) { _hoverGuildTip = "Личные сообщения"; _hoverGuildTipY = y + 8; }
+        int dmBadge = 0;
+        if (SettingsStore.Current.UnreadBadge)
+        {
+            lock (dc.Friends) dmBadge += dc.Friends.Count(f => f.Type == 3);
+            lock (dc.DmChannels) foreach (var dmc in dc.DmChannels) dmBadge += dmc.MentionCount;
+        }
+        if (dmBadge > 0) DrawRedBadge(dmRect.Right + 3, dmRect.Bottom + 2, dmBadge, Th.Rail);
         if (UI.Click(UI.Id("guild_dm"), dmRect))
         {
             _sideScroll = 0;
@@ -1033,7 +1053,7 @@ public static unsafe partial class Shell
 
             var g = guilds[i];
             bool act = dc.ActiveGuildId == g.Id;
-            bool hasUnread = !act && g.Channels.Any(c => dc.UnreadChannels.ContainsKey(c.Id));
+            bool hasUnread = !act && (g.MentionCount > 0 || g.Channels.Any(c => dc.UnreadChannels.ContainsKey(c.Id)));
             var gr = new R(r.X + 12, y, 44, 44);
             bool over = UI.Hover(gr);
 
@@ -1050,6 +1070,8 @@ public static unsafe partial class Shell
                 if (abbr.Length > 2 && !char.IsHighSurrogate(abbr[0])) abbr = abbr[..2];
                 Gfx.DrawText(abbr, new R(gr.X, gr.Y + 13, gr.W, 20), 13, Th.Text, 700, 1);
             }
+            if (SettingsStore.Current.UnreadBadge && g.MentionCount > 0)
+                DrawRedBadge(gr.Right + 3, gr.Bottom + 2, g.MentionCount, Th.Rail);
 
             if (over) { _hoverGuildTip = g.Name; _hoverGuildTipY = y + 8; }
             if (UI.Click(UI.Id("guild", i), gr))
@@ -1078,9 +1100,20 @@ public static unsafe partial class Shell
         var dc = DiscordClient.Instance;
         DiscordGuild? guild;
         lock (dc.Guilds) guild = dc.Guilds.FirstOrDefault(g => g.Id == dc.ActiveGuildId);
-        string title = dc.ActiveGuildId == "@me" ? "Личные сообщения" : (guild?.Name ?? "Сервер");
-
-        Gfx.DrawText(title, new R(r.X + 14, r.Y + 12, r.W - 28, 24), 15, Th.Text, 700);
+        bool isDmList = dc.ActiveGuildId == "@me";
+        if (isDmList)
+        {
+            var qsBtn = new R(r.X + 10, r.Y + 8, r.W - 20, 28);
+            Gfx.FillRect(qsBtn, UI.Hover(qsBtn) ? Th.Hover : Th.Bg, 6);
+            Gfx.StrokeRect(qsBtn, Th.Border, 1, 6);
+            Gfx.DrawText("Найти или начать беседу", new R(qsBtn.X + 10, qsBtn.Y + 5, qsBtn.W - 20, 18), 12f, Th.Sub, 500, 1);
+            if (UI.Click(UI.Id("dm_qs_top"), qsBtn)) ToggleQuickSwitch();
+        }
+        else
+        {
+            string title = guild?.Name ?? "Сервер";
+            Gfx.DrawText(title, new R(r.X + 14, r.Y + 12, r.W - 28, 24), 15, Th.Text, 700);
+        }
         Gfx.FillRect(new R(r.X, r.Y + 44, r.W, 1), Th.Border);
 
         bool voiceConnecting = !dc.VoiceConnected && !string.IsNullOrEmpty(dc.ConnectedVoiceChannelId);
@@ -1088,15 +1121,15 @@ public static unsafe partial class Shell
         var listRect = new R(r.X, r.Y + 46, r.W, r.H - 46 - dockH);
 
         List<DiscordChannel> channels;
-        if (dc.ActiveGuildId == "@me") { lock (dc.DmChannels) channels = [.. dc.DmChannels]; }
+        if (isDmList) { lock (dc.DmChannels) channels = [.. dc.DmChannels]; }
         else channels = guild?.Channels ?? [];
-        float totalH = 16 + (dc.ActiveGuildId == "@me" ? 40 : 0);
+        float totalH = 16 + (isDmList ? 66 : 0);
         foreach (var ch in channels)
         {
             bool catCollapsed = !ch.IsCategory && !string.IsNullOrEmpty(ch.ParentId) && _collapsedCats.Contains(ch.ParentId)
                                 && ch.Id != dc.ActiveChannelId && ch.Id != dc.ConnectedVoiceChannelId;
             if (catCollapsed) continue;
-            totalH += ch.IsCategory ? 28 : 34;
+            totalH += ch.IsCategory ? 28 : (ch.IsDmOrGroup ? 44 : 34);
             if (ch.IsVoice && guild != null)
             {
                 lock (guild.VoiceStates)
@@ -1109,15 +1142,24 @@ public static unsafe partial class Shell
 
         Gfx.PushClip(listRect);
         float y = listRect.Y + 8 - _sideScroll;
-        if (dc.ActiveGuildId == "@me")
+        if (isDmList)
         {
-            var frBtn = new R(r.X + 8, y, r.W - 16, 34);
+            var frBtn = new R(r.X + 8, y, r.W - 16, 36);
             if (_showFriendsView) Gfx.FillRect(frBtn, Th.Active, 6);
             else if (UI.Hover(frBtn)) Gfx.FillRect(frBtn, Th.Hover, 6);
-            int onCnt; lock (dc.Friends) onCnt = dc.Friends.Count(f => f.Status != "offline");
-            Gfx.DrawText($"👥  Друзья ({onCnt} в сети)", new R(frBtn.X + 10, frBtn.Y + 8, frBtn.W - 20, 18), 13.5f, _showFriendsView ? Th.Text : Th.Sub, 600);
+            int onCnt, reqCnt;
+            lock (dc.Friends)
+            {
+                onCnt = dc.Friends.Count(f => f.Type == 1 && f.Status is not ("offline" or "invisible"));
+                reqCnt = dc.Friends.Count(f => f.Type == 3);
+            }
+            Gfx.DrawText($"👥  Друзья ({onCnt} в сети)", new R(frBtn.X + 10, frBtn.Y + 9, frBtn.W - (reqCnt > 0 ? 48 : 20), 18), 13.5f, _showFriendsView ? Th.Text : Th.Sub, 600);
+            if (reqCnt > 0) DrawRedBadge(frBtn.Right - 8, frBtn.Y + 27, reqCnt, Th.Sidebar);
             if (UI.Click(UI.Id("dm_friends_btn"), frBtn)) { _showFriendsView = true; _inVoiceStage = false; }
-            y += 40;
+            y += 42;
+
+            Gfx.DrawText("Личные сообщения", new R(r.X + 14, y + 2, r.W - 28, 18), 11.5f, Th.Dim, 700);
+            y += 24;
         }
         for (int i = 0; i < channels.Count; i++)
         {
@@ -1142,22 +1184,80 @@ public static unsafe partial class Shell
             if (!string.IsNullOrEmpty(ch.ParentId) && _collapsedCats.Contains(ch.ParentId) && ch.Id != dc.ActiveChannelId && ch.Id != dc.ConnectedVoiceChannelId)
                 continue;
 
-            bool isActive = !_inVoiceStage && ch.Id == dc.ActiveChannelId;
-            bool isVoiceJoined = ch.IsVoice && ch.Id == dc.ConnectedVoiceChannelId;
-            var cr = new R(r.X + 8, y, r.W - 16, 32);
-            if (y + 32 >= listRect.Y && y <= listRect.Bottom)
+            bool isActive = !_inVoiceStage && !_showFriendsView && ch.Id == dc.ActiveChannelId;
+            bool isVoiceJoined = (ch.IsVoice || ch.IsDmOrGroup) && ch.Id == dc.ConnectedVoiceChannelId;
+            float chItemH = ch.IsDmOrGroup ? 42f : 32f;
+            var cr = new R(r.X + 8, y, r.W - 16, chItemH);
+            if (y + chItemH >= listRect.Y && y <= listRect.Bottom)
             {
-                if (isVoiceJoined) Gfx.FillRect(cr, 0x2223A55A, 6);
+                if (isVoiceJoined && !ch.IsDmOrGroup) Gfx.FillRect(cr, 0x2223A55A, 6);
                 else if (isActive) Gfx.FillRect(cr, Th.Active, 6);
                 else if (UI.Hover(cr)) Gfx.FillRect(cr, Th.Hover, 6);
 
-                if (ch.Type == 1 || ch.Type == 3)
+                if (ch.IsDmOrGroup)
                 {
-                    var av = ImageCache.Get(ch.DmAvatarUrl, 48, ImgMask.Circle);
-                    var avr = new R(cr.X + 6, cr.Y + 4, 24, 24);
-                    if (av != null) Gfx.DrawBitmap(av, avr);
-                    else { Gfx.FillCircle(avr.X + 12, avr.Y + 12, 12, Th.Card); Gfx.DrawText(FirstGrapheme(ch.Name), new R(avr.X, avr.Y + 4, 24, 18), 11, Th.Text, 700, 1); }
-                    Gfx.DrawText(ch.Name, new R(cr.X + 36, cr.Y + 7, cr.W - 42, 20), 13.5f, isActive ? Th.Text : Th.Sub, isActive ? 600 : 400);
+                    bool unread = dc.UnreadChannels.ContainsKey(ch.Id);
+                    if (unread && !isActive) Gfx.FillCircle(r.X + 4, cr.Y + 21, 3, Th.Text);
+
+                    var avr = new R(cr.X + 6, cr.Y + 5, 32, 32);
+                    if (ch.Type == 3 && string.IsNullOrEmpty(ch.ChannelIcon) && ch.RecipientIds.Count >= 2)
+                    {
+                        // Official Discord dual-avatar Group DM composite!
+                        dc.Users.TryGetValue(ch.RecipientIds[0], out var u0);
+                        dc.Users.TryGetValue(ch.RecipientIds[1], out var u1);
+                        var b0 = ImageCache.Get(u0?.AvatarUrl, 48, ImgMask.Circle);
+                        var b1 = ImageCache.Get(u1?.AvatarUrl, 48, ImgMask.Circle);
+                        var r0 = new R(avr.X, avr.Y, 21, 21);
+                        var r1 = new R(avr.X + 11, avr.Y + 11, 21, 21);
+                        if (b0 != null) Gfx.DrawBitmap(b0, r0); else Gfx.FillCircle(r0.X + 10.5f, r0.Y + 10.5f, 10.5f, Th.Brand);
+                        Gfx.FillCircle(r1.X + 10.5f, r1.Y + 10.5f, 12f, isActive ? Th.Active : Th.Sidebar);
+                        if (b1 != null) Gfx.DrawBitmap(b1, r1); else Gfx.FillCircle(r1.X + 10.5f, r1.Y + 10.5f, 10.5f, Th.Card);
+                    }
+                    else
+                    {
+                        var av = ImageCache.Get(ch.DmAvatarUrl, 64, ImgMask.Circle);
+                        if (av != null) Gfx.DrawBitmap(av, avr);
+                        else
+                        {
+                            Gfx.FillCircle(avr.X + 16, avr.Y + 16, 16, ch.Type == 3 ? Th.Brand : Th.Card);
+                            Gfx.DrawText(FirstGrapheme(ch.Name), new R(avr.X, avr.Y + 7, 32, 18), 13, Th.Text, 700, 1);
+                        }
+                        if (ch.Type == 1 && !string.IsNullOrEmpty(ch.RecipientId))
+                        {
+                            string ust = dc.Users.TryGetValue(ch.RecipientId, out var ru) ? ru.Status : "offline";
+                            uint dot = ust switch { "online" => Th.Green, "idle" => Th.Amber, "dnd" => Th.Red, _ => 0xFF4E5058 };
+                            Gfx.FillCircle(avr.Right - 4, avr.Bottom - 4, 5f, isActive ? Th.Active : Th.Sidebar);
+                            Gfx.FillCircle(avr.Right - 4, avr.Bottom - 4, 3.6f, dot);
+                        }
+                    }
+
+                    bool hasLiveCall = isVoiceJoined || (dc.DmCalls.TryGetValue(ch.Id, out var dmc) && dmc.VoiceStates.Count > 0);
+                    string subLine = "";
+                    if (ch.Type == 3)
+                        subLine = $"{ch.GroupMemberCount} {PluralizeMembers(ch.GroupMemberCount)}";
+                    else if (!string.IsNullOrEmpty(ch.RecipientId) && dc.Users.TryGetValue(ch.RecipientId, out var uAct) && !string.IsNullOrEmpty(uAct.ActivityText))
+                        subLine = uAct.ActivityText;
+                    if (hasLiveCall)
+                        subLine = string.IsNullOrEmpty(subLine) ? "В звонке" : $"В звонке • {subLine}";
+
+                    float rightPad = (hasLiveCall ? 24f : 6f) + (ch.MentionCount > 0 ? 28f : 0f);
+                    if (!string.IsNullOrEmpty(subLine))
+                    {
+                        Gfx.DrawText(ch.Name, new R(cr.X + 46, cr.Y + 4, cr.W - 46 - rightPad, 18), 13.5f,
+                            isActive || unread ? Th.Text : Th.Sub, isActive || unread ? 600 : 500);
+                        Gfx.DrawText(subLine, new R(cr.X + 46, cr.Y + 22, cr.W - 46 - rightPad, 15), 11f,
+                            hasLiveCall ? Th.Green : Th.Dim, hasLiveCall ? 600 : 400);
+                    }
+                    else
+                    {
+                        Gfx.DrawText(ch.Name, new R(cr.X + 46, cr.Y + 11, cr.W - 46 - rightPad, 20), 13.5f,
+                            isActive || unread ? Th.Text : Th.Sub, isActive || unread ? 600 : 500);
+                    }
+
+                    if (hasLiveCall)
+                        Gfx.DrawIcon(IcPhoneCall, "📞", new R(cr.Right - (ch.MentionCount > 0 ? 48 : 22), cr.Y + 12, 18, 18), 14, Th.Green);
+                    if (ch.MentionCount > 0 && !isActive)
+                        DrawRedBadge(cr.Right - 4, cr.Y + 30, ch.MentionCount, Th.Sidebar);
                 }
                 else
                 {
@@ -1194,7 +1294,7 @@ public static unsafe partial class Shell
                     }
                 }
             }
-            y += 34;
+            y += ch.IsDmOrGroup ? 44 : 34;
 
             if (ch.IsVoice && guild != null)
             {
@@ -1313,6 +1413,8 @@ public static unsafe partial class Shell
             DiscordGuild? vg;
             lock (dc.Guilds) vg = dc.Guilds.FirstOrDefault(x => x.Id == dc.ConnectedVoiceGuildId);
             var vc = vg?.Channels.FirstOrDefault(x => x.Id == dc.ConnectedVoiceChannelId);
+            DiscordChannel? vdm = null;
+            if (vg == null) { lock (dc.DmChannels) vdm = dc.DmChannels.FirstOrDefault(x => x.Id == dc.ConnectedVoiceChannelId); }
             var connHit = new R(r.X + 4, dy + 4, r.W - 46, 40);
             if (UI.Hover(connHit) || _showVoiceInfo) Gfx.FillRect(connHit, Th.Hover, 6);
 
@@ -1324,7 +1426,8 @@ public static unsafe partial class Shell
 
             string vHdr = dc.VoicePingMs > 0 ? $"Голосовая связь • {dc.VoicePingMs} мс" : dc.VoiceStatus;
             Gfx.DrawText(vHdr, new R(r.X + 29, dy + 8, r.W - 76, 18), 12f, sigCol, 700);
-            Gfx.DrawText($"{vc?.Name ?? "Voice"} / {vg?.Name ?? ""}", new R(r.X + 29, dy + 26, r.W - 76, 16), 11f, Th.Sub);
+            string vSub = vdm != null ? $"{vdm.Name} (Звонок)" : $"{vc?.Name ?? "Voice"} / {vg?.Name ?? ""}";
+            Gfx.DrawText(vSub, new R(r.X + 29, dy + 26, r.W - 76, 16), 11f, Th.Sub);
             if (UI.Click(UI.Id("btn_vinfo"), connHit))
             {
                 _showVoiceInfo = !_showVoiceInfo;
@@ -1493,6 +1596,9 @@ public static unsafe partial class Shell
         DiscordGuild? guild;
         lock (dc.Guilds) guild = dc.Guilds.FirstOrDefault(g => g.Id == dc.ConnectedVoiceGuildId);
         var vch = guild?.Channels.FirstOrDefault(c => c.Id == dc.ConnectedVoiceChannelId);
+        DiscordChannel? vdm = null;
+        if (guild == null) { lock (dc.DmChannels) vdm = dc.DmChannels.FirstOrDefault(c => c.Id == dc.ConnectedVoiceChannelId); }
+        string voiceScopeGuildId = guild?.Id ?? "@me";
 
         // Validate focused stream still active
         WatchSession? focusedWs = null;
@@ -1506,7 +1612,7 @@ public static unsafe partial class Shell
 
         // Top Voice Stage Header (exact f_004.jpg & f_022.jpg!)
         Gfx.DrawIcon(IcVol, "🔊", new R(r.X + 16, r.Y + 12, 22, 22), 16, Th.Sub);
-        string hdr = vch?.Name ?? (_streaming ? "Локальный предпросмотр" : "Голосовой канал");
+        string hdr = vch?.Name ?? vdm?.Name ?? (_streaming ? "Локальный предпросмотр" : "Голосовой звонок");
         if (focusedWs != null) hdr += $"  •  Экран {focusedWs.StreamerName}";
         else if (focusSelf) hdr += _activeStreamMonitor == -2 ? "  •  ⚡ 2 Экрана сразу (32:9)" : "  •  Ваш экран";
         Gfx.DrawText(hdr, new R(r.X + 44, r.Y + 13, 460, 22), 14.5f, Th.Text, 700);
@@ -1591,12 +1697,10 @@ public static unsafe partial class Shell
                 if (UI.Click(UI.Id("vs_svol"), svBtn)) dc.ToggleStreamMute(focusedWs.StreamerUserId);
             }
         }
-        else if (guild != null || _streaming)
+        else if (guild != null || vdm != null || dc.ConnectedVoiceGuildId == "@me" || _streaming)
         {
-            // MODE 1: Multi-Stream Grid View (exact f_004.jpg & f_037.jpg!)
-            List<VoiceMember> vms = [];
-            if (guild != null)
-                lock (guild.VoiceStates) vms = guild.VoiceStates.Values.Where(v => v.ChannelId == dc.ConnectedVoiceChannelId).ToList();
+            // MODE 1: Multi-Stream Grid View (works identically for Guild Voice AND DM / Group DM Calls!)
+            List<VoiceMember> vms = dc.GetVoiceMembersSnapshot(voiceScopeGuildId, dc.ConnectedVoiceChannelId);
 
             var tiles = new List<(VoiceMember? Vm, bool IsStream, bool IsSelfStream)>();
             if (_streaming) tiles.Add((null, true, true));
@@ -1695,7 +1799,7 @@ public static unsafe partial class Shell
                                 _ctxStreamY = Math.Clamp(UI.MY, TopH + 8, Gfx.H - 220);
                             }
                         }
-                        else if (guild != null)
+                        else
                         {
                             Gfx.FillRect(tr, 0xFF14161D, 10);
                             Gfx.StrokeRect(tr, UI.Hover(tr) ? 0x44FFFFFF : Th.Border, 1f, 10);
@@ -1707,13 +1811,13 @@ public static unsafe partial class Shell
                             float grpW = 148 + 8 + 38;
                             float gx = tr.X + (tr.W - grpW) * 0.5f, gy = tr.Y + (tr.H - 36) * 0.5f;
                             if (UI.Button(UI.Id("tile_watch_" + vm.UserId), new R(gx, gy, 148, 36), "Смотреть стрим", 0xDD2B2D31, Th.Text, 8, 12.5f, 700))
-                                _ = dc.WatchStreamAsync(guild.Id, dc.ConnectedVoiceChannelId, vm.UserId, vm.Username, focusImmediately: true, selfMute: _muted, selfDeaf: _deafened);
+                                _ = dc.WatchStreamAsync(voiceScopeGuildId, dc.ConnectedVoiceChannelId, vm.UserId, vm.Username, focusImmediately: true, selfMute: _muted, selfDeaf: _deafened);
 
                             var gridWatchBtn = new R(gx + 156, gy, 38, 36);
                             Gfx.FillRect(gridWatchBtn, UI.Hover(gridWatchBtn) ? Th.Hover : 0xDD2B2D31, 8);
                             Gfx.DrawIcon(IcEye, "👁", gridWatchBtn, 16, Th.Text);
                             if (UI.Click(UI.Id("tile_watch_grid_" + vm.UserId), gridWatchBtn))
-                                _ = dc.WatchStreamAsync(guild.Id, dc.ConnectedVoiceChannelId, vm.UserId, vm.Username, focusImmediately: false, selfMute: _muted, selfDeaf: _deafened);
+                                _ = dc.WatchStreamAsync(voiceScopeGuildId, dc.ConnectedVoiceChannelId, vm.UserId, vm.Username, focusImmediately: false, selfMute: _muted, selfDeaf: _deafened);
 
                             var nb = new R(tr.X + 10, tr.Bottom - 30, MathF.Min(tr.W - 20, 220), 22);
                             Gfx.FillRect(nb, 0xCC0A0B0E, 6);
@@ -1776,11 +1880,11 @@ public static unsafe partial class Shell
                             Gfx.DrawText(vm.Username, new R(nb.X + 8, nb.Y + 3, nb.W - 16, 16), 11.5f, Th.Text, 600);
                         }
 
-                        if (UI.RightClick(tr) && guild != null)
+                        if (UI.RightClick(tr))
                         {
                             _ctxStreamUserId = null; _audioPopupMode = 0;
                             _ctxUser = vm;
-                            _ctxGuildId = guild.Id;
+                            _ctxGuildId = voiceScopeGuildId;
                             _ctxX = Math.Clamp(UI.MX, 8, Gfx.W - 252);
                             _ctxY = Math.Clamp(UI.MY, TopH + 8, Gfx.H - 220);
                         }
@@ -1892,13 +1996,14 @@ public static unsafe partial class Shell
         // Channel Header Bar
         Gfx.FillRect(new R(r.X, r.Y, r.W, 44), Th.Panel);
         Gfx.FillRect(new R(r.X, r.Y + 44, r.W, 1), Th.Border);
-        Gfx.DrawText("# " + (ch?.Name ?? "выберите-канал"), new R(r.X + 16, r.Y + 12, 240, 22), 15, Th.Text, 700);
 
+        string hdrPrefix = ch == null ? "# " : (ch.Type == 1 ? "@ " : (ch.Type == 3 ? "👥 " : "# "));
         float rightX = r.Right - 10;
-        bool showMembers = SettingsStore.Current.ShowMemberList && guild != null && r.W > 760;
+        bool canShowMembers = guild != null || ch?.Type == 3;
+        bool showMembers = SettingsStore.Current.ShowMemberList && canShowMembers && r.W > 760;
 
-        // Right-side header controls: [👥 Members] [📌 Pins] [🔍 Search] [Stream / Back to Voice]
-        if (guild != null)
+        // Right-side header controls: [👥 Members] [📌 Pins] [🔍 Search] [📞 Call / Stream / Back to Voice]
+        if (canShowMembers)
         {
             rightX -= 32;
             var mbBtn = new R(rightX, r.Y + 8, 28, 28);
@@ -1924,11 +2029,23 @@ public static unsafe partial class Shell
             rightX -= 8;
         }
 
+        bool inThisDmCall = ch != null && ch.IsDmOrGroup && dc.ConnectedVoiceChannelId == ch.Id && (dc.VoiceConnected || !string.IsNullOrEmpty(dc.ConnectedVoiceChannelId));
+        bool dmHasActiveCall = ch != null && ch.IsDmOrGroup && dc.DmCalls.TryGetValue(ch.Id, out var hdrCall) && hdrCall.VoiceStates.Count > 0;
+
         if (dc.VoiceConnected || dc.IsWatchingAnyStream || _streaming)
         {
             rightX -= 154;
             if (UI.Button(UI.Id("hdr_vstage"), new R(rightX, r.Y + 8, 154, 28), "🔊 К стриму / голосу", Th.Green, 0xFFFFFFFF, 6, 11.5f))
                 _inVoiceStage = true;
+            rightX -= 8;
+        }
+        else if (ch != null && ch.IsDmOrGroup)
+        {
+            string callLbl = dmHasActiveCall ? "📞 Присоединиться" : "📞 Позвонить";
+            float callW = dmHasActiveCall ? 148f : 118f;
+            rightX -= callW;
+            if (UI.Button(UI.Id("hdr_dmcall"), new R(rightX, r.Y + 8, callW, 28), callLbl, Th.Green, 0xFFFFFFFF, 6, 12f, 700))
+                _ = dc.JoinVoiceAsync("@me", ch.Id, _muted, _deafened, ringIfEmpty: !dmHasActiveCall);
             rightX -= 8;
         }
         else
@@ -1939,12 +2056,114 @@ public static unsafe partial class Shell
             rightX -= 8;
         }
 
-        if (!string.IsNullOrEmpty(ch?.Topic) && rightX - (r.X + 250) > 60)
-            Gfx.DrawText(ch.Topic, new R(r.X + 250, r.Y + 14, rightX - (r.X + 256), 20), 12.5f, Th.Sub);
+        float maxTitleW = MathF.Max(140f, rightX - (r.X + 24f));
+        Gfx.DrawText(hdrPrefix + (ch?.Name ?? "выберите-канал"), new R(r.X + 16, r.Y + 12, MathF.Min(460f, maxTitleW), 22), 15, Th.Text, 700);
+        float titleEnd = r.X + 24 + MathF.Min(460f, Gfx.MeasureText(hdrPrefix + (ch?.Name ?? ""), 15, 700, 460f).W);
+        if (!string.IsNullOrEmpty(ch?.Topic) && rightX - titleEnd > 80)
+            Gfx.DrawText(ch.Topic, new R(titleEnd + 12, r.Y + 14, rightX - titleEnd - 18, 20), 12.5f, Th.Sub);
 
         float memW = showMembers ? 224f : 0f;
         float chatW = r.W - memW;
         float contentTop = r.Y + 45;
+
+        // Official Discord Inline DM / Group DM Active Call Stage Banner (matches Screenshot 3!)
+        if (ch != null && ch.IsDmOrGroup && (inThisDmCall || dmHasActiveCall))
+        {
+            var callVms = dc.GetVoiceMembersSnapshot("@me", ch.Id);
+            if (inThisDmCall && callVms.All(v => v.UserId != dc.Me.Id))
+                callVms.Insert(0, new VoiceMember { UserId = dc.Me.Id, ChannelId = ch.Id, Username = dc.Me.DisplayName, Avatar = dc.Me.Avatar, SelfMute = _muted || _deafened, SelfDeaf = _deafened, SelfStream = _streaming });
+
+            var banner = new R(r.X, contentTop, chatW, 168);
+            Gfx.FillRect(banner, 0xFF0C0D11);
+            Gfx.FillRect(new R(banner.X, banner.Bottom - 1, banner.W, 1), Th.Border);
+
+            int cnt = Math.Max(1, callVms.Count);
+            float avSz = 64f, avGap = 22f;
+            float totalAvW = cnt * avSz + (cnt - 1) * avGap;
+            float ax0 = banner.X + (banner.W - totalAvW) * 0.5f;
+            float ay0 = banner.Y + 20f;
+
+            for (int vi = 0; vi < callVms.Count; vi++)
+            {
+                var vm = callVms[vi];
+                bool isMe = vm.UserId == dc.Me.Id;
+                bool spk = dc.IsUserActuallySpeaking(vm);
+                float sa = isMe ? _localSpeakAnim : StepSpeakAnim(vm.UserId, spk);
+                var avr = new R(ax0 + vi * (avSz + avGap), ay0, avSz, avSz);
+                float cx = avr.X + avSz * 0.5f, cy = avr.Y + avSz * 0.5f;
+                if (sa > 0.03f)
+                {
+                    Gfx.FillCircle(cx, cy, avSz * 0.5f + 5f, Gfx.Fade(0xFF23A55A, 0.35f * sa));
+                    Gfx.FillCircle(cx, cy, avSz * 0.5f + 3f, Gfx.Fade(0xFF34D399, sa));
+                    Gfx.FillCircle(cx, cy, avSz * 0.5f + 1f, 0xFF0C0D11);
+                }
+                string? avUrl = string.IsNullOrEmpty(vm.Avatar) ? null : $"https://cdn.discordapp.com/avatars/{vm.UserId}/{vm.Avatar}.png?size=128";
+                var avBmp = ImageCache.Get(avUrl, 128, ImgMask.Circle);
+                if (avBmp != null) Gfx.DrawBitmap(avBmp, avr);
+                else { Gfx.FillCircle(cx, cy, avSz * 0.5f, Th.Brand); Gfx.DrawText(FirstGrapheme(vm.Username), new R(avr.X, avr.Y + 18, avSz, 28), 22, 0xFFFFFFFF, 700, 1); }
+
+                if (vm.SelfMute || vm.SelfDeaf || (isMe && (_muted || _deafened)))
+                {
+                    Gfx.FillCircle(avr.Right - 8, avr.Bottom - 8, 10, 0xFF0C0D11);
+                    Gfx.FillCircle(avr.Right - 8, avr.Bottom - 8, 8.5f, Th.Red);
+                    Gfx.DrawIcon(IcMicOff, "M", new R(avr.Right - 15, avr.Bottom - 15, 14, 14), 10, 0xFFFFFFFF);
+                }
+                if (vm.SelfStream)
+                {
+                    var lp = new R(avr.X + (avSz - 52) * 0.5f, avr.Y - 8, 52, 16);
+                    Gfx.FillRect(lp, Th.Red, 8);
+                    Gfx.DrawText("В ЭФИРЕ", new R(lp.X, lp.Y + 1, lp.W, 14), 9f, 0xFFFFFFFF, 700, 1);
+                    if (UI.Click(UI.Id("dm_call_watch_" + vm.UserId), avr))
+                    {
+                        _inVoiceStage = true;
+                        if (isMe) dc.FocusedStreamUserId = "self";
+                        else _ = dc.WatchStreamAsync("@me", ch.Id, vm.UserId, vm.Username, focusImmediately: true, selfMute: _muted, selfDeaf: _deafened);
+                    }
+                }
+                else if (UI.RightClick(avr))
+                {
+                    _ctxStreamUserId = null; _audioPopupMode = 0;
+                    _ctxUser = vm; _ctxGuildId = "@me";
+                    _ctxX = Math.Clamp(UI.MX, 8, Gfx.W - 252);
+                    _ctxY = Math.Clamp(UI.MY, TopH + 8, Gfx.H - 220);
+                }
+            }
+
+            float btnY = banner.Bottom - 50f;
+            if (inThisDmCall)
+            {
+                float totalBtnW = 128 + 8 + 116 + 8 + 46;
+                float bx = banner.X + (banner.W - totalBtnW) * 0.5f;
+                if (UI.Button(UI.Id("dmc_sh"), new R(bx, btnY, 128, 36), _streaming ? "Стоп экрана" : "🖥 Демонстрация", _streaming ? Th.Green : Th.Card, 0xFFFFFFFF, 8, 12f, 600))
+                {
+                    if (_streaming) StopStream();
+                    else OpenScreenShareModal();
+                }
+                if (UI.Button(UI.Id("dmc_grid"), new R(bx + 136, btnY, 116, 36), "⛶ На весь экран", Th.Card, Th.Text, 8, 12f, 600))
+                    _inVoiceStage = true;
+                var hup = new R(bx + 260, btnY, 46, 36);
+                Gfx.FillRect(hup, Th.Red, 8);
+                if (UI.Hover(hup)) Gfx.FillRect(hup, Th.Hover, 8);
+                Gfx.DrawIcon(IcPhoneOff, "✕", hup, 16, 0xFFFFFFFF);
+                if (UI.Click(UI.Id("dmc_hangup"), hup)) { dc.LeaveVoice(); StopStream(); }
+            }
+            else
+            {
+                float bx = banner.X + (banner.W - (46 + 10 + 210)) * 0.5f;
+                var shJoin = new R(bx, btnY, 46, 38);
+                Gfx.FillRect(shJoin, 0xFF23A55A, 8);
+                if (UI.Hover(shJoin)) Gfx.FillRect(shJoin, Th.Hover, 8);
+                Gfx.DrawIcon(IcShare, "🖥", shJoin, 16, 0xFFFFFFFF);
+                if (UI.Click(UI.Id("dmc_join_sh"), shJoin))
+                {
+                    _ = dc.JoinVoiceAsync("@me", ch.Id, _muted, _deafened);
+                    OpenScreenShareModal();
+                }
+                if (UI.Button(UI.Id("dmc_join"), new R(bx + 56, btnY, 210, 38), "📞 Присоединиться к звонку", 0xFF23A55A, 0xFFFFFFFF, 8, 13f, 700))
+                    _ = dc.JoinVoiceAsync("@me", ch.Id, _muted, _deafened);
+            }
+            contentTop += 168f;
+        }
 
         // Live In-Channel Search Bar (Ctrl+F / 🔍)
         if (_showChannelSearch && !_showQuickSwitch)
@@ -1983,7 +2202,109 @@ public static unsafe partial class Shell
             for (int i = snap.Count - 1; i >= 0; i--)
             {
                 var m = snap[i];
-                bool grouped = i > 0 && snap[i - 1].AuthorId == m.AuthorId && snap[i - 1].Timestamp == m.Timestamp && string.IsNullOrEmpty(m.ReplyPreview);
+                bool showDateDivider = !string.IsNullOrEmpty(m.DateLabel) && (i == 0 || snap[i - 1].DateLabel != m.DateLabel);
+                float dateDivH = showDateDivider ? 28f : 0f;
+
+                if (m.IsSystemOrCall)
+                {
+                    float reactH = m.Reactions.Length > 0 ? 28f : 0f;
+                    float sysRowH = 30f + reactH;
+                    float totalItemH = dateDivH + sysRowH;
+                    totalMsgH += totalItemH;
+                    y -= totalItemH;
+
+                    if (y + totalItemH >= msgArea.Y - 40 && y <= msgArea.Bottom + 40)
+                    {
+                        float scy = y;
+                        if (showDateDivider)
+                        {
+                            DrawDateDivider(msgArea.X + 16, scy + 6, msgArea.W - 32, m.DateLabel);
+                            scy += dateDivH;
+                        }
+
+                        var sRowRect = new R(msgArea.X + 4, scy, msgArea.W - 12, sysRowH);
+                        if (UI.Hover(sRowRect)) Gfx.FillRect(sRowRect, 0x0AFFFFFF, 6);
+
+                        var icBox = new R(msgArea.X + 24, scy + 6, 22, 18);
+                        if (m.MsgType == 3)
+                            Gfx.DrawIcon(m.CallMissed ? IcPhoneMissed : IcPhoneCall, "📞", icBox, 14, m.CallMissed ? Th.Dim : Th.Green);
+                        else
+                        {
+                            string sGlyph = m.MsgType == 6 ? "📌" : (m.MsgType is 1 or 7 ? "→" : (m.MsgType == 2 ? "←" : "✦"));
+                            uint sCol = m.MsgType is 1 or 7 ? Th.Green : (m.MsgType == 2 ? Th.Red : Th.Sub);
+                            Gfx.DrawText(sGlyph, icBox, 13f, sCol, 700, 1);
+                        }
+
+                        float tx = msgArea.X + 64f;
+                        float maxTxW = MathF.Max(120f, msgArea.W - 160f);
+                        string line = m.Content;
+                        int nameIdx = !string.IsNullOrEmpty(m.AuthorName) ? line.IndexOf(m.AuthorName, StringComparison.Ordinal) : -1;
+                        if (nameIdx == 0)
+                        {
+                            float nw = Gfx.MeasureText(m.AuthorName, 13.5f, 700, 260f).W;
+                            Gfx.DrawText(m.AuthorName, new R(tx, scy + 5, nw + 4, 20), 13.5f, Th.Text, 700);
+                            string rest = line[m.AuthorName.Length..];
+                            float rw = Gfx.MeasureText(rest, 13.5f, 400, maxTxW - nw).W;
+                            Gfx.DrawText(rest, new R(tx + nw, scy + 5, MathF.Max(40, maxTxW - nw), 20), 13.5f, Th.Sub, 400);
+                            tx += nw + rw + 8f;
+                        }
+                        else if (nameIdx > 0)
+                        {
+                            string pre = line[..nameIdx];
+                            float pw = Gfx.MeasureText(pre, 13.5f, 400, 240f).W;
+                            Gfx.DrawText(pre, new R(tx, scy + 5, pw + 4, 20), 13.5f, Th.Sub, 400);
+                            float nw = Gfx.MeasureText(m.AuthorName, 13.5f, 700, 240f).W;
+                            Gfx.DrawText(m.AuthorName, new R(tx + pw, scy + 5, nw + 4, 20), 13.5f, Th.Text, 700);
+                            string post = line[(nameIdx + m.AuthorName.Length)..];
+                            float postW = Gfx.MeasureText(post, 13.5f, 400, MathF.Max(40, maxTxW - pw - nw)).W;
+                            Gfx.DrawText(post, new R(tx + pw + nw, scy + 5, MathF.Max(40, maxTxW - pw - nw), 20), 13.5f, Th.Sub, 400);
+                            tx += pw + nw + postW + 8f;
+                        }
+                        else
+                        {
+                            float lw2 = Gfx.MeasureText(line, 13.5f, 400, maxTxW).W;
+                            Gfx.DrawText(line, new R(tx, scy + 5, maxTxW, 20), 13.5f, Th.Sub, 400);
+                            tx += lw2 + 8f;
+                        }
+
+                        if (m.CallActive && ch != null)
+                        {
+                            const string joinTxt = "— Присоединиться к звонку";
+                            float jw = Gfx.MeasureText(joinTxt, 13f, 600, 240f).W + 8f;
+                            var jr = new R(MathF.Min(tx, msgArea.Right - jw - 80), scy + 4, jw, 22);
+                            if (UI.Hover(jr)) Gfx.FillRect(jr, Th.Hover, 4);
+                            Gfx.DrawText(joinTxt, new R(jr.X + 2, jr.Y + 2, jr.W, 18), 13f, Th.Cyan, 600);
+                            if (UI.Click(UI.Id("sys_call_join_" + m.Id), jr))
+                                _ = dc.JoinVoiceAsync(guild?.Id ?? "@me", ch.Id, _muted, _deafened);
+                            tx = jr.Right + 8f;
+                        }
+
+                        Gfx.DrawText(m.Timestamp, new R(MathF.Min(tx, msgArea.Right - 96), scy + 7, 92, 16), 11f, Th.Dim);
+
+                        if (m.Reactions.Length > 0)
+                        {
+                            float rx = msgArea.X + 64;
+                            int rIdx = 0;
+                            foreach (var re in m.Reactions.Take(8))
+                            {
+                                string label = $"{re.Display} {re.Count}";
+                                bool isMine = re.Me;
+                                float rw = Gfx.MeasureText(label, 12, 600, 120).W + 16;
+                                var rr = new R(rx, scy + 28, rw, 22);
+                                Gfx.FillRect(rr, isMine ? 0x335865F2 : (UI.Hover(rr) ? Th.Hover : Th.Card), 6);
+                                Gfx.StrokeRect(rr, isMine ? Th.Brand : Th.Border, 1, 6);
+                                Gfx.DrawText(label, new R(rx, scy + 31, rw, 16), 12, Th.Text, 600, 1);
+                                if (UI.Click(UI.Id("mreact_" + m.Id, rIdx++), rr))
+                                    _ = dc.ToggleReactionAsync(m.ChannelId, m.Id, re.ApiKey);
+                                rx += rw + 6;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                bool grouped = !showDateDivider && i > 0 && !snap[i - 1].IsSystemOrCall &&
+                               snap[i - 1].AuthorId == m.AuthorId && snap[i - 1].Timestamp == m.Timestamp && string.IsNullOrEmpty(m.ReplyPreview);
                 float textW = msgArea.W - 88;
                 bool hasCode = m.Content.Contains("```", StringComparison.Ordinal);
                 bool isQuote = !hasCode && m.Content.TrimStart().StartsWith("> ", StringComparison.Ordinal);
@@ -2039,21 +2360,32 @@ public static unsafe partial class Shell
                     float eMeta = (!string.IsNullOrEmpty(eb.Author) ? 16f : 0f) + (!string.IsNullOrEmpty(eb.Footer) ? 16f : 0f);
                     embH += 22f + eMeta + eImgH + (string.IsNullOrEmpty(eb.Description) ? 0f : Gfx.MeasureText(eb.Description, 12.5f, 400, MathF.Min(420, textW - 24)).H) + 14f;
                 }
-                float reactH = m.Reactions.Length > 0 ? 28f : 0f;
+                float reactH2 = m.Reactions.Length > 0 ? 28f : 0f;
                 float headerH = grouped ? 4f : 24f;
-                float rowH = MathF.Max(grouped ? 24f : 44f, replyH + headerH + textH + attTotalH + embH + reactH + 8f);
-                totalMsgH += rowH;
-                y -= rowH;
+                float rowH = MathF.Max(grouped ? 24f : 44f, replyH + headerH + textH + attTotalH + embH + reactH2 + 8f);
+                float fullH = dateDivH + rowH;
+                totalMsgH += fullH;
+                y -= fullH;
 
-                if (y + rowH < msgArea.Y - 40 || y > msgArea.Bottom + 40) continue;
+                if (y + fullH < msgArea.Y - 40 || y > msgArea.Bottom + 40) continue;
+
+                float msgTop = y;
+                if (showDateDivider)
+                {
+                    DrawDateDivider(msgArea.X + 16, msgTop + 6, msgArea.W - 32, m.DateLabel);
+                    msgTop += dateDivH;
+                }
 
                 int mk = m.Id.GetHashCode();
-                var rowRect = new R(msgArea.X + 4, y, msgArea.W - 12, rowH);
-                bool rowHover = UI.Hover(rowRect);
-                if (rowHover) Gfx.FillRect(rowRect, 0x0AFFFFFF, 6);
+                var rowRect2 = new R(msgArea.X + 4, msgTop, msgArea.W - 12, rowH);
+                bool rowHover2 = UI.Hover(rowRect2);
+                if (rowHover2) Gfx.FillRect(rowRect2, 0x0AFFFFFF, 6);
 
-                float cy = y + 2;
-                if (!string.IsNullOrEmpty(m.ReplyPreview)) { Gfx.DrawText(m.ReplyPreview, new R(msgArea.X + 64, cy, textW, 16), 11.5f, Th.Dim); cy += 18; }
+                float cy2 = msgTop + 2;
+                if (!string.IsNullOrEmpty(m.ReplyPreview)) { Gfx.DrawText(m.ReplyPreview, new R(msgArea.X + 64, cy2, textW, 16), 11.5f, Th.Dim); cy2 += 18; }
+                float cy = cy2;
+                var rowRect = rowRect2;
+                bool rowHover = rowHover2;
                 if (!grouped)
                 {
                     var avBmp = ImageCache.Get(m.AvatarUrl, 64, ImgMask.Circle);
@@ -2176,7 +2508,7 @@ public static unsafe partial class Shell
                     bool ownMsg = m.AuthorId == dc.Me.Id;
                     string? foundUrl = FindFirstHttpUrl(m.Content);
                     float pillW = 4 * 26f + 60f + 52f + (foundUrl != null ? 58f : 0f) + (ownMsg ? 98f : 0f) + 12f;
-                    var pillR = new R(rowRect.Right - pillW - 6, y + 2, pillW, 26);
+                    var pillR = new R(rowRect.Right - pillW - 6, msgTop + 2, pillW, 26);
                     Gfx.FillRect(pillR, 0xF416181F, 7);
                     Gfx.StrokeRect(pillR, Th.Border, 1, 7);
 
@@ -2238,10 +2570,13 @@ public static unsafe partial class Shell
                 _chatScroll = 0;
         }
 
-        // Right-Side Member List Sidebar (224px)
-        if (showMembers && guild != null)
+        // Right-Side Member List Sidebar (224px — works for BOTH Guilds AND Group DMs!)
+        if (showMembers)
         {
-            DrawMemberListSidebar(new R(r.X + chatW, r.Y + 45, memW, r.H - 45), guild);
+            if (guild != null)
+                DrawMemberListSidebar(new R(r.X + chatW, r.Y + 45, memW, r.H - 45), guild);
+            else if (ch?.Type == 3)
+                DrawGroupDmMemberSidebar(new R(r.X + chatW, r.Y + 45, memW, r.H - 45), ch);
         }
 
         if (!string.IsNullOrEmpty(_hoverGuildTip))
@@ -2296,6 +2631,102 @@ public static unsafe partial class Shell
             _showEmojiPicker = !_showEmojiPicker;
         if (UI.Button(UI.Id("btn_send"), new R(r.X + chatW - 88, _chatInputRect.Y + 3, 66, 34), string.IsNullOrEmpty(_editingMsgId) ? "Отпр." : "Сохр.", Th.Brand, Th.Text, 7, 13))
             OnChatEnter();
+    }
+
+    private static void DrawDateDivider(float x, float y, float w, string dateText)
+    {
+        float tw = Gfx.MeasureText(dateText, 11.5f, 700, 220f).W + 20f;
+        float lineW = MathF.Max(12f, (w - tw) * 0.5f);
+        Gfx.FillRect(new R(x, y + 8f, lineW, 1f), Th.Border);
+        Gfx.DrawText(dateText, new R(x + lineW, y, tw, 16f), 11.5f, Th.Dim, 700, 1);
+        Gfx.FillRect(new R(x + lineW + tw, y + 8f, lineW, 1f), Th.Border);
+    }
+
+    private static void DrawGroupDmMemberSidebar(R r, DiscordChannel groupCh)
+    {
+        Gfx.FillRect(r, Th.Sidebar);
+        Gfx.FillRect(new R(r.X, r.Y, 1, r.H), Th.Border);
+        var dc = DiscordClient.Instance;
+
+        var callSet = new HashSet<string>();
+        if (dc.DmCalls.TryGetValue(groupCh.Id, out var dmCall))
+        {
+            lock (dmCall) foreach (var k in dmCall.VoiceStates.Keys) callSet.Add(k);
+        }
+        if (dc.ConnectedVoiceChannelId == groupCh.Id) callSet.Add(dc.Me.Id);
+
+        var allIds = new List<string> { dc.Me.Id };
+        foreach (var rid in groupCh.RecipientIds)
+            if (!allIds.Contains(rid)) allIds.Add(rid);
+
+        var rows = new List<(string Id, string Name, string? AvUrl, string Status, string Activity, bool InCall)>(allIds.Count);
+        foreach (var uid in allIds)
+        {
+            if (uid == dc.Me.Id)
+            {
+                string? myAv = string.IsNullOrEmpty(dc.Me.Avatar) ? null : $"https://cdn.discordapp.com/avatars/{dc.Me.Id}/{dc.Me.Avatar}.png?size=64";
+                rows.Add((uid, dc.Me.DisplayName, myAv, dc.Me.Status, dc.Me.ActivityText, callSet.Contains(uid)));
+            }
+            else
+            {
+                dc.Users.TryGetValue(uid, out var uo);
+                string nm = uo?.DisplayName ?? ("User " + (uid.Length >= 4 ? uid[^4..] : uid));
+                rows.Add((uid, nm, uo?.AvatarUrl, uo?.Status ?? "offline", uo?.ActivityText ?? "", callSet.Contains(uid)));
+            }
+        }
+        rows = rows
+            .OrderByDescending(x => x.InCall)
+            .ThenBy(x => x.Status is "offline" or "invisible" ? 1 : 0)
+            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        float totalH = 38f + rows.Count * 44f;
+        float maxSc = MathF.Max(0, totalH - r.H);
+        if (UI.Hover(r) && UI.Wheel != 0) _memberScroll = Math.Clamp(_memberScroll - UI.Wheel * 44f, 0f, maxSc);
+        else _memberScroll = Math.Clamp(_memberScroll, 0f, maxSc);
+
+        Gfx.PushClip(r);
+        float y = r.Y + 12 - _memberScroll;
+        Gfx.DrawText($"Участники — {rows.Count}", new R(r.X + 14, y, r.W - 24, 18), 11.5f, Th.Dim, 700);
+        y += 24;
+
+        foreach (var u in rows)
+        {
+            if (y + 42 >= r.Y && y <= r.Bottom)
+            {
+                bool online = u.Status is not ("offline" or "invisible") || u.InCall;
+                uint dotCol = u.Status switch { "online" => Th.Green, "idle" => Th.Amber, "dnd" => Th.Red, _ => 0xFF4E5058 };
+                var row = new R(r.X + 8, y, r.W - 16, 40);
+                if (u.InCall) Gfx.FillRect(row, 0x185865F2, 8);
+                if (UI.Hover(row)) Gfx.FillRect(row, Th.Hover, 8);
+
+                var av = ImageCache.Get(u.AvUrl, 64, ImgMask.Circle);
+                var avr = new R(row.X + 6, row.Y + 5, 30, 30);
+                if (av != null) Gfx.DrawBitmap(av, avr);
+                else { Gfx.FillCircle(avr.X + 15, avr.Y + 15, 15, Th.Brand); Gfx.DrawText(FirstGrapheme(u.Name), new R(avr.X, avr.Y + 6, 30, 18), 12, 0xFFFFFFFF, 700, 1); }
+
+                Gfx.FillCircle(avr.Right - 3, avr.Bottom - 3, 4.6f, Th.Sidebar);
+                Gfx.FillCircle(avr.Right - 3, avr.Bottom - 3, 3.3f, u.InCall ? Th.Green : dotCol);
+
+                string sub = u.InCall
+                    ? (string.IsNullOrEmpty(u.Activity) ? "📞 В звонке" : $"📞 • {u.Activity}")
+                    : u.Activity;
+                if (!string.IsNullOrEmpty(sub))
+                {
+                    Gfx.DrawText(u.Name, new R(row.X + 42, row.Y + 4, row.W - 48, 17), 12.5f, online ? Th.Text : Th.Sub, online ? 600 : 400);
+                    Gfx.DrawText(sub, new R(row.X + 42, row.Y + 21, row.W - 48, 15), 10.5f, u.InCall ? Th.Green : Th.Dim, 500);
+                }
+                else
+                {
+                    Gfx.DrawText(u.Name, new R(row.X + 42, row.Y + 11, row.W - 48, 18), 12.5f, online ? Th.Text : Th.Sub, online ? 600 : 400);
+                }
+
+                if (UI.Click(UI.Id("gdm_mem_" + u.Id), row))
+                    OpenUserProfile(u.Id, "@me", UI.MX, UI.MY);
+            }
+            y += 44;
+        }
+        Gfx.PopClip();
     }
 
     private static string? FindFirstHttpUrl(string s)
@@ -2435,15 +2866,26 @@ public static unsafe partial class Shell
         Gfx.FillRect(r, Th.Bg);
         var dc = DiscordClient.Instance;
 
+        List<DiscordFriend> allRels;
+        lock (dc.Friends) allRels = [.. dc.Friends];
+        int incomingCnt = allRels.Count(f => f.Type == 3);
+        int pendingCnt = allRels.Count(f => f.Type is 3 or 4);
+
         Gfx.FillRect(new R(r.X, r.Y, r.W, 44), Th.Panel);
         Gfx.FillRect(new R(r.X, r.Y + 44, r.W, 1), Th.Border);
         Gfx.DrawText("👥 Друзья", new R(r.X + 16, r.Y + 12, 110, 22), 15, Th.Text, 700);
         if (UI.Button(UI.Id("fr_t0"), new R(r.X + 128, r.Y + 8, 86, 28), "В сети", _friendsTab == 0 ? Th.Active : Th.Card, Th.Text, 6, 12)) { _friendsTab = 0; _friendsScroll = 0; }
         if (UI.Button(UI.Id("fr_t1"), new R(r.X + 220, r.Y + 8, 72, 28), "Все", _friendsTab == 1 ? Th.Active : Th.Card, Th.Text, 6, 12)) { _friendsTab = 1; _friendsScroll = 0; }
+        string pendLbl = pendingCnt > 0 ? $"Ожидание ({pendingCnt})" : "Ожидание";
+        if (UI.Button(UI.Id("fr_t2"), new R(r.X + 298, r.Y + 8, 126, 28), pendLbl, _friendsTab == 2 ? Th.Active : (incomingCnt > 0 ? 0x33ED4245 : Th.Card), incomingCnt > 0 && _friendsTab != 2 ? Th.Red : Th.Text, 6, 12, incomingCnt > 0 ? 700 : 600))
+        { _friendsTab = 2; _friendsScroll = 0; }
 
-        List<DiscordFriend> list;
-        lock (dc.Friends) list = [.. dc.Friends];
-        if (_friendsTab == 0) list = list.Where(f => f.Status != "offline").ToList();
+        List<DiscordFriend> list = _friendsTab switch
+        {
+            0 => allRels.Where(f => f.Type == 1 && f.Status is not ("offline" or "invisible")).ToList(),
+            1 => allRels.Where(f => f.Type == 1).ToList(),
+            _ => allRels.Where(f => f.Type is 3 or 4).ToList()
+        };
 
         var area = new R(r.X, r.Y + 45, r.W, r.H - 45);
         float totalH = 52 + list.Count * 56f;
@@ -2453,12 +2895,13 @@ public static unsafe partial class Shell
 
         Gfx.PushClip(area);
         float y = area.Y + 16 - _friendsScroll;
-        Gfx.DrawText((_friendsTab == 0 ? "В СЕТИ — " : "ВСЕ ДРУЗЬЯ — ") + list.Count, new R(area.X + 20, y, 260, 18), 11, Th.Dim, 700);
+        string secHdr = _friendsTab switch { 0 => "В СЕТИ — ", 1 => "ВСЕ ДРУЗЬЯ — ", _ => "ЗАПРОСЫ ДРУЖБЫ — " } + list.Count;
+        Gfx.DrawText(secHdr, new R(area.X + 20, y, 260, 18), 11, Th.Dim, 700);
         y += 28;
 
         if (list.Count == 0)
         {
-            Gfx.DrawText("Нет друзей в этой категории", new R(area.X + 20, y + 20, area.W - 40, 24), 14, Th.Dim);
+            Gfx.DrawText("Нет пользователей в этой категории", new R(area.X + 20, y + 20, area.W - 40, 24), 14, Th.Dim);
         }
         else
         {
@@ -2467,7 +2910,7 @@ public static unsafe partial class Shell
                 if (y + 56 >= area.Y && y <= area.Bottom)
                 {
                     var f = list[i];
-                    var row = new R(area.X + 16, y, MathF.Min(720, area.W - 32), 54);
+                    var row = new R(area.X + 16, y, MathF.Min(760, area.W - 32), 54);
                     Gfx.FillRect(new R(row.X, row.Y, row.W, 1), Th.Border);
                     if (UI.Hover(row)) Gfx.FillRect(row, Th.Hover, 8);
 
@@ -2476,18 +2919,44 @@ public static unsafe partial class Shell
                     if (av != null) Gfx.DrawBitmap(av, avr);
                     else { Gfx.FillCircle(avr.X + 17, avr.Y + 17, 17, Th.Brand); Gfx.DrawText(FirstGrapheme(f.DisplayName), new R(avr.X, avr.Y + 8, 34, 20), 14, 0xFFFFFFFF, 700, 1); }
 
-                    uint dot = f.Status switch { "online" => Th.Green, "idle" => Th.Amber, "dnd" => Th.Red, _ => Th.Dim };
+                    uint dot = f.Status switch { "online" => Th.Green, "idle" => Th.Amber, "dnd" => Th.Red, _ => 0xFF4E5058 };
                     Gfx.FillCircle(avr.Right - 4, avr.Bottom - 4, 5.2f, Th.Bg);
                     Gfx.FillCircle(avr.Right - 4, avr.Bottom - 4, 3.8f, dot);
 
-                    Gfx.DrawText(f.DisplayName, new R(row.X + 54, row.Y + 9, row.W - 190, 18), 14, Th.Text, 700);
-                    string stTxt = f.Status switch { "online" => "В сети", "idle" => "Неактивен", "dnd" => "Не беспокоить", _ => "Не в сети" };
-                    Gfx.DrawText($"@{f.Username}  •  {stTxt}", new R(row.X + 54, row.Y + 28, row.W - 190, 16), 11.5f, Th.Sub);
+                    Gfx.DrawText(f.DisplayName, new R(row.X + 54, row.Y + 9, row.W - 260, 18), 14, Th.Text, 700);
+                    string stTxt = f.Type == 3
+                        ? "Входящий запрос дружбы"
+                        : (f.Type == 4
+                            ? "Исходящий запрос дружбы"
+                            : (!string.IsNullOrEmpty(f.ActivityText)
+                                ? f.ActivityText
+                                : (f.Status switch { "online" => "В сети", "idle" => "Неактивен", "dnd" => "Не беспокоить", _ => "Не в сети" })));
+                    Gfx.DrawText($"@{f.Username}  •  {stTxt}", new R(row.X + 54, row.Y + 28, row.W - 260, 16), 11.5f, f.Type == 3 ? Th.Cyan : Th.Sub);
 
-                    if (UI.Button(UI.Id("fr_dm_" + f.UserId), new R(row.Right - 118, row.Y + 12, 108, 30), "💬 Написать", Th.Card, Th.Text, 6, 12))
+                    if (f.Type == 3)
                     {
-                        _showFriendsView = false;
-                        _ = ShellAsync.OpenDmAsync(f.UserId);
+                        if (UI.Button(UI.Id("fr_acc_" + f.UserId), new R(row.Right - 198, row.Y + 12, 92, 30), "✓ Принять", Th.Green, 0xFFFFFFFF, 6, 12, 700))
+                            _ = dc.AcceptFriendRequestAsync(f.UserId);
+                        if (UI.Button(UI.Id("fr_dec_" + f.UserId), new R(row.Right - 98, row.Y + 12, 88, 30), "✕ Скрыть", 0x22ED4245, Th.Red, 6, 12))
+                            _ = dc.RemoveRelationshipAsync(f.UserId);
+                    }
+                    else if (f.Type == 4)
+                    {
+                        if (UI.Button(UI.Id("fr_can_" + f.UserId), new R(row.Right - 118, row.Y + 12, 108, 30), "Отменить", 0x22ED4245, Th.Red, 6, 12))
+                            _ = dc.RemoveRelationshipAsync(f.UserId);
+                    }
+                    else
+                    {
+                        if (UI.Button(UI.Id("fr_call_" + f.UserId), new R(row.Right - 216, row.Y + 12, 90, 30), "📞 Звонок", 0x2223A55A, Th.Green, 6, 12, 600))
+                        {
+                            _showFriendsView = false;
+                            _ = ShellAsync.OpenDmAndCallAsync(f.UserId, _muted, _deafened);
+                        }
+                        if (UI.Button(UI.Id("fr_dm_" + f.UserId), new R(row.Right - 118, row.Y + 12, 108, 30), "💬 Написать", Th.Card, Th.Text, 6, 12))
+                        {
+                            _showFriendsView = false;
+                            _ = ShellAsync.OpenDmAsync(f.UserId);
+                        }
                     }
                 }
                 y += 56;

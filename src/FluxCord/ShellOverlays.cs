@@ -1399,11 +1399,15 @@ public static unsafe partial class Shell
         string status = uid == dc.Me.Id ? dc.Me.Status : (user?.Status ?? "offline");
 
         bool inVoice = false;
-        if (!string.IsNullOrEmpty(_profileGuildId))
+        if (!string.IsNullOrEmpty(_profileGuildId) && _profileGuildId != "@me")
         {
             DiscordGuild? g;
             lock (dc.Guilds) g = dc.Guilds.FirstOrDefault(x => x.Id == _profileGuildId);
             if (g != null) lock (g.VoiceStates) inVoice = g.VoiceStates.ContainsKey(uid);
+        }
+        else if (!string.IsNullOrEmpty(dc.ConnectedVoiceChannelId) && dc.DmCalls.TryGetValue(dc.ConnectedVoiceChannelId, out var dmCall))
+        {
+            lock (dmCall) inVoice = dmCall.VoiceStates.ContainsKey(uid);
         }
 
         float w = 282, h = inVoice && uid != dc.Me.Id ? 276 : 230;
@@ -1499,6 +1503,13 @@ internal static class ShellAsync
     {
         var cid = await DiscordClient.Instance.OpenOrCreateDmAsync(userId);
         if (string.IsNullOrEmpty(cid)) Shell.Toast("Не удалось открыть ЛС");
+    }
+
+    public static async Task OpenDmAndCallAsync(string userId, bool selfMute, bool selfDeaf)
+    {
+        var cid = await DiscordClient.Instance.OpenOrCreateDmAsync(userId);
+        if (string.IsNullOrEmpty(cid)) { Shell.Toast("Не удалось открыть ЛС"); return; }
+        await DiscordClient.Instance.JoinVoiceAsync("@me", cid, selfMute, selfDeaf, ringIfEmpty: true);
     }
 
     public static async Task CreateAndCopyInviteAsync(string channelId)

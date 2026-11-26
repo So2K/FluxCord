@@ -4,7 +4,7 @@ namespace FluxCord;
 
 /// <summary>
 /// Instant local SQLite WAL cache (%LOCALAPPDATA%\FluxCord\cache.db).
-/// Stores recent messages per channel with proper numeric Snowflake ordering & live edit/delete sync.
+/// Stores recent messages per channel with proper numeric Snowflake ordering, call/system types & live edit/delete sync.
 /// </summary>
 public static class LocalCache
 {
@@ -22,27 +22,46 @@ public static class LocalCache
                 Directory.CreateDirectory(SettingsStore.DataDir);
                 _conn = new SqliteConnection($"Data Source={DbPath}");
                 _conn.Open();
-                using var cmd = _conn.CreateCommand();
-                cmd.CommandText = """
-                    PRAGMA journal_mode=WAL;
-                    PRAGMA synchronous=NORMAL;
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id TEXT PRIMARY KEY,
-                        channel_id TEXT NOT NULL,
-                        author_id TEXT NOT NULL,
-                        author_name TEXT NOT NULL,
-                        author_avatar TEXT NOT NULL,
-                        author_color INTEGER NOT NULL,
-                        content TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        reply_preview TEXT NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_msg_ch ON messages(channel_id, id);
-                    """;
-                cmd.ExecuteNonQuery();
+                using (var cmd = _conn.CreateCommand())
+                {
+                    cmd.CommandText = """
+                        PRAGMA journal_mode=WAL;
+                        PRAGMA synchronous=NORMAL;
+                        CREATE TABLE IF NOT EXISTS messages (
+                            id TEXT PRIMARY KEY,
+                            channel_id TEXT NOT NULL,
+                            author_id TEXT NOT NULL,
+                            author_name TEXT NOT NULL,
+                            author_avatar TEXT NOT NULL,
+                            author_color INTEGER NOT NULL,
+                            content TEXT NOT NULL,
+                            timestamp TEXT NOT NULL,
+                            reply_preview TEXT NOT NULL,
+                            msg_type INTEGER NOT NULL DEFAULT 0,
+                            call_missed INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_msg_ch ON messages(channel_id, id);
+                        """;
+                    cmd.ExecuteNonQuery();
+                }
+                // Non-destructive migration for existing cache.db tables
+                TryAlterColumn("ALTER TABLE messages ADD COLUMN msg_type INTEGER NOT NULL DEFAULT 0;");
+                TryAlterColumn("ALTER TABLE messages ADD COLUMN call_missed INTEGER NOT NULL DEFAULT 0;");
             }
             catch (Exception ex) { SettingsStore.Log("SQLite init: " + ex.Message); }
         }
+    }
+
+    private static void TryAlterColumn(string sql)
+    {
+        try
+        {
+            if (_conn == null) return;
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.ExecuteNonQuery();
+        }
+        catch { }
     }
 
     public static void SaveMessages(string channelId, IReadOnlyList<DiscordMessage> msgs)
@@ -59,8 +78,8 @@ public static class LocalCache
                 cmd.Transaction = tx;
                 cmd.CommandText = """
                     INSERT OR REPLACE INTO messages
-                    (id, channel_id, author_id, author_name, author_avatar, author_color, content, timestamp, reply_preview)
-                    VALUES ($id, $ch, $aid, $an, $av, $ac, $cnt, $ts, $rp);
+                    (id, channel_id, author_id, author_name, author_avatar, author_color, content, timestamp, reply_preview, msg_type, call_missed)
+                    VALUES ($id, $ch, $aid, $an, $av, $ac, $cnt, $ts, $rp, $mt, $cm);
                     """;
                 var pId = cmd.Parameters.Add("$id", SqliteType.Text);
                 var pCh = cmd.Parameters.Add("$ch", SqliteType.Text);
@@ -71,6 +90,8 @@ public static class LocalCache
                 var pCnt = cmd.Parameters.Add("$cnt", SqliteType.Text);
                 var pTs = cmd.Parameters.Add("$ts", SqliteType.Text);
                 var pRp = cmd.Parameters.Add("$rp", SqliteType.Text);
+                var pMt = cmd.Parameters.Add("$mt", SqliteType.Integer);
+                var pCm = cmd.Parameters.Add("$cm", SqliteType.Integer);
 
                 int start = Math.Max(0, msgs.Count - 80);
                 for (int i = start; i < msgs.Count; i++)
@@ -86,6 +107,8 @@ public static class LocalCache
                     pCnt.Value = m.Content;
                     pTs.Value = m.Timestamp;
                     pRp.Value = m.ReplyPreview;
+                    pMt.Value = m.MsgType;
+                    pCm.Value = m.CallMissed ? 1 : 0;
                     cmd.ExecuteNonQuery();
                 }
 
@@ -253,24 +276,32 @@ public static class LocalCache
             try
             {
                 using var cmd = _conn.CreateCommand();
-                // Numeric Snowflake ordering (handles 18-digit vs 19-digit IDs accurately!)
-                cmd.CommandText = "SELECT id, author_id, author_name, author_avatar, author_color, content, timestamp, reply_preview FROM messages WHERE channel_id=$ch ORDER BY CAST(id AS INTEGER) DESC LIMIT $lim;";
+                cmd.CommandText = "SELECT id, author_id, author_name, author_avatar, author_color, content, timestamp, reply_preview, msg_type, call_missed FROM messages WHERE channel_id=$ch ORDER BY CAST(id AS INTEGER) DESC LIMIT $lim;";
                 cmd.Parameters.AddWithValue("$ch", channelId);
                 cmd.Parameters.AddWithValue("$lim", limit);
                 using var r = cmd.ExecuteReader();
                 while (r.Read())
                 {
+                    string id = r.GetString(0);
+                    string content = r.GetString(5);
+                    int mt = r.IsDBNull(8) ? 0 : r.GetInt32(8);
+                    bool cm = !r.IsDBNull(9) && r.GetInt32(9) != 0;
+                    // Skip legacy cached rows that had empty content from pre-v1.0.6 before REST refreshes them!
+                    if (string.IsNullOrEmpty(content) && mt == 0) continue;
                     res.Add(new DiscordMessage
                     {
-                        Id = r.GetString(0),
+                        Id = id,
                         ChannelId = channelId,
                         AuthorId = r.GetString(1),
                         AuthorName = r.GetString(2),
                         AuthorAvatar = r.GetString(3),
                         AuthorColor = (uint)r.GetInt64(4),
-                        Content = r.GetString(5),
+                        Content = content,
                         Timestamp = r.GetString(6),
+                        DateLabel = DiscordMessage.DateLabelFromSnowflake(id),
                         ReplyPreview = r.GetString(7),
+                        MsgType = mt,
+                        CallMissed = cm
                     });
                 }
                 res.Reverse();

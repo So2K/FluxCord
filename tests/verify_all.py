@@ -153,6 +153,14 @@ with tempfile.TemporaryDirectory(prefix="fluxcord_test_") as DATA:
             check(s3.get("LastChannelId") == "c_dev",
                   f"UI click text channel sidebar c_gen -> c_dev (LastChannelId={s3.get('LastChannelId')})")
 
+            # Test C2: Switch to Direct Messages (@me), open Group DM (dm_1: 3 members + call history), then switch back to g1!
+            ui_click(34, 72)        # Top-left DM button -> @me Friends view
+            ui_click(188, 174)      # First Group DM item (dm_1: "mirrorcoder, DemoTeammate")
+            s3b = read_settings()
+            check(s3b.get("LastGuildId") == "@me" and s3b.get("LastChannelId") == "dm_1",
+                  f"UI click DM rail + Group DM dm_1 (LastGuildId={s3b.get('LastGuildId')}, LastChannelId={s3b.get('LastChannelId')})")
+            ui_click(34, 128)       # Return to g1 for modal/popup tests
+
             # Test D: Open Settings modal (gear icon), verify background rail click is BLOCKED, then Esc closes modal & rail click works again!
             ui_click(302, lh - 30)  # Open Settings
             ui_click(34, 182)       # Try clicking g2 UNDER modal -> must be blocked!
@@ -260,9 +268,12 @@ check(nc >= 1 and nr >= 1, f"WASAPI devices detected: capture={nc}, render={nr}"
 
 # 3. Zero-Copy VRAM NVENC Hardware Encode + Process-Loopback System Audio Capture test
 ok_scr = dll.fc_screen_start_ex(0, ctypes.c_uint64(0), 2560, 1440, 60, 16000, 0, 0, None, 1, b"")
-time.sleep(1.1)
 st = FcScreenStats()
-dll.fc_screen_get_stats(ctypes.byref(st))
+for _ in range(25):
+    time.sleep(0.1)
+    dll.fc_screen_get_stats(ctypes.byref(st))
+    if st.zero_copy == 1 and st.frames_encoded >= 1:
+        break
 dll.fc_screen_stop()
 enc_name = st.encoder_name.decode("utf-8", "ignore")
 check(ok_scr == 1 and st.zero_copy == 1 and "NVIDIA" in enc_name,
