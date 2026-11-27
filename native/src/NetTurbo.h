@@ -121,4 +121,110 @@ inline void optimizeUdpSocket(SOCKET s, bool isVideo, const sockaddr_in* remote 
     }
 }
 
+namespace p2p {
+struct PendingStun {
+    std::mutex mtx;
+    char ip[64]{};
+    uint16_t port = 0;
+    bool ready = false;
+};
+
+inline PendingStun& stunState() {
+    static PendingStun st{};
+    return st;
+}
+
+inline void publishStunEndpoint(const char* ip, uint16_t port) {
+    if (!ip || !*ip || port == 0) return;
+    auto& s = stunState();
+    std::lock_guard lk(s.mtx);
+    std::memset(s.ip, 0, sizeof(s.ip));
+    std::strncpy(s.ip, ip, sizeof(s.ip) - 1);
+    s.port = port;
+    s.ready = true;
+}
+
+inline bool consumeStunEndpoint(char* out_ip, int32_t cap, uint16_t* out_port) {
+    auto& s = stunState();
+    std::lock_guard lk(s.mtx);
+    if (!s.ready) return false;
+    s.ready = false;
+    if (out_ip && cap > 0) {
+        std::memset(out_ip, 0, size_t(cap));
+        std::strncpy(out_ip, s.ip, size_t(cap - 1));
+    }
+    if (out_port) *out_port = s.port;
+    return true;
+}
+
+inline bool isPrivateIpv4Addr(const sockaddr_in& a) {
+    uint32_t h = ntohl(a.sin_addr.s_addr);
+    uint8_t b0 = uint8_t(h >> 24), b1 = uint8_t(h >> 16);
+    return b0 == 127 || b0 == 10 || (b0 == 172 && b1 >= 16 && b1 <= 31) || (b0 == 192 && b1 == 168);
+}
+
+inline void sendCloudflareStunReq(SOCKET s) {
+    sockaddr_in stunAddr{};
+    stunAddr.sin_family = AF_INET;
+    stunAddr.sin_port = htons(3478);
+    inet_pton(AF_INET, "162.159.207.0", &stunAddr.sin_addr); // stun.cloudflare.com Anycast IP
+    uint8_t req[20]{};
+    req[0] = 0x00; req[1] = 0x01; // Binding Request
+    req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42; // Magic Cookie
+    uint64_t t = GetTickCount64();
+    std::memcpy(req + 8, &t, 8);
+    req[16] = 0xFC; req[17] = 0x50; req[18] = 0x32; req[19] = 0x50;
+    sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0, reinterpret_cast<sockaddr*>(&stunAddr), sizeof(stunAddr));
+}
+
+inline bool tryParseStunXorMapped(const uint8_t* pkt, int n) {
+    if (!pkt || n < 20) return false;
+    if (pkt[0] != 0x01 || pkt[1] != 0x01) return false;
+    if (pkt[4] != 0x21 || pkt[5] != 0x12 || pkt[6] != 0xA4 || pkt[7] != 0x42) return false;
+    int pos = 20;
+    while (pos + 4 <= n) {
+        uint16_t at = uint16_t((uint16_t(pkt[pos]) << 8) | pkt[pos + 1]);
+        uint16_t al = uint16_t((uint16_t(pkt[pos + 2]) << 8) | pkt[pos + 3]);
+        if (pos + 4 + int(al) > n) break;
+        const uint8_t* val = pkt + pos + 4;
+        if (at == 0x0020 && al >= 8) {
+            uint16_t xport = uint16_t(((uint16_t(val[2]) << 8) | val[3]) ^ 0x2112u);
+            uint32_t xip = ((uint32_t(val[4]) << 24) | (uint32_t(val[5]) << 16) | (uint32_t(val[6]) << 8) | val[7]) ^ 0x2112A442u;
+            in_addr ia{};
+            ia.s_addr = htonl(xip);
+            char ipStr[64]{};
+            if (inet_ntop(AF_INET, &ia, ipStr, sizeof(ipStr))) {
+                publishStunEndpoint(ipStr, xport);
+                return true;
+            }
+        }
+        pos += 4 + ((int(al) + 3) & ~3);
+    }
+    return false;
+}
+
+inline void buildProbe(uint8_t out[16], uint8_t cmd, uint32_t tsMs, const uint8_t key[32]) {
+    out[0] = 0xFC; out[1] = 'P'; out[2] = '2'; out[3] = 'P';
+    out[4] = cmd;
+    out[5] = uint8_t(tsMs >> 24); out[6] = uint8_t(tsMs >> 16);
+    out[7] = uint8_t(tsMs >> 8);  out[8] = uint8_t(tsMs);
+    for (int i = 0; i < 7; ++i) {
+        out[9 + i] = uint8_t(key[i] ^ key[16 + i] ^ out[4 + (i % 5)] ^ uint8_t(0xA5 + i * 17));
+    }
+}
+
+inline bool verifyProbe(const uint8_t* pkt, int n, const uint8_t key[32], uint8_t& outCmd, uint32_t& outTsMs) {
+    if (!pkt || n != 16) return false;
+    if (pkt[0] != 0xFC || pkt[1] != 'P' || pkt[2] != '2' || pkt[3] != 'P') return false;
+    if (pkt[4] != 0x55 && pkt[4] != 0x56) return false;
+    for (int i = 0; i < 7; ++i) {
+        uint8_t exp = uint8_t(key[i] ^ key[16 + i] ^ pkt[4 + (i % 5)] ^ uint8_t(0xA5 + i * 17));
+        if (pkt[9 + i] != exp) return false;
+    }
+    outCmd = pkt[4];
+    outTsMs = (uint32_t(pkt[5]) << 24) | (uint32_t(pkt[6]) << 16) | (uint32_t(pkt[7]) << 8) | pkt[8];
+    return true;
+}
+} // namespace p2p
+
 } // namespace fc

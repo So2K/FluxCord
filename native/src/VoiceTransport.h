@@ -22,6 +22,8 @@ public:
 
     bool connectAndDiscover(const char* ip, uint16_t port, uint32_t ssrc, std::string& out_ext_ip, uint16_t& out_ext_port);
     void setKey(const uint8_t key[32], bool use_xchacha_rtpsize);
+    void setP2pPeer(const char* ip, uint16_t port, bool allow_direct_tx);
+    bool isP2pDirect() const;
     void disconnect();
 
     bool sendOpus(const uint8_t* opus, int len, uint32_t timestamp);
@@ -75,6 +77,10 @@ private:
     SOCKET sock_ = INVALID_SOCKET;
     ULONG qos_flow_id_ = 0;
     sockaddr_in remote_{};
+    sockaddr_in p2p_peer_{};
+    std::atomic<bool> has_p2p_peer_{false};
+    std::atomic<bool> allow_p2p_tx_{false};
+    std::atomic<int64_t> last_p2p_rx_ms_{0};
     std::atomic<uint32_t> ssrc_{0};
     uint16_t audio_seq_ = 0;
     uint16_t video_seq_ = 0;

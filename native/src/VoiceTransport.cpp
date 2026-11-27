@@ -93,7 +93,10 @@ void VoiceTransport::daveSetVideoSsrc(uint32_t video_ssrc) {
     }
     std::lock_guard lk(dave_mtx_);
     video_ssrc_ = video_ssrc;
-    if (!dave_enc_) dave_enc_ = daveEncryptorCreate();
+    if (!dave_enc_) {
+        dave_enc_ = daveEncryptorCreate();
+        if (dave_enc_ && dave_proto_ver_ == 0) daveEncryptorSetPassthroughMode(dave_enc_, true);
+    }
     if (dave_enc_) daveEncryptorAssignSsrcToCodec(dave_enc_, video_ssrc, DAVE_CODEC_H264);
 }
 
@@ -289,6 +292,9 @@ bool VoiceTransport::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
+    const bool isWan = !p2p::isPrivateIpv4Addr(rem);
+    if (isWan) p2p::sendCloudflareStunReq(s);
+
     if (sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
                reinterpret_cast<sockaddr*>(&rem), sizeof(rem)) != sizeof(req)) {
         closesocket(s);
@@ -297,14 +303,19 @@ bool VoiceTransport::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
 
     uint8_t resp[128]{};
     bool discOk = false;
-    int64_t deadlineMs = steadyMs() + 1500;
+    int64_t deadlineMs = steadyMs() + (isWan ? 2800 : 1500);
     while (steadyMs() < deadlineMs) {
         sockaddr_in from{};
         int fromLen = sizeof(from);
         int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n < 0) {
-            // Retry one sendto on packet loss
+            if (isWan) p2p::sendCloudflareStunReq(s);
+            sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
+                   reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
+            continue;
+        }
+        if (isWan && p2p::tryParseStunXorMapped(resp, n)) {
             sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
                    reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
             continue;
@@ -359,6 +370,31 @@ void VoiceTransport::setKey(const uint8_t key[32], bool use_xchacha_rtpsize) {
     has_key_.store(true);
 }
 
+void VoiceTransport::setP2pPeer(const char* ip, uint16_t port, bool allow_direct_tx) {
+    std::lock_guard lk(tx_mtx_);
+    allow_p2p_tx_.store(allow_direct_tx);
+    if (!ip || !*ip || port == 0) {
+        has_p2p_peer_.store(false);
+        last_p2p_rx_ms_.store(0);
+        return;
+    }
+    sockaddr_in cand{};
+    cand.sin_family = AF_INET;
+    cand.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &cand.sin_addr) == 1) {
+        if (!has_p2p_peer_.load() || p2p_peer_.sin_addr.s_addr != cand.sin_addr.s_addr || p2p_peer_.sin_port != cand.sin_port) {
+            p2p_peer_ = cand;
+            has_p2p_peer_.store(true);
+        }
+    }
+}
+
+bool VoiceTransport::isP2pDirect() const {
+    if (!allow_p2p_tx_.load() || !has_p2p_peer_.load()) return false;
+    int64_t last = last_p2p_rx_ms_.load();
+    return last > 0 && (steadyMs() - last < 8000);
+}
+
 void VoiceTransport::disconnect() {
     std::lock_guard life(lifecycle_mtx_);
     disconnectLocked();
@@ -368,6 +404,9 @@ void VoiceTransport::closeTransportLocked() {
     running_.store(false);
     connected_.store(false);
     has_key_.store(false);
+    has_p2p_peer_.store(false);
+    allow_p2p_tx_.store(false);
+    last_p2p_rx_ms_.store(0);
 
     // Wake recvfrom cleanly BEFORE joining rx_thread_, then close socket AFTER join (zero handle-reuse UB!)
     {
@@ -445,8 +484,15 @@ bool VoiceTransport::sendEncryptedRtpLocked(uint8_t payload_type, uint16_t seq, 
         totalLen = 12 + len + crypto_secretbox_MACBYTES + 4;
     }
 
+    const sockaddr_in* dstAddr = &remote_;
+    if (allow_p2p_tx_.load() && has_p2p_peer_.load()) {
+        int64_t lastP2p = last_p2p_rx_ms_.load();
+        if (lastP2p > 0 && (steadyMs() - lastP2p < 8000)) {
+            dstAddr = &p2p_peer_;
+        }
+    }
     int sent = sendto(sock_, reinterpret_cast<const char*>(pkt), totalLen, 0,
-                      reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
+                      reinterpret_cast<const sockaddr*>(dstAddr), sizeof(sockaddr_in));
     if (sent == totalLen) {
         tx_pkts_.fetch_add(1);
         if (payload_type == 120) audio_tx_pkts_.fetch_add(1);
@@ -467,7 +513,7 @@ bool VoiceTransport::sendOpus(const uint8_t* opus, int len, uint32_t timestamp) 
     // Apply DAVE E2EE media encryption when active (silence frame 0xF8,0xFF,0xFE stays unencrypted per spec)
     if (!isSilenceFrame(opus, len)) {
         std::lock_guard lk(dave_mtx_);
-        if (dave_enc_ && !daveEncryptorIsPassthroughMode(dave_enc_)) {
+        if (dave_enc_ && dave_proto_ver_ > 0 && !daveEncryptorIsPassthroughMode(dave_enc_)) {
             if (!daveEncryptorHasKeyRatchet(dave_enc_)) return false; // NEVER leak plaintext when DAVE is mandated!
             size_t maxOut = daveEncryptorGetMaxCiphertextByteSize(dave_enc_, DAVE_MEDIA_TYPE_AUDIO, size_t(len));
             daveBuf.resize(std::max(maxOut, size_t(len) + 64));
@@ -601,7 +647,7 @@ bool VoiceTransport::sendH264AccessUnit(const uint8_t* annexb, int len, uint32_t
     std::vector<uint8_t> daveBuf;
     {
         std::lock_guard lk(dave_mtx_);
-        if (dave_enc_ && !daveEncryptorIsPassthroughMode(dave_enc_)) {
+        if (dave_enc_ && dave_proto_ver_ > 0 && !daveEncryptorIsPassthroughMode(dave_enc_)) {
             if (!daveEncryptorHasKeyRatchet(dave_enc_)) return false;
             size_t maxOut = daveEncryptorGetMaxCiphertextByteSize(dave_enc_, DAVE_MEDIA_TYPE_VIDEO, size_t(rawLen));
             daveBuf.resize(std::max(maxOut, size_t(rawLen) + 256));
@@ -701,14 +747,18 @@ void VoiceTransport::rxLoop() {
     uint8_t plain[2048];
     uint8_t daveOut[2048];
     int64_t lastKeepaliveMs = steadyMs();
+    int64_t lastP2pProbeMs = 0;
 
     while (running_.load()) {
         SOCKET s = INVALID_SOCKET;
         sockaddr_in rem{};
+        sockaddr_in p2pRem{};
+        bool wantP2p = has_p2p_peer_.load();
         {
             std::lock_guard lk(tx_mtx_);
             s = sock_;
             rem = remote_;
+            p2pRem = p2p_peer_;
         }
         if (s == INVALID_SOCKET) break;
 
@@ -721,13 +771,25 @@ void VoiceTransport::rxLoop() {
                    reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
         }
 
+        // Direct P2P UDP Hole-Punching probe (every 450ms until locked, then every 3.5s keepalive)
+        if (wantP2p && has_key_.load()) {
+            int64_t interval = isP2pDirect() ? 3500 : 450;
+            if (nowMs - lastP2pProbeMs >= interval) {
+                lastP2pProbeMs = nowMs;
+                uint8_t localKey[32];
+                { std::lock_guard klk(key_mtx_); std::memcpy(localKey, key_, 32); }
+                uint8_t probe[16];
+                p2p::buildProbe(probe, 0x55, uint32_t(nowMs), localKey);
+                sendto(s, reinterpret_cast<const char*>(probe), sizeof(probe), 0,
+                       reinterpret_cast<sockaddr*>(&p2pRem), sizeof(p2pRem));
+            }
+        }
+
         sockaddr_in from{};
         int fromLen = sizeof(from);
         int n = recvfrom(s, reinterpret_cast<char*>(buf), sizeof(buf), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n < 12 || !has_key_.load()) continue;
-        // Drop spoofed foreign IP or port packets!
-        if (from.sin_addr.s_addr != rem.sin_addr.s_addr || from.sin_port != rem.sin_port) continue;
 
         uint8_t localKey[32];
         bool useXchacha = true;
@@ -736,6 +798,33 @@ void VoiceTransport::rxLoop() {
             std::memcpy(localKey, key_, 32);
             useXchacha = use_xchacha_;
         }
+
+        // Authenticated P2P Ping/Pong (0x55 / 0x56) -> locks direct 0-hop peer endpoint & measures real P2P RTT!
+        if (n == 16 && buf[0] == 0xFC) {
+            uint8_t pCmd = 0;
+            uint32_t pTs = 0;
+            if (p2p::verifyProbe(buf, n, localKey, pCmd, pTs)) {
+                last_p2p_rx_ms_.store(steadyMs());
+                {
+                    std::lock_guard lk(tx_mtx_);
+                    p2p_peer_ = from;
+                    has_p2p_peer_.store(true);
+                }
+                if (pCmd == 0x55) {
+                    uint8_t pong[16];
+                    p2p::buildProbe(pong, 0x56, pTs, localKey);
+                    sendto(s, reinterpret_cast<const char*>(pong), sizeof(pong), 0,
+                           reinterpret_cast<sockaddr*>(&from), sizeof(from));
+                } else if (pCmd == 0x56) {
+                    int32_t rtt = int32_t(uint32_t(steadyMs()) - pTs);
+                    if (rtt >= 0 && rtt < 2000) ping_ms_.store(std::max<int32_t>(1, rtt));
+                }
+            }
+            continue;
+        }
+
+        bool isRelaySrc = (from.sin_addr.s_addr == rem.sin_addr.s_addr && from.sin_port == rem.sin_port);
+        if (!isRelaySrc && !wantP2p) continue;
 
         uint8_t ptFull = buf[1];
         uint8_t pt = ptFull & 0x7F;
@@ -794,6 +883,11 @@ void VoiceTransport::rxLoop() {
             }
         }
         if (!ok || plen == 0) continue;
+        if (!isRelaySrc) {
+            last_p2p_rx_ms_.store(steadyMs());
+            std::lock_guard lk(tx_mtx_);
+            p2p_peer_ = from;
+        }
 
         // Strip RFC 3550 RTP Padding bytes if P bit (0x20) is set!
         if (hasPad && plen > 0) {

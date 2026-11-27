@@ -250,6 +250,8 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
     putBE16(req + 0, 0x0001);
     putBE16(req + 2, 70);
     putBE32(req + 4, ssrc);
+    const bool isWan = !p2p::isPrivateIpv4Addr(rem);
+    if (isWan) p2p::sendCloudflareStunReq(s);
     if (sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
                reinterpret_cast<sockaddr*>(&rem), sizeof(rem)) != sizeof(req)) {
         closesocket(s);
@@ -258,13 +260,19 @@ bool StreamReceiver::connectAndDiscover(const char* ip, uint16_t port, uint32_t 
 
     uint8_t resp[128]{};
     bool discOk = false;
-    int64_t deadlineMs = steadyMs() + 1500;
+    int64_t deadlineMs = steadyMs() + (isWan ? 2800 : 1500);
     while (steadyMs() < deadlineMs) {
         sockaddr_in from{};
         int fromLen = sizeof(from);
         int n = recvfrom(s, reinterpret_cast<char*>(resp), sizeof(resp), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n < 0) {
+            if (isWan) p2p::sendCloudflareStunReq(s);
+            sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
+                   reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
+            continue;
+        }
+        if (isWan && p2p::tryParseStunXorMapped(resp, n)) {
             sendto(s, reinterpret_cast<const char*>(req), sizeof(req), 0,
                    reinterpret_cast<sockaddr*>(&rem), sizeof(rem));
             continue;
@@ -322,6 +330,23 @@ void StreamReceiver::setCodec(int32_t codec, int32_t video_pt) {
     if (prevC != codec) reset_depack_.store(true);
 }
 
+void StreamReceiver::setP2pPeer(const char* ip, uint16_t port, bool allow_direct_tx) {
+    std::lock_guard lk(p2p_mtx_);
+    allow_p2p_tx_.store(allow_direct_tx);
+    if (!ip || !*ip || port == 0) {
+        has_p2p_peer_.store(false);
+        last_p2p_rx_ms_.store(0);
+        return;
+    }
+    sockaddr_in cand{};
+    cand.sin_family = AF_INET;
+    cand.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &cand.sin_addr) == 1) {
+        p2p_peer_ = cand;
+        has_p2p_peer_.store(true);
+    }
+}
+
 void StreamReceiver::resize(int32_t w, int32_t h) {
     if (w > 16 && h > 16) {
         pending_w_.store(w);
@@ -337,6 +362,9 @@ void StreamReceiver::stop() {
 void StreamReceiver::closeTransportLocked() {
     running_.store(false);
     has_key_.store(false);
+    has_p2p_peer_.store(false);
+    allow_p2p_tx_.store(false);
+    last_p2p_rx_ms_.store(0);
     reset_depack_.store(false);
 
     if (sock_ != INVALID_SOCKET) shutdown(sock_, SD_BOTH);
@@ -446,7 +474,16 @@ void StreamReceiver::rxDecodeLoop() {
     }
 
     ComPtr<IMFTransform> decMft;
+    ComPtr<IMFMediaEventGenerator> decEvGen;
+    bool isAsyncDecMft = false;
+    int decAsyncNeedInput = 0;
+    bool decProvidesSamples = true;
+    ComPtr<IMFSample> cpuOutSample;
+    ComPtr<IMFMediaBuffer> cpuOutBuf;
+    DWORD cpuOutCap = 0;
+    ComPtr<ID3D11Texture2D> cpuUploadNv12;
     int32_t activeDecCodec = -1;
+
     auto initDecoderForCodec = [&](int32_t targetCodec) {
         if (decMft && activeDecCodec == targetCodec) return;
         if (decMft) {
@@ -454,19 +491,25 @@ void StreamReceiver::rxDecodeLoop() {
             decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             ComPtr<IMFShutdown> shut;
             if (SUCCEEDED(decMft.As(&shut))) shut->Shutdown();
+            decEvGen.Reset();
             decMft.Reset();
         }
+        isAsyncDecMft = false;
+        decAsyncNeedInput = 0;
+        decProvidesSamples = true;
         activeDecCodec = targetCodec;
         const GUID subtype = (targetCodec == FC_CODEC_HEVC) ? MFVideoFormat_HEVC : MFVideoFormat_H264;
-        MFT_REGISTER_TYPE_INFO inInfo{ MFMediaType_Video, subtype };
 
         auto tryInitMft = [&](IMFTransform* mft, bool bindD3d) -> bool {
             if (!mft) return false;
+            bool asyncFlag = false;
             ComPtr<IMFAttributes> attrs;
             if (SUCCEEDED(mft->GetAttributes(&attrs)) && attrs) {
                 UINT32 isAsync = 0;
-                if (SUCCEEDED(attrs->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync)) && isAsync)
+                if (SUCCEEDED(attrs->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync)) && isAsync) {
                     attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+                    asyncFlag = true;
+                }
                 attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
             }
             if (bindD3d && dxgiMgr) {
@@ -489,20 +532,44 @@ void StreamReceiver::rxDecodeLoop() {
                 }
             }
             if (!outSet) return false;
+
+            ComPtr<IMFMediaEventGenerator> evg;
+            if (asyncFlag && FAILED(mft->QueryInterface(IID_PPV_ARGS(&evg)))) return false;
+
+            MFT_OUTPUT_STREAM_INFO osi{};
+            if (SUCCEEDED(mft->GetOutputStreamInfo(0, &osi))) {
+                decProvidesSamples = (osi.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+            }
             mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
             mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            isAsyncDecMft = asyncFlag;
+            decEvGen = evg;
+            decAsyncNeedInput = 0;
             return true;
         };
 
-        for (UINT32 flagsPass : { UINT32(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER),
-                                  UINT32(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER) }) {
+        // 1. For H.264, ALWAYS prefer Microsoft's synchronous D3D11VA/NVDEC CLSID_CMSH264DecoderMFT first!
+        if (targetCodec == FC_CODEC_H264) {
+            ComPtr<IMFTransform> cand;
+            if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&cand)))) {
+                if (tryInitMft(cand.Get(), true) || tryInitMft(cand.Get(), false)) {
+                    decMft = cand;
+                    return;
+                }
+            }
+        }
+
+        // 2. For HEVC (or fallback), try Sync MFTs first, then Hardware Async MFT (e.g. NVIDIA HEVC Decoder MFT with full IMFMediaEventGenerator!)
+        MFT_REGISTER_TYPE_INFO inInfo{ MFMediaType_Video, subtype };
+        for (UINT32 flagsPass : { UINT32(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER),
+                                  UINT32(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER) }) {
             IMFActivate** acts = nullptr;
             UINT32 count = 0;
             if (SUCCEEDED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flagsPass, &inInfo, nullptr, &acts, &count)) && count > 0) {
                 for (UINT32 i = 0; i < count; ++i) {
                     ComPtr<IMFTransform> cand;
                     if (!decMft && SUCCEEDED(acts[i]->ActivateObject(IID_PPV_ARGS(&cand)))) {
-                        if (tryInitMft(cand.Get(), (flagsPass & MFT_ENUM_FLAG_HARDWARE) != 0) || tryInitMft(cand.Get(), false)) {
+                        if (tryInitMft(cand.Get(), true) || tryInitMft(cand.Get(), false)) {
                             decMft = cand;
                         } else {
                             ComPtr<IMFShutdown> shut;
@@ -516,13 +583,6 @@ void StreamReceiver::rxDecodeLoop() {
                 if (decMft) return;
             } else if (acts) {
                 CoTaskMemFree(acts);
-            }
-        }
-
-        if (!decMft && targetCodec == FC_CODEC_H264) {
-            ComPtr<IMFTransform> cand;
-            if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&cand)))) {
-                if (tryInitMft(cand.Get(), true) || tryInitMft(cand.Get(), false)) decMft = cand;
             }
         }
     };
@@ -663,109 +723,188 @@ void StreamReceiver::rxDecodeLoop() {
         }
         sendto(sock_, reinterpret_cast<const char*>(outPkt), totalLen, 0,
                reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
+        if (allow_p2p_tx_.load() && has_p2p_peer_.load()) {
+            sockaddr_in p2pDst{};
+            { std::lock_guard plk(p2p_mtx_); p2pDst = p2p_peer_; }
+            sendto(sock_, reinterpret_cast<const char*>(outPkt), totalLen, 0,
+                   reinterpret_cast<sockaddr*>(&p2pDst), sizeof(p2pDst));
+        }
+    };
+
+    auto renegotiateDecoderOutput = [&]() {
+        if (!decMft) return;
+        for (DWORD i = 0; ; ++i) {
+            ComPtr<IMFMediaType> mtOut;
+            if (FAILED(decMft->GetOutputAvailableType(0, i, &mtOut))) break;
+            GUID sub{};
+            if (SUCCEEDED(mtOut->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_NV12) {
+                decMft->SetOutputType(0, mtOut.Get(), 0);
+                UINT32 dw = 0, dh = 0;
+                MFGetAttributeSize(mtOut.Get(), MF_MT_FRAME_SIZE, &dw, &dh);
+                curDecW = dw; curDecH = dh;
+                MFVideoArea area{};
+                UINT32 areaSize = 0;
+                if (SUCCEEDED(mtOut->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&area), sizeof(area), &areaSize)) &&
+                    areaSize >= sizeof(area) && area.Area.cx > 0 && area.Area.cy > 0) {
+                    dispAperture.left = area.OffsetX.value;
+                    dispAperture.top = area.OffsetY.value;
+                    dispAperture.right = area.OffsetX.value + area.Area.cx;
+                    dispAperture.bottom = area.OffsetY.value + area.Area.cy;
+                } else {
+                    dispAperture = { 0, 0, LONG(dw), LONG(dh) };
+                }
+                MFT_OUTPUT_STREAM_INFO osi{};
+                if (SUCCEEDED(decMft->GetOutputStreamInfo(0, &osi))) {
+                    decProvidesSamples = (osi.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+                }
+                vp.Reset(); vpenum.Reset();
+                cpuUploadNv12.Reset();
+                break;
+            }
+        }
+    };
+
+    auto presentDecodedTexture = [&](ID3D11Texture2D* decTex, UINT subRes) {
+        if (!decTex || !swap || !vdev || !vctx) return;
+        D3D11_TEXTURE2D_DESC td{};
+        decTex->GetDesc(&td);
+        if (curDecW != td.Width || curDecH != td.Height || !vp) {
+            curDecW = td.Width; curDecH = td.Height;
+            if (dispAperture.right <= dispAperture.left || dispAperture.right > LONG(curDecW) || dispAperture.bottom > LONG(curDecH)) {
+                dispAperture = { 0, 0, LONG(curDecW), LONG(curDecH) };
+            }
+            vp.Reset(); vpenum.Reset();
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC vcd{};
+            vcd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+            vcd.InputWidth = curDecW; vcd.InputHeight = curDecH;
+            vcd.OutputWidth = sw; vcd.OutputHeight = sh;
+            vcd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+            if (SUCCEEDED(vdev->CreateVideoProcessorEnumerator(&vcd, &vpenum)))
+                vdev->CreateVideoProcessor(vpenum.Get(), 0, &vp);
+        }
+        ComPtr<ID3D11Texture2D> backBuf;
+        if (vp && vpenum && SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&backBuf)))) {
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+            ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            ivd.Texture2D.ArraySlice = subRes;
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
+            ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            ComPtr<ID3D11VideoProcessorInputView> pin;
+            ComPtr<ID3D11VideoProcessorOutputView> pout;
+            if (SUCCEEDED(vdev->CreateVideoProcessorInputView(decTex, vpenum.Get(), &ivd, &pin)) &&
+                SUCCEEDED(vdev->CreateVideoProcessorOutputView(backBuf.Get(), vpenum.Get(), &ovd, &pout))) {
+                LONG visW = std::max<LONG>(1, dispAperture.right - dispAperture.left);
+                LONG visH = std::max<LONG>(1, dispAperture.bottom - dispAperture.top);
+                float srcAsp = float(visW) / float(visH);
+                float dstAsp = float(sw) / float(std::max<UINT>(1, sh));
+                RECT dstRc{ 0, 0, LONG(sw), LONG(sh) };
+                if (srcAsp > dstAsp) {
+                    LONG nh = LONG(float(sw) / srcAsp);
+                    dstRc.top = (LONG(sh) - nh) / 2;
+                    dstRc.bottom = dstRc.top + nh;
+                } else if (srcAsp < dstAsp) {
+                    LONG nw = LONG(float(sh) * srcAsp);
+                    dstRc.left = (LONG(sw) - nw) / 2;
+                    dstRc.right = dstRc.left + nw;
+                }
+                D3D11_VIDEO_COLOR bg{};
+                bg.RGBA = { 0.0f, 0.0f, 0.0f, 1.0f };
+                vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bg);
+                vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &dispAperture);
+                vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
+                D3D11_VIDEO_PROCESSOR_STREAM pst{};
+                pst.Enable = TRUE;
+                pst.pInputSurface = pin.Get();
+                vctx->VideoProcessorBlt(vp.Get(), pout.Get(), 0, 1, &pst);
+                swap->Present(0, 0);
+            }
+        }
+        framesDecoded++;
+        framesWindow++;
+    };
+
+    auto pullOneDecoderOutput = [&]() -> bool {
+        if (!decMft) return false;
+        MFT_OUTPUT_DATA_BUFFER outBuf{};
+        if (!decProvidesSamples) {
+            MFT_OUTPUT_STREAM_INFO osi{};
+            decMft->GetOutputStreamInfo(0, &osi);
+            DWORD wantCap = std::max<DWORD>(osi.cbSize, std::max<DWORD>(curDecW * curDecH * 2, 3840 * 2160 * 3 / 2));
+            if (!cpuOutSample || !cpuOutBuf || cpuOutCap < wantCap) {
+                cpuOutSample.Reset(); cpuOutBuf.Reset();
+                if (FAILED(MFCreateSample(&cpuOutSample)) || FAILED(MFCreateMemoryBuffer(wantCap, &cpuOutBuf))) return false;
+                cpuOutSample->AddBuffer(cpuOutBuf.Get());
+                cpuOutCap = wantCap;
+            }
+            cpuOutBuf->SetCurrentLength(0);
+            outBuf.pSample = cpuOutSample.Get();
+        }
+        DWORD status = 0;
+        HRESULT ohr = decMft->ProcessOutput(0, 1, &outBuf, &status);
+        if (outBuf.pEvents) { outBuf.pEvents->Release(); outBuf.pEvents = nullptr; }
+        if (ohr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            renegotiateDecoderOutput();
+            return true;
+        }
+        if (FAILED(ohr) || !outBuf.pSample) return false;
+
+        ComPtr<IMFMediaBuffer> ob;
+        if (SUCCEEDED(outBuf.pSample->GetBufferByIndex(0, &ob))) {
+            ComPtr<IMFDXGIBuffer> dxBuf;
+            ComPtr<ID3D11Texture2D> decTex;
+            UINT subRes = 0;
+            if (SUCCEEDED(ob.As(&dxBuf)) && SUCCEEDED(dxBuf->GetResource(IID_PPV_ARGS(&decTex))) &&
+                SUCCEEDED(dxBuf->GetSubresourceIndex(&subRes))) {
+                presentDecodedTexture(decTex.Get(), subRes);
+            } else if (dev && ctx && curDecW > 0 && curDecH > 0) {
+                BYTE* rawPtr = nullptr;
+                DWORD curLen = 0;
+                if (SUCCEEDED(ob->Lock(&rawPtr, nullptr, &curLen)) && rawPtr && curLen >= curDecW * curDecH * 3 / 2) {
+                    if (!cpuUploadNv12) {
+                        D3D11_TEXTURE2D_DESC nd{};
+                        nd.Width = curDecW; nd.Height = curDecH;
+                        nd.MipLevels = 1; nd.ArraySize = 1;
+                        nd.Format = DXGI_FORMAT_NV12;
+                        nd.SampleDesc.Count = 1;
+                        nd.Usage = D3D11_USAGE_DEFAULT;
+                        nd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+                        dev->CreateTexture2D(&nd, nullptr, &cpuUploadNv12);
+                    }
+                    if (cpuUploadNv12) {
+                        ctx->UpdateSubresource(cpuUploadNv12.Get(), 0, nullptr, rawPtr, curDecW, 0);
+                        presentDecodedTexture(cpuUploadNv12.Get(), 0);
+                    }
+                    ob->Unlock();
+                } else {
+                    framesDecoded++;
+                    framesWindow++;
+                }
+            } else {
+                framesDecoded++;
+                framesWindow++;
+            }
+        }
+        if (decProvidesSamples) outBuf.pSample->Release();
+        return true;
     };
 
     auto drainDecoderOutputs = [&]() {
         if (!decMft) return;
-        for (int drain = 0; drain < 32; ++drain) {
-            MFT_OUTPUT_DATA_BUFFER outBuf{};
-            DWORD status = 0;
-            HRESULT ohr = decMft->ProcessOutput(0, 1, &outBuf, &status);
-            if (outBuf.pEvents) { outBuf.pEvents->Release(); outBuf.pEvents = nullptr; }
-            if (ohr == MF_E_TRANSFORM_STREAM_CHANGE) {
-                for (DWORD i = 0; ; ++i) {
-                    ComPtr<IMFMediaType> mtOut;
-                    if (FAILED(decMft->GetOutputAvailableType(0, i, &mtOut))) break;
-                    GUID sub{};
-                    if (SUCCEEDED(mtOut->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_NV12) {
-                        decMft->SetOutputType(0, mtOut.Get(), 0);
-                        UINT32 dw = 0, dh = 0;
-                        MFGetAttributeSize(mtOut.Get(), MF_MT_FRAME_SIZE, &dw, &dh);
-                        curDecW = dw; curDecH = dh;
-                        MFVideoArea area{};
-                        UINT32 areaSize = 0;
-                        if (SUCCEEDED(mtOut->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&area), sizeof(area), &areaSize)) &&
-                            areaSize >= sizeof(area) && area.Area.cx > 0 && area.Area.cy > 0) {
-                            dispAperture.left = area.OffsetX.value;
-                            dispAperture.top = area.OffsetY.value;
-                            dispAperture.right = area.OffsetX.value + area.Area.cx;
-                            dispAperture.bottom = area.OffsetY.value + area.Area.cy;
-                        } else {
-                            dispAperture = { 0, 0, LONG(dw), LONG(dh) };
-                        }
-                        vp.Reset(); vpenum.Reset();
-                        break;
-                    }
-                }
-                continue;
+        if (isAsyncDecMft && decEvGen) {
+            for (int spin = 0; spin < 32; ++spin) {
+                ComPtr<IMFMediaEvent> ev;
+                HRESULT ehr = decEvGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
+                if (ehr == MF_E_NO_EVENTS_AVAILABLE || FAILED(ehr)) break;
+                MediaEventType met = MEUnknown;
+                ev->GetType(&met);
+                if (met == METransformNeedInput) decAsyncNeedInput++;
+                else if (met == METransformHaveOutput) pullOneDecoderOutput();
+                else if (met == 602 /*METransformDrainComplete*/) { }
             }
-            if (FAILED(ohr) || !outBuf.pSample) break;
-
-            ComPtr<IMFMediaBuffer> ob;
-            if (SUCCEEDED(outBuf.pSample->GetBufferByIndex(0, &ob))) {
-                ComPtr<IMFDXGIBuffer> dxBuf;
-                ComPtr<ID3D11Texture2D> decTex;
-                UINT subRes = 0;
-                if (SUCCEEDED(ob.As(&dxBuf)) && SUCCEEDED(dxBuf->GetResource(IID_PPV_ARGS(&decTex))) &&
-                    SUCCEEDED(dxBuf->GetSubresourceIndex(&subRes)) && swap && vdev && vctx) {
-                    D3D11_TEXTURE2D_DESC td{};
-                    decTex->GetDesc(&td);
-                    if (curDecW != td.Width || curDecH != td.Height || !vp) {
-                        curDecW = td.Width; curDecH = td.Height;
-                        if (dispAperture.right <= dispAperture.left || dispAperture.right > LONG(curDecW) || dispAperture.bottom > LONG(curDecH)) {
-                            dispAperture = { 0, 0, LONG(curDecW), LONG(curDecH) };
-                        }
-                        vp.Reset(); vpenum.Reset();
-                        D3D11_VIDEO_PROCESSOR_CONTENT_DESC vcd{};
-                        vcd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-                        vcd.InputWidth = curDecW; vcd.InputHeight = curDecH;
-                        vcd.OutputWidth = sw; vcd.OutputHeight = sh;
-                        vcd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-                        if (SUCCEEDED(vdev->CreateVideoProcessorEnumerator(&vcd, &vpenum)))
-                            vdev->CreateVideoProcessor(vpenum.Get(), 0, &vp);
-                    }
-                    ComPtr<ID3D11Texture2D> backBuf;
-                    if (vp && vpenum && SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&backBuf)))) {
-                        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-                        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-                        ivd.Texture2D.ArraySlice = subRes;
-                        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
-                        ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-                        ComPtr<ID3D11VideoProcessorInputView> pin;
-                        ComPtr<ID3D11VideoProcessorOutputView> pout;
-                        if (SUCCEEDED(vdev->CreateVideoProcessorInputView(decTex.Get(), vpenum.Get(), &ivd, &pin)) &&
-                            SUCCEEDED(vdev->CreateVideoProcessorOutputView(backBuf.Get(), vpenum.Get(), &ovd, &pout))) {
-                            LONG visW = std::max<LONG>(1, dispAperture.right - dispAperture.left);
-                            LONG visH = std::max<LONG>(1, dispAperture.bottom - dispAperture.top);
-                            float srcAsp = float(visW) / float(visH);
-                            float dstAsp = float(sw) / float(std::max<UINT>(1, sh));
-                            RECT dstRc{ 0, 0, LONG(sw), LONG(sh) };
-                            if (srcAsp > dstAsp) {
-                                LONG nh = LONG(float(sw) / srcAsp);
-                                dstRc.top = (LONG(sh) - nh) / 2;
-                                dstRc.bottom = dstRc.top + nh;
-                            } else if (srcAsp < dstAsp) {
-                                LONG nw = LONG(float(sh) * srcAsp);
-                                dstRc.left = (LONG(sw) - nw) / 2;
-                                dstRc.right = dstRc.left + nw;
-                            }
-                            D3D11_VIDEO_COLOR bg{};
-                            bg.RGBA = { 0.0f, 0.0f, 0.0f, 1.0f };
-                            vctx->VideoProcessorSetOutputBackgroundColor(vp.Get(), FALSE, &bg);
-                            vctx->VideoProcessorSetStreamSourceRect(vp.Get(), 0, TRUE, &dispAperture);
-                            vctx->VideoProcessorSetStreamDestRect(vp.Get(), 0, TRUE, &dstRc);
-                            D3D11_VIDEO_PROCESSOR_STREAM pst{};
-                            pst.Enable = TRUE;
-                            pst.pInputSurface = pin.Get();
-                            vctx->VideoProcessorBlt(vp.Get(), pout.Get(), 0, 1, &pst);
-                            swap->Present(0, 0);
-                            framesDecoded++;
-                            framesWindow++;
-                        }
-                    }
-                }
+        } else {
+            for (int drain = 0; drain < 32; ++drain) {
+                if (!pullOneDecoderOutput()) break;
             }
-            outBuf.pSample->Release();
         }
     };
 
@@ -847,10 +986,19 @@ void StreamReceiver::rxDecodeLoop() {
         }
 
         auto tDec0 = std::chrono::steady_clock::now();
+        drainDecoderOutputs();
+        if (isAsyncDecMft && decAsyncNeedInput <= 0) {
+            // Wait up to 8ms for async hardware decoder input slot on burst keyframes
+            for (int w = 0; w < 8 && decAsyncNeedInput <= 0; ++w) {
+                Sleep(1);
+                drainDecoderOutputs();
+            }
+        }
         mftFed++;
         ComPtr<IMFSample> inSamp;
         ComPtr<IMFMediaBuffer> mb;
-        if (SUCCEEDED(MFCreateSample(&inSamp)) && SUCCEEDED(MFCreateMemoryBuffer(DWORD(frameLen), &mb))) {
+        if ((!isAsyncDecMft || decAsyncNeedInput > 0) &&
+            SUCCEEDED(MFCreateSample(&inSamp)) && SUCCEEDED(MFCreateMemoryBuffer(DWORD(frameLen), &mb))) {
             BYTE* dst = nullptr;
             if (SUCCEEDED(mb->Lock(&dst, nullptr, nullptr))) {
                 std::memcpy(dst, frameData, frameLen);
@@ -862,7 +1010,9 @@ void StreamReceiver::rxDecodeLoop() {
                     drainDecoderOutputs();
                     phr = decMft->ProcessInput(0, inSamp.Get(), 0);
                 }
-                if (FAILED(phr)) {
+                if (SUCCEEDED(phr)) {
+                    if (isAsyncDecMft) decAsyncNeedInput--;
+                } else {
                     decNeedsKf = true;
                     depack.setNeedKeyframe(true);
                 }
@@ -912,8 +1062,13 @@ void StreamReceiver::rxDecodeLoop() {
             cachedVps.clear();
             cachedSps.clear();
             cachedPps.clear();
-            if (decMft) decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            if (decMft) {
+                decMft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                decMft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+                decAsyncNeedInput = 0;
+            }
         }
+        if (isAsyncDecMft) drainDecoderOutputs();
 
         int32_t rw = pending_w_.exchange(0);
         int32_t rh = pending_h_.exchange(0);
@@ -947,6 +1102,21 @@ void StreamReceiver::rxDecodeLoop() {
                        reinterpret_cast<sockaddr*>(&remote_), sizeof(remote_));
                 lastKeepaliveMs = nowMs;
             }
+            if (has_p2p_peer_.load() && nowMs - lastPliMs > 500) {
+                bool locked = last_p2p_rx_ms_.load() > 0 && (nowMs - last_p2p_rx_ms_.load() < 8000);
+                static thread_local int64_t lastWatchProbe = 0;
+                if (nowMs - lastWatchProbe >= (locked ? 3500 : 450)) {
+                    lastWatchProbe = nowMs;
+                    uint8_t localKey[32];
+                    { std::lock_guard klk(key_mtx_); std::memcpy(localKey, key_, 32); }
+                    sockaddr_in p2pDst{};
+                    { std::lock_guard plk(p2p_mtx_); p2pDst = p2p_peer_; }
+                    uint8_t probe[16];
+                    p2p::buildProbe(probe, 0x55, uint32_t(nowMs), localKey);
+                    sendto(sock_, reinterpret_cast<const char*>(probe), sizeof(probe), 0,
+                           reinterpret_cast<sockaddr*>(&p2pDst), sizeof(p2pDst));
+                }
+            }
             uint32_t vs = video_ssrc_.load();
             if (vs != 0 && (depack.needKeyframe() || decNeedsKf) && (nowMs - lastPliMs > 600)) {
                 sendEncryptedRtcpPli(vs);
@@ -958,8 +1128,24 @@ void StreamReceiver::rxDecodeLoop() {
         int fromLen = sizeof(from);
         int n = recvfrom(sock_, reinterpret_cast<char*>(pkt), sizeof(pkt), 0,
                          reinterpret_cast<sockaddr*>(&from), &fromLen);
-        if (n < 28 || !has_key_.load() ||
-            from.sin_addr.s_addr != rem.sin_addr.s_addr || from.sin_port != rem.sin_port) {
+        if (n == 16 && pkt[0] == 0xFC && has_key_.load()) {
+            uint8_t localKey[32];
+            { std::lock_guard klk(key_mtx_); std::memcpy(localKey, key_, 32); }
+            uint8_t pCmd = 0; uint32_t pTs = 0;
+            if (p2p::verifyProbe(pkt, n, localKey, pCmd, pTs)) {
+                last_p2p_rx_ms_.store(steadyMs());
+                { std::lock_guard plk(p2p_mtx_); p2p_peer_ = from; has_p2p_peer_.store(true); }
+                if (pCmd == 0x55) {
+                    uint8_t pong[16];
+                    p2p::buildProbe(pong, 0x56, pTs, localKey);
+                    sendto(sock_, reinterpret_cast<const char*>(pong), sizeof(pong), 0,
+                           reinterpret_cast<sockaddr*>(&from), sizeof(from));
+                }
+            }
+            continue;
+        }
+        bool isRelaySrc = (from.sin_addr.s_addr == rem.sin_addr.s_addr && from.sin_port == rem.sin_port);
+        if (n < 28 || !has_key_.load() || (!isRelaySrc && !has_p2p_peer_.load())) {
             bool anyPli = false;
             bool stepPli = false;
             while (depack.tryEmit(steadyMs(), readyFrame, stepPli)) {
@@ -1028,6 +1214,11 @@ void StreamReceiver::rxDecodeLoop() {
             }
         }
         if (!ok) continue;
+        if (!isRelaySrc) {
+            last_p2p_rx_ms_.store(steadyMs());
+            std::lock_guard plk(p2p_mtx_);
+            p2p_peer_ = from;
+        }
         rxUdpPkts++;
 
         // Strip RFC 3550 RTP Padding bytes if P bit (0x20) is set!
@@ -1124,6 +1315,10 @@ void StreamReceiver::rxDecodeLoop() {
         ComPtr<IMFShutdown> shut;
         if (SUCCEEDED(decMft.As(&shut))) shut->Shutdown();
     }
+    cpuOutBuf.Reset();
+    cpuOutSample.Reset();
+    cpuUploadNv12.Reset();
+    decEvGen.Reset();
     decMft.Reset();
     dxgiMgr.Reset();
     swap.Reset();

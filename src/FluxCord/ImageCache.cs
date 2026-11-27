@@ -340,6 +340,32 @@ public static partial class ImageCache
         }
     }
 
+    public static byte[]? DecodeLocalIconBgra(string path, int size)
+    {
+        if (!File.Exists(path) || size <= 0) return null;
+        try
+        {
+            byte[] raw = File.ReadAllBytes(path);
+            int hr = CoInitializeEx(0, 0x2);
+            try
+            {
+                using var wic = new IWICImagingFactory();
+                using var ms = new MemoryStream(raw);
+                using var dec = wic.CreateDecoderFromStream(ms, DecodeOptions.CacheOnDemand);
+                using var frame = dec.GetFrame(0);
+                using var conv = wic.CreateFormatConverter();
+                conv.Initialize(frame, Vortice.WIC.PixelFormat.Format32bppBGRA, BitmapDitherType.None, null, 0, BitmapPaletteType.Custom);
+                using var scaler = wic.CreateBitmapScaler();
+                scaler.Initialize(conv, (uint)size, (uint)size, Vortice.WIC.BitmapInterpolationMode.Fant);
+                byte[] px = new byte[size * size * 4];
+                scaler.CopyPixels((uint)(size * 4), px);
+                return px;
+            }
+            finally { if (hr is 0 or 1) CoUninitialize(); }
+        }
+        catch { return null; }
+    }
+
     public static void ClearGpu()
     {
         foreach (var b in _gpu.Values)

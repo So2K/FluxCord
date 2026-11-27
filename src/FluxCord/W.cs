@@ -8,16 +8,19 @@ internal static unsafe partial class W
         WM_PAINT = 0x000F, WM_CLOSE = 0x0010, WM_QUERYENDSESSION = 0x0011, WM_ERASEBKGND = 0x0014,
         WM_ENDSESSION = 0x0016, WM_SETCURSOR = 0x0020,
         WM_GETMINMAXINFO = 0x0024, WM_SETFONT = 0x0030, WM_CONTEXTMENU = 0x007B,
+        WM_SIZING = 0x0214, WM_ENTERSIZEMOVE = 0x0231, WM_EXITSIZEMOVE = 0x0232,
         WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101,
         WM_CHAR = 0x0102, WM_COMMAND = 0x0111, WM_TIMER = 0x0113, WM_CTLCOLOREDIT = 0x0133,
         WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_LBUTTONDBLCLK = 0x0203,
         WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_MOUSEWHEEL = 0x020A,
         WM_CAPTURECHANGED = 0x0215,
         WM_DROPFILES = 0x0233,
-        WM_MOUSELEAVE = 0x02A3, WM_DPICHANGED = 0x02E0, WM_APP = 0x8000,
+        WM_MOUSELEAVE = 0x02A3, WM_DPICHANGED = 0x02E0, WM_HOTKEY = 0x0312, WM_APP = 0x8000,
         WM_NCCALCSIZE = 0x0083, WM_NCHITTEST = 0x0084, WM_SETICON = 0x0080;
+    public const uint MOD_ALT = 0x0001, MOD_CONTROL = 0x0002, MOD_SHIFT = 0x0004, MOD_NOREPEAT = 0x4000;
     public const uint NIM_ADD = 0x00000000, NIM_MODIFY = 0x00000001, NIM_DELETE = 0x00000002,
-        NIF_MESSAGE = 0x00000001, NIF_ICON = 0x00000002, NIF_TIP = 0x00000004;
+        NIF_MESSAGE = 0x00000001, NIF_ICON = 0x00000002, NIF_TIP = 0x00000004, NIF_INFO = 0x00000010,
+        NIIF_INFO = 0x00000001, NIIF_NOSOUND = 0x00000010;
     public const uint MF_STRING = 0x0000, MF_CHECKED = 0x0008, MF_SEPARATOR = 0x0800;
     public const uint TPM_RIGHTBUTTON = 0x0002, TPM_BOTTOMALIGN = 0x0020, TPM_NONOTIFY = 0x0080, TPM_RETURNCMD = 0x0100;
     public const uint IMAGE_ICON = 1, LR_DEFAULTSIZE = 0x0040;
@@ -158,7 +161,10 @@ internal static unsafe partial class W
     [LibraryImport("gdi32.dll")] public static partial int CombineRgn(nint dst, nint src1, nint src2, int mode);
     [LibraryImport("user32.dll")] public static partial int SetWindowRgn(nint h, nint rgn, [MarshalAs(UnmanagedType.Bool)] bool redraw);
 
+    [StructLayout(LayoutKind.Sequential)] public struct MARGINS { public int L, R, T, B; }
+
     [LibraryImport("dwmapi.dll")] public static partial int DwmSetWindowAttribute(nint h, uint attr, void* value, uint size);
+    [LibraryImport("dwmapi.dll")] public static partial int DwmExtendFrameIntoClientArea(nint h, MARGINS* margins);
     [LibraryImport("uxtheme.dll", EntryPoint = "#135")] public static partial int SetPreferredAppMode(int mode);
 
     [LibraryImport("crypt32.dll")]
@@ -227,6 +233,77 @@ internal static unsafe partial class W
             if (SetClipboardData(13, mem) == 0) GlobalFree(mem); // prevent leak if SetClipboardData fails
         }
         finally { CloseClipboard(); }
+    }
+
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool RegisterHotKey(nint hWnd, int id, uint fsModifiers, uint vk);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool UnregisterHotKey(nint hWnd, int id);
+
+    [StructLayout(LayoutKind.Sequential)] public struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+    [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFO { public uint biSize; public int biWidth, biHeight; public ushort biPlanes, biBitCount; public uint biCompression, biSizeImage; public int biXPelsPerMeter, biYPelsPerMeter; public uint biClrUsed, biClrImportant; }
+    [LibraryImport("user32.dll")] public static partial nint GetDC(nint hWnd);
+    [LibraryImport("user32.dll")] public static partial int ReleaseDC(nint hWnd, nint hDC);
+    [LibraryImport("gdi32.dll")] public static partial nint CreateCompatibleDC(nint hdc);
+    [LibraryImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool DeleteDC(nint hdc);
+    [LibraryImport("gdi32.dll")] public static partial nint SelectObject(nint hdc, nint h);
+    [LibraryImport("gdi32.dll")] public static partial nint CreateDIBSection(nint hdc, BITMAPINFO* pbmi, uint usage, out byte* ppvBits, nint hSection, uint offset);
+    [LibraryImport("user32.dll", StringMarshalling = StringMarshalling.Utf16)] public static partial int DrawTextW(nint hdc, string lpchText, int cchText, RECT* lprc, uint format);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool UpdateLayeredWindow(nint hWnd, nint hdcDst, POINT* pptDst, POINT* psize, nint hdcSrc, POINT* pptSrc, uint crKey, BLENDFUNCTION* pblend, uint dwFlags);
+
+    public static string FormatHotkey(uint mod, uint vk)
+    {
+        var parts = new List<string>();
+        if ((mod & MOD_CONTROL) != 0) parts.Add("Ctrl");
+        if ((mod & MOD_SHIFT) != 0) parts.Add("Shift");
+        if ((mod & MOD_ALT) != 0) parts.Add("Alt");
+        string kn = vk switch
+        {
+            >= 0x41 and <= 0x5A => ((char)vk).ToString(),
+            >= 0x30 and <= 0x39 => ((char)vk).ToString(),
+            >= 0x70 and <= 0x7B => $"F{vk - 0x6F}",
+            0x20 => "Space",
+            0xC0 => "`",
+            0x09 => "Tab",
+            _ => $"0x{vk:X2}"
+        };
+        parts.Add(kn);
+        return string.Join("+", parts);
+    }
+    [LibraryImport("advapi32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int RegCreateKeyExW(nint hKey, string lpSubKey, uint reserved, string? lpClass, uint dwOptions, uint samDesired, nint lpSecurityAttributes, out nint phkResult, out uint lpdwDisposition);
+    [LibraryImport("advapi32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int RegSetValueExW(nint hKey, string lpValueName, uint reserved, uint dwType, char* lpData, uint cbData);
+    [LibraryImport("advapi32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int RegDeleteValueW(nint hKey, string lpValueName);
+    [LibraryImport("advapi32.dll")]
+    private static partial int RegCloseKey(nint hKey);
+
+    public static void SetWindowsAutostart(bool enable, bool startMinimized)
+    {
+        nint HKEY_CURRENT_USER = unchecked((nint)0x80000001);
+        const uint KEY_WRITE = 0x20006;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, @"Software\Microsoft\Windows\CurrentVersion\Run", 0, null, 0, KEY_WRITE, 0, out nint hKey, out _) != 0)
+            return;
+        try
+        {
+            if (enable)
+            {
+                string exe = Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "FluxCordP2P.exe");
+                string val = startMinimized ? $"\"{exe}\" --minimized" : $"\"{exe}\"";
+                fixed (char* p = val)
+                    RegSetValueExW(hKey, "FluxCord", 0, 1 /*REG_SZ*/, p, (uint)((val.Length + 1) * 2));
+            }
+            else
+            {
+                RegDeleteValueW(hKey, "FluxCord");
+            }
+        }
+        finally { RegCloseKey(hKey); }
+    }
+
+    public static void OpenLocalFile(string path)
+    {
+        if (!string.IsNullOrEmpty(path) && File.Exists(path))
+            ShellExecuteW(0, "open", path, null, Path.GetDirectoryName(path), 5);
     }
 
     public static void OpenUrl(string url)
@@ -336,11 +413,71 @@ internal static unsafe partial class W
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetOpenFileNameW(OPENFILENAMEW* ofn);
 
-    public static string? PickFile(nint owner)
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ICONINFO
+    {
+        public int fIcon;
+        public uint xHotspot, yHotspot;
+        public nint hbmMask, hbmColor;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BITMAPV5HEADER
+    {
+        public uint bV5Size;
+        public int bV5Width, bV5Height;
+        public ushort bV5Planes, bV5BitCount;
+        public uint bV5Compression, bV5SizeImage;
+        public int bV5XPelsPerMeter, bV5YPelsPerMeter;
+        public uint bV5ClrUsed, bV5ClrImportant;
+        public uint bV5RedMask, bV5GreenMask, bV5BlueMask, bV5AlphaMask;
+        public uint bV5CSType;
+        public fixed int bV5Endpoints[9];
+        public uint bV5GammaRed, bV5GammaGreen, bV5GammaBlue;
+        public uint bV5Intent, bV5ProfileData, bV5ProfileSize, bV5Reserved;
+    }
+
+    [LibraryImport("user32.dll")] public static partial nint CreateIconIndirect(ICONINFO* piconinfo);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool DestroyIcon(nint hIcon);
+    [LibraryImport("gdi32.dll")] public static partial nint CreateDIBSection(nint hdc, BITMAPV5HEADER* pbmi, uint usage, void** ppvBits, nint hSection, uint offset);
+    [LibraryImport("gdi32.dll")] public static partial nint CreateBitmap(int nWidth, int nHeight, uint nPlanes, uint nBitCount, nint lpBits);
+
+    public static nint CreateHIconFromBgra(byte[] bgra, int size)
+    {
+        if (bgra.Length < size * size * 4) return 0;
+        var bi = new BITMAPV5HEADER
+        {
+            bV5Size = (uint)sizeof(BITMAPV5HEADER),
+            bV5Width = size,
+            bV5Height = -size, // top-down
+            bV5Planes = 1,
+            bV5BitCount = 32,
+            bV5Compression = 3, // BI_BITFIELDS
+            bV5RedMask = 0x00FF0000,
+            bV5GreenMask = 0x0000FF00,
+            bV5BlueMask = 0x000000FF,
+            bV5AlphaMask = 0xFF000000
+        };
+        void* bits = null;
+        nint hColor = CreateDIBSection(0, &bi, 0, &bits, 0, 0);
+        if (hColor == 0 || bits == null) return 0;
+        fixed (byte* src = bgra) Buffer.MemoryCopy(src, bits, size * size * 4, size * size * 4);
+        nint hMask = CreateBitmap(size, size, 1, 1, 0);
+        var ii = new ICONINFO { fIcon = 1, hbmMask = hMask, hbmColor = hColor };
+        nint hIcon = CreateIconIndirect(&ii);
+        DeleteObject(hColor);
+        if (hMask != 0) DeleteObject(hMask);
+        return hIcon;
+    }
+
+    public static string? PickFile(nint owner, bool imagesOnly = false)
     {
         var buf = new char[1024];
+        string filter = imagesOnly
+            ? "Изображения (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0Все файлы (*.*)\0*.*\0\0"
+            : "Все файлы (*.*)\0*.*\0Изображения (*.png;*.jpg;*.webp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.gif\0\0";
         fixed (char* pBuf = buf)
-        fixed (char* pFilter = "Все файлы (*.*)\0*.*\0Изображения (*.png;*.jpg;*.webp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.gif\0\0")
+        fixed (char* pFilter = filter)
         {
             var ofn = new OPENFILENAMEW
             {

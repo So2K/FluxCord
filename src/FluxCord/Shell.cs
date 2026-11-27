@@ -105,6 +105,14 @@ public static unsafe partial class Shell
     private static string _toast = "";
     private static long _toastUntil;
     private static long _lastStatsTick;
+    private static readonly HashSet<string> _revealedSpoilers = new();
+
+    public static bool IsLocalSpeaking => _localSpeakAnim > 0.12f;
+    public static void NotifyOverlayToggled()
+    {
+        Toast(SettingsStore.Current.GameOverlayEnabled ? "🎮 Игровой оверлей включён" : "🎮 Игровой оверлей выключен");
+        App.WakeUi();
+    }
 
     private static FcAudioStats _audioStats;
     private static float _localVoiceLevel, _localSpeakAnim;
@@ -396,6 +404,13 @@ public static unsafe partial class Shell
             dc.UpdateLocalSpeaking(dc.VoiceConnected && selfSpk, _localVoiceLevel);
             if (selfSpk != _prevLocalSpkPoll || selfSpk) { _prevLocalSpkPoll = selfSpk; needRedraw = true; }
 
+            TrayVoiceState traySt = !dc.VoiceConnected ? TrayVoiceState.Idle
+                : _deafened ? TrayVoiceState.Deafened
+                : _muted ? TrayVoiceState.Muted
+                : selfSpk ? TrayVoiceState.Speaking
+                : TrayVoiceState.VoiceConnected;
+            App.UpdateTrayVoiceState(traySt);
+
             // Check if any peer speaking state changed (Guild Voice OR DM / Group DM Call!)
             int peerHash = 0;
             if (dc.VoiceConnected)
@@ -411,6 +426,8 @@ public static unsafe partial class Shell
             if (_loopback || _showSettings || _audioPopupMode != 0 || _showVoiceInfo) needRedraw = true;
             if (_streaming && _selfScreenStats.FramesEncoded == 0) needRedraw = true;
         }
+        if (!wantStats) App.UpdateTrayVoiceState(TrayVoiceState.Idle);
+        GameOverlay.Tick();
         if (!string.IsNullOrEmpty(_toast) && now >= _toastUntil) { _toast = ""; needRedraw = true; }
         return needRedraw;
     }
@@ -873,9 +890,9 @@ public static unsafe partial class Shell
         TopBarRightZoneWidth = rightZone;
 
         if (UI.Button(UI.Id("win_min"), new R(bx, r.Y + 4, 40, 30), "—", 0x00000000, Th.Sub, 4))
-            W.ShowWindow(App.Hwnd, W.SW_MINIMIZE);
+            App.InvokeOnUiThread(() => W.ShowWindow(App.Hwnd, W.SW_MINIMIZE));
         if (UI.Button(UI.Id("win_max"), new R(bx + 44, r.Y + 4, 40, 30), "□", 0x00000000, Th.Sub, 4))
-            W.ShowWindow(App.Hwnd, W.IsZoomed(App.Hwnd) ? W.SW_SHOWNORMAL : W.SW_MAXIMIZE);
+            App.InvokeOnUiThread(() => W.ShowWindow(App.Hwnd, W.IsZoomed(App.Hwnd) ? W.SW_SHOWNORMAL : W.SW_MAXIMIZE));
         if (UI.Button(UI.Id("win_cls"), new R(bx + 88, r.Y + 4, 40, 30), "✕", 0x00000000, Th.Red, 4))
             W.PostMessageW(App.Hwnd, W.WM_CLOSE, 0, 0);
     }
@@ -1981,7 +1998,7 @@ public static unsafe partial class Shell
         Gfx.FillRect(fsBtn, UI.Hover(fsBtn) ? Th.Hover : Th.Card, 8);
         Gfx.DrawIcon(W.IsZoomed(App.Hwnd) ? IcMin : IcMax, "⛶", fsBtn, 16, Th.Text);
         if (UI.Click(UI.Id("vs_fs"), fsBtn))
-            W.ShowWindow(App.Hwnd, W.IsZoomed(App.Hwnd) ? W.SW_SHOWNORMAL : W.SW_MAXIMIZE);
+            App.InvokeOnUiThread(() => W.ShowWindow(App.Hwnd, W.IsZoomed(App.Hwnd) ? W.SW_SHOWNORMAL : W.SW_MAXIMIZE));
     }
 
     // ---------------- Text Chat Stage (Search, Pins, Member List, Markdown Code Blocks, Lightbox, Reactions, Edit, Emoji) ----------------
@@ -2315,7 +2332,7 @@ public static unsafe partial class Shell
                     ? 0f
                     : (hasCode
                         ? Gfx.MeasureText(m.Content.Replace("```", "").Trim(), 13f, 400, MathF.Max(60f, MathF.Min(textW, 640f) - 20f)).H + 20f
-                        : Gfx.MeasureText(m.Content, 14f, 400, textW).H);
+                        : Gfx.MeasureMarkdownText(isQuote ? m.Content.TrimStart().Substring(2) : m.Content, 14f, isQuote ? textW - 10 : textW).H);
                 float replyH = string.IsNullOrEmpty(m.ReplyPreview) ? 0f : 18f;
 
                 // Measure ALL attachments (images + file cards!)
@@ -2417,12 +2434,16 @@ public static unsafe partial class Shell
                     else if (isQuote)
                     {
                         Gfx.FillRect(new R(msgArea.X + 64, cy + 2, 3.5f, MathF.Max(16, textH - 2)), Th.Dim, 1.5f);
-                        Gfx.DrawText(m.Content.TrimStart().Substring(2), new R(msgArea.X + 74, cy, textW - 10, textH + 6), 14, Th.Sub, 400, 0, true);
+                        Gfx.DrawMarkdownText(m.Content.TrimStart().Substring(2), new R(msgArea.X + 74, cy, textW - 10, textH + 6), 14, Th.Sub, m.Id, _revealedSpoilers, out var qUrl, out var qSp);
+                        if (qUrl != null) W.OpenUrl(qUrl);
+                        if (qSp != null) { if (!_revealedSpoilers.Add(qSp)) _revealedSpoilers.Remove(qSp); }
                         cy += textH + 4;
                     }
                     else
                     {
-                        Gfx.DrawText(m.Content, new R(msgArea.X + 64, cy, textW, textH + 6), 14, Th.Text, 400, 0, true);
+                        Gfx.DrawMarkdownText(m.Content, new R(msgArea.X + 64, cy, textW, textH + 6), 14, Th.Text, m.Id, _revealedSpoilers, out var mUrl, out var mSp);
+                        if (mUrl != null) W.OpenUrl(mUrl);
+                        if (mSp != null) { if (!_revealedSpoilers.Add(mSp)) _revealedSpoilers.Remove(mSp); }
                         cy += textH + 4;
                     }
                 }
@@ -2571,6 +2592,34 @@ public static unsafe partial class Shell
             var jmp = new R(msgArea.X + (msgArea.W - 190) * 0.5f, msgArea.Bottom - 36, 190, 28);
             if (UI.Button(UI.Id("chat_bot"), jmp, "↓ К новым сообщениям", 0xEE5865F2, 0xFFFFFFFF, 14, 12, 700))
                 _chatScroll = 0;
+        }
+
+        // Discord-style Floating PiP Mini-Window of Active Stream inside Text Chat!
+        if (SettingsStore.Current.ShowPiPInChat && (dc.IsWatchingAnyStream || _streaming) && msgArea.W > 420 && msgArea.H > 240)
+        {
+            var watches = dc.GetWatchSessionsSnapshot();
+            bool showRemote = watches.Count > 0;
+            var firstWatch = showRemote ? watches[0] : null;
+            float pipW = 288f, pipH = 162f;
+            var pipCard = new R(msgArea.Right - pipW - 14, msgArea.Bottom - pipH - 36, pipW, pipH + 28);
+            Gfx.FillRect(pipCard, 0xF511131A, 10);
+            Gfx.StrokeRect(pipCard, Th.Brand, 1.2f, 10);
+
+            string pipTitle = showRemote ? $"🔴 {firstWatch!.StreamerName}" : "🔴 Мой экран (PiP)";
+            Gfx.DrawText(pipTitle, new R(pipCard.X + 10, pipCard.Y + 6, pipCard.W - 88, 16), 11.5f, Th.Text, 700);
+            if (UI.Button(UI.Id("pip_exp"), new R(pipCard.Right - 72, pipCard.Y + 3, 42, 22), "⛶", Th.Card, Th.Cyan, 5, 12f))
+                _inVoiceStage = true;
+            if (UI.Button(UI.Id("pip_cls"), new R(pipCard.Right - 26, pipCard.Y + 3, 22, 22), "✕", Th.Card, Th.Sub, 5, 11f))
+            { SettingsStore.Current.ShowPiPInChat = false; SettingsStore.Save(); }
+
+            var vidR = new R(pipCard.X + 2, pipCard.Y + 28, pipW - 4, pipH - 2);
+            if (showRemote && firstWatch != null && firstWatch.Slot >= 0 && firstWatch.Slot < App.MaxWatchSlots)
+                _watchSlotsLayout[firstWatch.Slot] = (true, vidR);
+            else if (_streaming)
+            {
+                _wantSelfHost = true;
+                _selfHostRect = vidR;
+            }
         }
 
         // Right-Side Member List Sidebar (224px — works for BOTH Guilds AND Group DMs!)

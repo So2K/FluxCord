@@ -809,10 +809,38 @@ public static unsafe partial class Shell
             }
             y += 8;
 
+            // Discord-style Two-Tone Interactive VAD Sensitivity Bar
+            Gfx.DrawText($"ЧУВСТВИТЕЛЬНОСТЬ ВВОДА (VAD ПОРОГ: {s.GateDb:F0} dB)", new R(px, y, pw, 16), 11, Th.Sub, 700);
+            y += 20;
+            var vadTrack = new R(px, y + 6, pw, 12);
+            float gateNorm = Math.Clamp((s.GateDb - (-75f)) / 60f, 0f, 1f);
+            float splitX = vadTrack.X + vadTrack.W * gateNorm;
+            float liveDb = 20f * MathF.Log10(MathF.Max(_audioStats.RawRms, 1e-5f));
+            float liveNorm = Math.Clamp((liveDb - (-75f)) / 60f, 0f, 1f);
+            float liveW = vadTrack.W * liveNorm;
+            Gfx.FillRect(new R(vadTrack.X, vadTrack.Y, MathF.Max(0, splitX - vadTrack.X), vadTrack.H), 0x44F59E0B, 6);
+            Gfx.FillRect(new R(splitX, vadTrack.Y, MathF.Max(0, vadTrack.Right - splitX), vadTrack.H), 0x4423A55A, 6);
+            if (liveW > 1f)
+            {
+                float orangeW = MathF.Min(liveW, splitX - vadTrack.X);
+                if (orangeW > 0.5f) Gfx.FillRect(new R(vadTrack.X, vadTrack.Y, orangeW, vadTrack.H), Th.Amber, 6);
+                if (liveW > splitX - vadTrack.X)
+                    Gfx.FillRect(new R(splitX, vadTrack.Y, liveW - (splitX - vadTrack.X), vadTrack.H), Th.Green, 6);
+            }
+            Gfx.FillRect(new R(splitX - 3f, vadTrack.Y - 4f, 6f, vadTrack.H + 8f), 0xFFFFFFFF, 3);
+            var vadHit = new R(vadTrack.X - 4, vadTrack.Y - 6, vadTrack.W + 8, vadTrack.H + 12);
+            if (UI.Hover(vadHit) && UI.Down)
+            {
+                float nt = Math.Clamp((UI.MX - vadTrack.X) / MathF.Max(1f, vadTrack.W), 0f, 1f);
+                s.GateDb = -75f + nt * 60f;
+                changed = true;
+            }
+            y += 30;
+
             float str = s.NoiseStrength;
             if (UI.Slider(UI.Id("sl_str"), new R(px, y, halfW, 38), "Сила шумоподавления", ref str, 0f, 1f)) { s.NoiseStrength = str; changed = true; }
             float gate = s.GateDb;
-            if (UI.Slider(UI.Id("sl_gate"), new R(px + halfW + 16, y, halfW, 38), "Чувствительность ввода (Gate)", ref gate, -70f, -15f, " dB")) { s.GateDb = gate; changed = true; }
+            if (UI.Slider(UI.Id("sl_gate"), new R(px + halfW + 16, y, halfW, 38), "Порог голоса (Gate)", ref gate, -75f, -15f, " dB")) { s.GateDb = gate; changed = true; }
             y += 46;
 
             if (UI.Toggle(UI.Id("tg_hpf"), new R(px, y, pw, 30), "High-Pass 80 Hz (убирает гул стола и вентиляторов)", s.HpfEnabled)) { s.HpfEnabled = !s.HpfEnabled; changed = true; }
@@ -891,6 +919,78 @@ public static unsafe partial class Shell
 
             Gfx.FillRect(new R(px, y, pw, 1), Th.Border);
             y += 14;
+            Gfx.DrawText("ТЕМЫ ОФОРМЛЕНИЯ (DISCORD 2026), ОВЕРЛЕЙ И PIP", new R(px, y, pw, 18), 12, Th.Cyan, 700);
+            y += 24;
+
+            (string Id, string Name)[] themes = [("Obsidian", "Obsidian"), ("Onyx", "Onyx OLED"), ("Ash", "Discord Ash"), ("Midnight", "Midnight")];
+            float tw = (pw - 18f) / 4f;
+            for (int ti = 0; ti < themes.Length; ti++)
+            {
+                bool sel = string.Equals(s.Theme, themes[ti].Id, StringComparison.OrdinalIgnoreCase);
+                if (UI.Button(UI.Id("th_btn", ti), new R(px + ti * (tw + 6f), y, tw, 32), themes[ti].Name, sel ? Th.Brand : Th.Card, sel ? 0xFFFFFFFF : Th.Text, 6, 12))
+                {
+                    s.Theme = themes[ti].Id;
+                    Th.ApplyTheme(s.Theme);
+                    changed = true;
+                }
+            }
+            y += 40;
+
+            if (UI.Toggle(UI.Id("tg_ovl"), new R(px, y, pw, 30), "🎮 Игровой оверлей говорящих поверх игр (Overlay v3, без инжекта)", s.GameOverlayEnabled))
+            { s.GameOverlayEnabled = !s.GameOverlayEnabled; changed = true; GameOverlay.Tick(); }
+            y += 34;
+            string[] corners = ["↖ Верх-Лево", "↗ Верх-Право", "↙ Низ-Лево", "↘ Низ-Право"];
+            for (int ci = 0; ci < 4; ci++)
+            {
+                bool sel = s.GameOverlayPos == ci;
+                if (UI.Button(UI.Id("ovl_pos", ci), new R(px + ci * (tw + 6f), y, tw, 26), corners[ci], sel ? Th.Brand : Th.Card, sel ? 0xFFFFFFFF : Th.Sub, 6, 11.5f))
+                { s.GameOverlayPos = ci; changed = true; GameOverlay.Tick(); }
+            }
+            y += 36;
+            if (UI.Toggle(UI.Id("tg_pip"), new R(px, y, pw, 30), "Мини-окно стрима (PiP) поверх текстового чата", s.ShowPiPInChat))
+            { s.ShowPiPInChat = !s.ShowPiPInChat; changed = true; }
+            y += 36;
+
+            Gfx.FillRect(new R(px, y, pw, 1), Th.Border);
+            y += 14;
+            Gfx.DrawText("ГЛОБАЛЬНЫЕ ХОТКЕИ, WINDOWS И МАСШТАБ", new R(px, y, pw, 18), 12, Th.Cyan, 700);
+            y += 24;
+            if (UI.Toggle(UI.Id("tg_ghk"), new R(px, y, pw, 30), "Глобальные хоткеи в играх (переназначаются кликом ниже)", s.GlobalHotkeys))
+            { s.GlobalHotkeys = !s.GlobalHotkeys; changed = true; App.SyncGlobalHotkeys(); }
+            y += 34;
+            (int Slot, string Title, uint Mod, uint Vk)[] binds =
+            [
+                (1, "Вкл/Выкл микрофон", s.HotkeyMuteMod, s.HotkeyMuteVk),
+                (2, "Вкл/Выкл звук (Deafen)", s.HotkeyDeafenMod, s.HotkeyDeafenVk),
+                (3, "Вкл/Выкл игровой оверлей", s.HotkeyOverlayMod, s.HotkeyOverlayVk)
+            ];
+            for (int bi = 0; bi < binds.Length; bi++)
+            {
+                var b = binds[bi];
+                bool cap = App.CapturingHotkeySlot == b.Slot;
+                Gfx.DrawText(b.Title, new R(px + 6, y + 6, pw - 190, 18), 12.5f, Th.Text, 500);
+                string btnTxt = cap ? "Нажмите клавишу..." : W.FormatHotkey(b.Mod, b.Vk);
+                if (UI.Button(UI.Id("hk_bind", b.Slot), new R(px + pw - 176, y, 176, 26), btnTxt, cap ? Th.Amber : Th.Card, cap ? 0xFF0A0B0E : Th.Cyan, 6, 12, 700))
+                    App.CapturingHotkeySlot = cap ? 0 : b.Slot;
+                y += 32;
+            }
+            if (UI.Toggle(UI.Id("tg_winrun"), new R(px, y, pw, 30), "Запускать FluxCord автоматически вместе с Windows", s.LaunchWithWindows))
+            { s.LaunchWithWindows = !s.LaunchWithWindows; changed = true; W.SetWindowsAutostart(s.LaunchWithWindows, s.StartMinimized); }
+            y += 34;
+            if (UI.Toggle(UI.Id("tg_startmin"), new R(px, y, pw, 30), "Запускать свёрнутым в трей (при старте Windows)", s.StartMinimized))
+            { s.StartMinimized = !s.StartMinimized; changed = true; if (s.LaunchWithWindows) W.SetWindowsAutostart(true, s.StartMinimized); }
+            y += 36;
+            float scalePct = s.UiScale * 100f;
+            if (UI.Slider(UI.Id("sl_uisc"), new R(px, y, pw, 38), "Масштаб интерфейса", ref scalePct, 80f, 140f, "%"))
+            {
+                s.UiScale = MathF.Round(scalePct / 5f) * 0.05f;
+                changed = true;
+                App.InvokeOnUiThread(Gfx.RefreshDpi);
+            }
+            y += 46;
+
+            Gfx.FillRect(new R(px, y, pw, 1), Th.Border);
+            y += 14;
             Gfx.DrawText("ПЕРЕНЕСЁННЫЕ НАСТРОЙКИ (DORION / DISCORD)", new R(px, y, pw, 18), 12, Th.Cyan, 700);
             y += 24;
             Gfx.DrawText(SettingsStore.MigrationSummary, new R(px, y, pw, 20), 12.5f, Th.Green, 600);
@@ -899,9 +999,9 @@ public static unsafe partial class Shell
             y += 38;
             if (UI.Toggle(UI.Id("tg_tray"), new R(px, y, pw, 34), "Сворачивать в фоновый трей при закрытии на крестик (✕)", s.CloseToTray)) { s.CloseToTray = !s.CloseToTray; changed = true; }
             y += 38;
-            if (UI.Toggle(UI.Id("tg_not"), new R(px, y, pw, 34), "Уведомления рабочего стола", s.DesktopNotifications)) { s.DesktopNotifications = !s.DesktopNotifications; changed = true; }
+            if (UI.Toggle(UI.Id("tg_not"), new R(px, y, pw, 34), "Уведомления рабочего стола (Windows Toast)", s.DesktopNotifications)) { s.DesktopNotifications = !s.DesktopNotifications; changed = true; }
             y += 38;
-            if (UI.Toggle(UI.Id("tg_stm"), new R(px, y, pw, 34), "Режим стримера (скрывать личные данные)", s.StreamerMode)) { s.StreamerMode = !s.StreamerMode; changed = true; }
+            if (UI.Toggle(UI.Id("tg_stm"), new R(px, y, pw, 34), "Режим стримера (скрывать уведомления и оверлей)", s.StreamerMode)) { s.StreamerMode = !s.StreamerMode; changed = true; GameOverlay.Tick(); }
             y += 48;
             if (UI.Button(UI.Id("btn_remig"), new R(px, y, 310, 36), "Повторно импортировать из Dorion/Discord", Th.Card, Th.Text, 6, 12.5f))
             { SettingsStore.MigrateFromExistingClients(); SettingsStore.Save(); Toast(SettingsStore.MigrationSummary); }

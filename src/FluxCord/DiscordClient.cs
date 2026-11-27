@@ -1768,7 +1768,11 @@ public sealed class DiscordClient
         if (msg.AuthorId != Me.Id && SettingsStore.Current.DesktopNotifications && !SettingsStore.Current.StreamerMode &&
             (App.IsHiddenToTray || W.GetForegroundWindow() != App.Hwnd))
         {
-            W.FlashWindow(App.Hwnd, true);
+            App.InvokeOnUiThread(() =>
+            {
+                W.FlashWindow(App.Hwnd, true);
+                App.ShowTrayBalloon(msg.AuthorName, string.IsNullOrEmpty(msg.Content) ? "📎 Вложение" : msg.Content);
+            });
         }
         TypingUsers.TryRemove(msg.ChannelId, out _);
         Notify();
